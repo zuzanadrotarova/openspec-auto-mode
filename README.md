@@ -48,9 +48,9 @@ Odporúčané: `.gitattributes` s `* text=auto eol=lf` (inak môžu konverzie ko
 
 ## Použitie
 
-1. Priprav zmeny interaktívne (`/opsx:propose`) a pomenuj ich s poradím: `01-login`, `02-profil`, …
+1. Priprav zmeny interaktívne (`/opsx:propose`) a pomenuj ich s poradím: `01-login`, `02-profil`, … Nemusí to byť celý projekt, stačí dávka; ďalšie zmeny pridáš neskôr a spustíš znova.
 2. Commitni ich, pracovný strom musí byť čistý.
-3. Spusti:
+3. Spusti (najprv pokojne s `-DryRun`). Pri štarte sa overí, že každá číslovaná zmena má hotový propose: všetky artefakty, aspoň jednu úlohu v `tasks.md` a prejde `openspec validate`. Ak nie, nič sa nespustí a vypíše sa, čo kde chýba.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\cesta\k\openspec-auto-mode\openspec-auto.ps1           # v koreni projektu

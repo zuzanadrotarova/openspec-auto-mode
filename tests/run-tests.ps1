@@ -122,6 +122,22 @@ $p = New-Project 't6' @('fix-login:1')
 $r = Invoke-Runner $p ''
 Check ($r.Code -eq 2 -and $r.Out -match 'no active numbered changes') 'fix changes are skipped'
 
+Write-Host "T7 incomplete propose is refused at start"
+$p = New-Project 't7' @('01-a:1', '02-b:1', '03-c:1', '04-d:1')
+Push-Location $p
+Remove-Item openspec/changes/02-b/design.md
+Set-Content openspec/changes/03-c/specs/cap-c/spec.md "## ADDED Requirements`n### Requirement: No scenario`nThe system SHALL do c.`n"
+Set-Content openspec/changes/04-d/tasks.md "## 1. Impl`nnothing yet`n"
+git add -A 2>&1 | Out-Null; git commit -q -m broken 2>&1 | Out-Null
+Pop-Location
+$r = Invoke-Runner $p '01-a=success;02-b=success;03-c=success;04-d=success'
+Check ($r.Code -eq 2) 'runner refuses to start (exit 2)'
+Check ($r.Out -match '02-b is not ready.*missing artifacts: design') 'missing design.md reported'
+Check ($r.Out -match '03-c is not ready.*validate failed') 'invalid spec delta reported'
+Check ($r.Out -match '04-d is not ready.*no tasks') 'empty tasks.md reported'
+Check ($r.Out -notmatch '01-a is not ready') 'complete change not reported'
+Check (-not (Test-Path "$p/.openspec-auto/runs")) 'no agent run started'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

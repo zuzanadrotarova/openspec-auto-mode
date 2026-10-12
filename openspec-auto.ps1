@@ -93,6 +93,27 @@ function Get-NumberedChanges($Active) {
         Sort-Object @{ Expression = { Get-ChangeNumber $_.name } }, @{ Expression = { $_.name } })
 }
 
+# Start check: the propose phase of a change is complete and valid (all artifacts of its schema
+# are done or skipped, it has tasks, and openspec validate passes).
+function Get-ProposeProblems([string]$Change) {
+    $problems = @()
+    $s = Invoke-OpenSpec @('status', '--change', $Change, '--json')
+    $start = $s.Out.IndexOf('{')
+    if ($s.Code -ne 0 -or $start -lt 0) { return @("openspec status failed: $($s.Out)") }
+    $status = $s.Out.Substring($start) | ConvertFrom-Json
+    $missing = @($status.artifacts | Where-Object { $_.status -notin @('done', 'skipped') } | ForEach-Object { "$($_.id) ($($_.outputPath))" })
+    if ($missing.Count) { $problems += "missing artifacts: $($missing -join ', ')" }
+    $t = Get-TaskCounts (Join-Path $Project "openspec/changes/$Change")
+    if ($t.Total -eq 0) { $problems += 'tasks.md has no tasks (- [ ] ...)' }
+    $v = Invoke-OpenSpec @('validate', $Change, '--no-interactive')
+    if ($v.Code -ne 0) {
+        $errs = @($v.Out -split "`n" | Where-Object { $_ -match '\[ERROR\]' } | ForEach-Object { $_ -replace '^.*?\[ERROR\]', '[ERROR]' })
+        if (-not $errs.Count) { $errs = @($v.Out) }
+        $problems += "openspec validate failed: $($errs -join ' | ')"
+    }
+    $problems
+}
+
 function Get-TaskCounts([string]$ChangeDir) {
     $file = Join-Path $ChangeDir 'tasks.md'
     $total = 0; $done = 0
@@ -387,6 +408,11 @@ if ($errors.Count -eq 0) {
         $errors += "change $($b.name) is blocked (openspec/changes/$($b.name)/BLOCKED.md); resolve it, delete BLOCKED.md and commit"
     }
     if ($numbered.Count -eq 0) { $errors += 'no active numbered changes (NN-name) to process' }
+    foreach ($c in $numbered) {
+        foreach ($p in (Get-ProposeProblems $c.name)) {
+            $errors += "change $($c.name) is not ready (propose incomplete): $p"
+        }
+    }
 }
 if ($errors.Count -gt 0) {
     foreach ($e in $errors) { Write-Bad $e }
