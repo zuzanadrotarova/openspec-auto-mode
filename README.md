@@ -15,7 +15,7 @@ openspec-auto.ps1 (deterministický skript)
   report → .openspec-auto/auto-mode-report.md
 ```
 
-Úplná špecifikácia je v [ZADANIE.md](ZADANIE.md).
+**Podrobný návod krok za krokom: [NAVOD.md](NAVOD.md).** Úplná špecifikácia je v [ZADANIE.md](ZADANIE.md).
 
 ## Požiadavky
 
