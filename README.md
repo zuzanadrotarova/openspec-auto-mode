@@ -17,6 +17,16 @@ openspec-auto.ps1 (deterministický skript)
 
 **Podrobný návod krok za krokom: [NAVOD.md](NAVOD.md).** Úplná špecifikácia je v [ZADANIE.md](ZADANIE.md).
 
+## Použitie z Claude Code (odporúčané)
+
+Skill `/openspec-auto` (`init`, `check`, `run`, `report`) spustí runner za teba a zhrnie výsledok. Inštalácia skillu (raz na počítač):
+
+```powershell
+Copy-Item -Recurse -Force claude-skill\openspec-auto $HOME\.claude\skills\
+```
+
+Postup je v [NAVOD.md](NAVOD.md). Zvyšok tohto README opisuje priame spúšťanie runnera.
+
 ## Požiadavky
 
 - Windows PowerShell 5.1+ (alebo PowerShell 7)
