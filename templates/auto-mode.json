@@ -1,0 +1,15 @@
+{
+  "testCommand": "npm test",
+  "allowedCommands": [
+    "npm test",
+    "npm run build",
+    "npm run lint"
+  ],
+  "timeoutMinutes": 60,
+  "maxTurns": 200,
+  "maxRunsPerChange": 10,
+  "tasksPerRun": 8,
+  "model": null,
+  "effort": null,
+  "maxBudgetUsdPerRun": null
+}
