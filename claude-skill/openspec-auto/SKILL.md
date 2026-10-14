@@ -8,13 +8,15 @@ argument-hint: "[init | check | run | report]"
 
 The user works only inside Claude Code and never runs PowerShell commands by hand. You run everything for them and explain results in their language (Slovak, unless they write otherwise). Keep answers short: what happened, what it means, what to do next.
 
-Runner: `C:\Users\zuzan\.gemini\antigravity\scratch\openspec-auto-mode\openspec-auto.ps1`
-Guide (error messages and fixes): `C:\Users\zuzan\.gemini\antigravity\scratch\openspec-auto-mode\NAVOD.md`
+Runner: `{{OPENSPEC_AUTO_HOME}}\openspec-auto.ps1`
+Guide (error messages and fixes): `{{OPENSPEC_AUTO_HOME}}\NAVOD.md`
+
+If the paths above still contain the placeholder OPENSPEC_AUTO_HOME in double curly braces, the skill was copied by hand instead of installed. Stop and tell the user to run `install.ps1` from the cloned openspec-auto-mode repository (`powershell -ExecutionPolicy Bypass -File install.ps1`), then restart Claude Code.
 
 Invoke it with the PowerShell tool, always with the project root as `-Project`:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\zuzan\.gemini\antigravity\scratch\openspec-auto-mode\openspec-auto.ps1" -Project "<project root>" [-Init | -DryRun]
+powershell -NoProfile -ExecutionPolicy Bypass -File "{{OPENSPEC_AUTO_HOME}}\openspec-auto.ps1" -Project "<project root>" [-Init | -DryRun]
 ```
 
 The project root is the git repository root of the current working directory (`git rev-parse --show-toplevel`).

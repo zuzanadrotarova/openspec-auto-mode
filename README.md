@@ -19,11 +19,15 @@ openspec-auto.ps1 (deterministický skript)
 
 ## Použitie z Claude Code (odporúčané)
 
-Skill `/openspec-auto` (`init`, `check`, `run`, `report`) spustí runner za teba a zhrnie výsledok. Inštalácia skillu (raz na počítač):
+Skill `/openspec-auto` (`init`, `check`, `run`, `report`) spustí runner za teba a zhrnie výsledok. Inštalácia (raz na počítač):
 
 ```powershell
-Copy-Item -Recurse -Force claude-skill\openspec-auto $HOME\.claude\skills\
+git clone https://github.com/zuzanadrotarova/openspec-auto-mode.git
+cd openspec-auto-mode
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
+
+`install.ps1` nainštaluje skill do `~/.claude/skills/openspec-auto/` a nastaví v ňom cestu k runneru v tomto repozitári. Potom reštartuj Claude Code. Repozitár po inštalácii nepresúvaj (inak spusti `install.ps1` znova). Aktualizácia: `git pull`, a ak sa zmenil `claude-skill/`, znova `install.ps1`.
 
 Postup je v [NAVOD.md](NAVOD.md). Zvyšok tohto README opisuje priame spúšťanie runnera.
 
@@ -102,6 +106,8 @@ Skript si nedrží vlastný stav, opätovné spustenie je ten istý príkaz.
 |---|---|
 | `openspec-auto.ps1` | riadiaci skript (slučka, kontroly, report) |
 | `worker-prompt.md` | pokyn pre agenta jedného behu |
+| `install.ps1` | inštalácia skillu `/openspec-auto` pre aktuálneho používateľa |
+| `claude-skill/openspec-auto/SKILL.md` | zdroj skillu (cestu k runneru doplní `install.ps1`) |
 | `templates/auto-mode.json` | šablóna konfigurácie projektu |
 | `tests/run-tests.ps1` | testy logiky slučky s falošným agentom (bez volaní API) |
 | `ZADANIE.md` | špecifikácia |
