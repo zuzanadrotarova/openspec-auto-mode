@@ -1,25 +1,25 @@
 # OpenSpec auto-mode
 
-Nástroj bez dozoru implementuje, otestuje a archivuje pripravené OpenSpec zmeny jednu po druhej, v ľubovoľnom projekte.
+Implements, tests and archives prepared OpenSpec changes one after another, unattended, in any project.
 
-Podstata: **každý beh agenta je nový proces Claude Code s prázdnym kontextom.** Medzi behmi sa nič neprenáša cez konverzáciu, iba cez súbory (OpenSpec artefakty, kód, git). Veľká zmena sa rozdelí na viac behov, takže kontextové okno sa nikdy nenaplní a agent nezačne halucinovať.
+The core idea: **every agent run is a new Claude Code process with an empty context.** Nothing is carried between runs through the conversation, only through files (OpenSpec artifacts, code, git). A large change is split across several runs, so the context window never fills up and the agent does not start hallucinating.
 
 ```
-openspec-auto.ps1 (deterministický skript)
-  pre každú zmenu 01-…, 02-…, …:
-    branch auto/NN-nazov (reťazená z predchádzajúcej)
-    ┌─ nový proces: claude -p --agent openspec-auto   ← prázdny kontext
-    │    implementuje max. tasksPerRun úloh, commitne, skončí
-    ├─ skript overí súbory (git status, validate, archív/BLOCKED.md, push)
-    └─ ešte nehotovo a je pokrok? → znova, nový proces
+openspec-auto.ps1 (deterministic script)
+  for each change 01-…, 02-…, …:
+    branch auto/NN-name (chained from the previous one)
+    ┌─ new process: claude -p --agent openspec-auto   ← empty context
+    │    implements at most tasksPerRun tasks, commits, exits
+    ├─ script verifies the files (git status, validate, archive/BLOCKED.md, push)
+    └─ not done yet and progress was made? → again, new process
   report → .openspec-auto/auto-mode-report.md
 ```
 
-**Podrobný návod krok za krokom: [NAVOD.md](NAVOD.md).** Úplná špecifikácia je v [ZADANIE.md](ZADANIE.md).
+**Step-by-step guide: [NAVOD.md](NAVOD.md)** (in Slovak). The full specification is in [ZADANIE.md](ZADANIE.md) (in Slovak).
 
-## Použitie z Claude Code (odporúčané)
+## Using it from Claude Code (recommended)
 
-Skill `/openspec-auto` (`init`, `check`, `run`, `report`) spustí runner za teba a zhrnie výsledok. Inštalácia (raz na počítač):
+The `/openspec-auto` skill (`init`, `check`, `run`, `report`) runs the runner for you and summarizes the result. Installation (once per machine):
 
 ```powershell
 git clone https://github.com/zuzanadrotarova/openspec-auto-mode.git
@@ -27,90 +27,102 @@ cd openspec-auto-mode
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-`install.ps1` nainštaluje skill do `~/.claude/skills/openspec-auto/` a nastaví v ňom cestu k runneru v tomto repozitári. Potom reštartuj Claude Code. Repozitár po inštalácii nepresúvaj (inak spusti `install.ps1` znova). Aktualizácia: `git pull`, a ak sa zmenil `claude-skill/`, znova `install.ps1`.
+`install.ps1` installs the skill into `~/.claude/skills/openspec-auto/` and points it to the runner in this repository. Then restart Claude Code. Do not move the repository after installing (or run `install.ps1` again). To update: `git pull`, and if `claude-skill/` changed, run `install.ps1` again.
 
-Postup je v [NAVOD.md](NAVOD.md). Zvyšok tohto README opisuje priame spúšťanie runnera.
+Typical flow:
 
-## Požiadavky
+```
+/openspec-auto init                  # once per project
+/opsx:propose 01-name: …             # one per change (01-, 02-, … = order)
+"commit the proposals"
+/openspec-auto check                 # readiness check
+/openspec-auto run                   # runs in the background, summary at the end
+"merge it into main"                 # after you review the result
+```
 
-- Windows PowerShell 5.1+ (alebo PowerShell 7)
-- [Claude Code](https://claude.com/claude-code) (`claude`) a [OpenSpec](https://github.com/Fission-AI/OpenSpec) (`openspec`) v PATH
+The rest of this README describes running the runner directly.
+
+## Requirements
+
+- Windows PowerShell 5.1+ (or PowerShell 7)
+- [Claude Code](https://claude.com/claude-code) (`claude`) and [OpenSpec](https://github.com/Fission-AI/OpenSpec) (`openspec`) on PATH
 - git
 
-## Nastavenie v projekte (raz)
+## Project setup (once)
 
 ```powershell
-cd C:\cesta\k\projektu
-openspec init                     # ak OpenSpec v projekte ešte nie je
-powershell -ExecutionPolicy Bypass -File C:\cesta\k\openspec-auto-mode\openspec-auto.ps1 -Init
+cd C:\path\to\project
+openspec init                     # if the project does not use OpenSpec yet
+powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-auto.ps1 -Init
 ```
 
-`-Init` vytvorí `openspec/auto-mode.json`. Uprav ho a commitni:
+`-Init` creates `openspec/auto-mode.json`. Edit it and commit it:
 
-| Kľúč | Význam | Predvolené |
+| Key | Meaning | Default |
 |---|---|---|
-| `testCommand` | príkaz na testy (povinný) | – |
-| `allowedCommands` | ďalšie príkazy, ktoré agent smie spúšťať (build, lint…) | `[]` |
-| `tasksPerRun` | max. úloh z `tasks.md` na jeden beh (jeden kontext) | 8 |
-| `maxRunsPerChange` | max. behov na jednu zmenu | 10 |
-| `timeoutMinutes` | časový limit jedného behu | 60 |
-| `maxTurns` | max. krokov agenta v jednom behu | 200 |
-| `model`, `effort` | model a úroveň uvažovania pre Claude Code | podľa Claude Code |
-| `maxBudgetUsdPerRun` | cenový strop jedného behu | bez limitu |
+| `testCommand` | test command (required) | – |
+| `allowedCommands` | additional commands the agent may run (build, lint…) | `[]` |
+| `tasksPerRun` | max. tasks from `tasks.md` per run (one context) | 8 |
+| `maxRunsPerChange` | max. runs per change | 10 |
+| `timeoutMinutes` | time limit of one run | 60 |
+| `maxTurns` | max. agent turns in one run | 200 |
+| `model`, `effort` | model and reasoning effort for Claude Code | Claude Code default |
+| `maxBudgetUsdPerRun` | cost cap of one run | no limit |
 
-Odporúčané: `.gitattributes` s `* text=auto eol=lf` (inak môžu konverzie koncov riadkov robiť falošne nečistý `git status`).
+Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
 
-## Použitie
+## Usage
 
-1. Priprav zmeny interaktívne (`/opsx:propose`) a pomenuj ich s poradím: `01-login`, `02-profil`, … Nemusí to byť celý projekt, stačí dávka; ďalšie zmeny pridáš neskôr a spustíš znova.
-2. Commitni ich, pracovný strom musí byť čistý.
-3. Spusti (najprv pokojne s `-DryRun`). Pri štarte sa overí, že každá číslovaná zmena má hotový propose: všetky artefakty, aspoň jednu úlohu v `tasks.md` a prejde `openspec validate`. Ak nie, nič sa nespustí a vypíše sa, čo kde chýba.
+1. Prepare the changes interactively (`/opsx:propose`) and name them in order: `01-login`, `02-profile`, … It does not have to be the whole project, a batch is enough; add more changes later and run again.
+2. Commit them; the working tree must be clean.
+3. Run it (start with `-DryRun` if you like). At start it checks that every numbered change has a complete proposal: all artifacts, at least one task in `tasks.md`, and `openspec validate` passes. If not, nothing runs and it lists what is missing where.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\cesta\k\openspec-auto-mode\openspec-auto.ps1           # v koreni projektu
-powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -DryRun                              # len kontroly a plán
-powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\iny\projekt
+powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-auto.ps1   # in the project root
+powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -DryRun                      # checks and plan only
+powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\other\project
 ```
 
-## Výsledky
+## Results
 
-| Výsledok | Čo sa stane |
+| Result | What happens |
 |---|---|
-| SUCCESS | zmena implementovaná, testy prechádzajú, archivovaná → ďalšia zmena |
-| NONCRITICAL | archivovaná + vznikne `fix-NN-nazov` s popisom chyby (neimplementovaná) → ďalšia zmena |
-| BLOCKED | architektonický problém, `openspec/changes/NN-nazov/BLOCKED.md`, nearchivovaná → **stop** |
-| FAILED-CHECK | kontrola skriptu neprešla (necommitnuté zmeny, nevalidné špecifikácie, pokus o push, pád, timeout, žiadny pokrok) → **stop** |
+| SUCCESS | change implemented, tests pass, archived → next change |
+| NONCRITICAL | archived + a `fix-NN-name` change describing the bug is created (not implemented) → next change |
+| BLOCKED | architectural problem, `openspec/changes/NN-name/BLOCKED.md`, not archived → **stop** |
+| FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress) → **stop** |
 
-Report: `.openspec-auto/auto-mode-report.md`, logy každého behu: `.openspec-auto/runs/<čas>/`. Priečinok je v `.git/info/exclude`, do repozitára sa nedostane.
+Report: `.openspec-auto/auto-mode-report.md`, logs of every run: `.openspec-auto/runs/<time>/`. The folder is listed in `.git/info/exclude`, so it never gets into the repository.
 
-Nič sa nepushuje ani nemerguje. Branche `auto/NN-…` skontroluješ a zmerguješ sám.
+Nothing is pushed or merged. You review and merge the `auto/NN-…` branches yourself.
 
-## Po zastavení
+## After a stop
 
-Skript si nedrží vlastný stav, opätovné spustenie je ten istý príkaz.
+The script keeps no state of its own; re-running is the same command.
 
-- **BLOCKED:** ostaň na `auto/NN-nazov`, vyrieš problém (napr. `/opsx:update NN-nazov`, inštalácia balíčka, úprava `design.md`), zmaž `BLOCKED.md`, commitni, spusti znova. Kým `BLOCKED.md` existuje, skript odmietne štart.
-- **FAILED-CHECK:** pozri report a log behu, daj stav do poriadku (commit alebo revert), spusti znova z aktuálnej branch.
-- **`fix-…` zmeny** slučka nespracúva. Implementuj ich interaktívne (`/opsx:apply fix-NN-nazov`), alebo ich premenuj na číslovanú zmenu.
+- **BLOCKED:** stay on `auto/NN-name`, resolve the problem (e.g. `/opsx:update NN-name`, install a package, edit `design.md`), delete `BLOCKED.md`, commit, run again. While `BLOCKED.md` exists, the script refuses to start.
+- **FAILED-CHECK:** check the report and the run log, fix the state (commit or revert), run again from the current branch.
+- **`fix-…` changes** are not processed by the loop. Implement them interactively (`/opsx:apply fix-NN-name`), or rename them to a numbered change.
 
-## Bezpečnosť
+## Safety
 
-- Agent beží v režime `dontAsk`: smie iba to, čo je na allowliste (súborové nástroje, `openspec`, lokálny git bez práce s vetvami, `testCommand` a `allowedCommands`).
-- Push blokujú tri vrstvy: deny pravidlá, `pre-push` hook aktívny pri `OPENSPEC_AUTO_MODE=1` a kontrola remote refov po každom behu.
-- Agent nesmie meniť `.git/`, `.claude/`, `.openspec-auto/` ani `openspec/auto-mode.json`.
-- `claude -p` preskakuje dialóg dôvery k priečinku. Spúšťaj ho len v projektoch, ktorým dôveruješ.
+- The agent runs in `dontAsk` mode: it may only do what is on the allowlist (file tools, `openspec`, local git without branch operations, `testCommand` and `allowedCommands`).
+- Push is blocked by three layers: deny rules, a `pre-push` hook active when `OPENSPEC_AUTO_MODE=1`, and a check of remote refs after every run.
+- The agent must not modify `.git/`, `.claude/`, `.openspec-auto/` or `openspec/auto-mode.json`.
+- `claude -p` skips the folder trust dialog. Only run it in projects you trust.
 
-## Súbory
+## Files
 
-| Súbor | Účel |
+| File | Purpose |
 |---|---|
-| `openspec-auto.ps1` | riadiaci skript (slučka, kontroly, report) |
-| `worker-prompt.md` | pokyn pre agenta jedného behu |
-| `install.ps1` | inštalácia skillu `/openspec-auto` pre aktuálneho používateľa |
-| `claude-skill/openspec-auto/SKILL.md` | zdroj skillu (cestu k runneru doplní `install.ps1`) |
-| `templates/auto-mode.json` | šablóna konfigurácie projektu |
-| `tests/run-tests.ps1` | testy logiky slučky s falošným agentom (bez volaní API) |
-| `ZADANIE.md` | špecifikácia |
+| `openspec-auto.ps1` | control script (loop, checks, report) |
+| `worker-prompt.md` | instructions for the agent of a single run |
+| `install.ps1` | installs the `/openspec-auto` skill for the current user |
+| `claude-skill/openspec-auto/SKILL.md` | skill source (`install.ps1` fills in the runner path) |
+| `templates/auto-mode.json` | project configuration template |
+| `tests/run-tests.ps1` | tests of the loop logic with a fake agent (no API calls) |
+| `NAVOD.md` | step-by-step guide (Slovak) |
+| `ZADANIE.md` | specification (Slovak) |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
