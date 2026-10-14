@@ -9,7 +9,7 @@ argument-hint: "[init | check | run | report]"
 The user works only inside Claude Code and never runs PowerShell commands by hand. You run everything for them and explain results in their language (Slovak, unless they write otherwise). Keep answers short: what happened, what it means, what to do next.
 
 Runner: `{{OPENSPEC_AUTO_HOME}}\openspec-auto.ps1`
-Guide (error messages and fixes): `{{OPENSPEC_AUTO_HOME}}\NAVOD.md`
+Guide (error messages and fixes): `{{OPENSPEC_AUTO_HOME}}\GUIDE.md`
 
 If the paths above still contain the placeholder OPENSPEC_AUTO_HOME in double curly braces, the skill was copied by hand instead of installed. Stop and tell the user to run `install.ps1` from the cloned openspec-auto-mode repository (`powershell -ExecutionPolicy Bypass -File install.ps1`), then restart Claude Code.
 
@@ -49,7 +49,7 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
 ## check – readiness
 
 Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are problems.
-- Explain each problem in one sentence with the concrete fix (see the table in chapter 7 of NAVOD.md).
+- Explain each problem in one sentence with the concrete fix (see the table in the appendix of GUIDE.md).
 - Offer to fix what you can: commit a dirty tree, rename a change folder to `NN-name`, complete a missing artifact via `/opsx:update`, fix a validation error.
 - Do not fix architectural content of a change on your own; propose the fix and let the user decide.
 - If everything passes, show the plan (order of changes).

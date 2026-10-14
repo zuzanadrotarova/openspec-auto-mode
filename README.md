@@ -15,7 +15,7 @@ openspec-auto.ps1 (deterministic script)
   report → .openspec-auto/auto-mode-report.md
 ```
 
-**Step-by-step guide: [NAVOD.md](NAVOD.md)** (in Slovak). The full specification is in [ZADANIE.md](ZADANIE.md) (in Slovak).
+**Step-by-step guide: [GUIDE.md](GUIDE.md).**
 
 ## Using it from Claude Code (recommended)
 
@@ -121,8 +121,7 @@ The script keeps no state of its own; re-running is the same command.
 | `claude-skill/openspec-auto/SKILL.md` | skill source (`install.ps1` fills in the runner path) |
 | `templates/auto-mode.json` | project configuration template |
 | `tests/run-tests.ps1` | tests of the loop logic with a fake agent (no API calls) |
-| `NAVOD.md` | step-by-step guide (Slovak) |
-| `ZADANIE.md` | specification (Slovak) |
+| `GUIDE.md` | step-by-step guide |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
