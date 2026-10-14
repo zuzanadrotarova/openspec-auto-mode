@@ -126,3 +126,7 @@ The script keeps no state of its own; re-running is the same command.
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
 ```
+
+## License
+
+[MIT](LICENSE)
