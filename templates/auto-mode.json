@@ -11,5 +11,8 @@
   "tasksPerRun": 8,
   "model": null,
   "effort": null,
-  "maxBudgetUsdPerRun": null
+  "maxBudgetUsdPerRun": null,
+  "testTimeoutMinutes": 20,
+  "fixMode": "immediate",
+  "maxRunsPerFix": 2
 }

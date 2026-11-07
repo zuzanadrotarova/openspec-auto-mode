@@ -42,13 +42,14 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
    - `testCommand`: from `package.json` (`scripts.test` → `npm test`), `pyproject.toml` / `pytest.ini` (`pytest`), `*.csproj` / `*.sln` (`dotnet test`), `Cargo.toml` (`cargo test`), `go.mod` (`go test ./...`), etc.
    - `allowedCommands`: build and lint commands the project actually has (e.g. `npm run build`, `npm run lint`). Remove template entries the project does not have.
    - If the project has no tests or no code yet, say so and ask what the test command will be.
+   - A script in the project root needs an explicit path (`.\test.cmd`); the tests must pass and must not leave untracked files (add test outputs such as coverage to `.gitignore`).
 5. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
 6. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
 7. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`.
 
 ## check – readiness
 
-Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are problems.
+Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are problems. The check also runs the project's tests once (as long as the tests take); `baseline tests fail` means the project must be green before auto-mode starts. Read only the end of `.openspec-auto/baseline-tests.txt` to explain why.
 - Explain each problem in one sentence with the concrete fix (see the table in the appendix of GUIDE.md).
 - Offer to fix what you can: commit a dirty tree, rename a change folder to `NN-name`, complete a missing artifact via `/opsx:update`, fix a validation error.
 - Do not fix architectural content of a change on your own; propose the fix and let the user decide.
@@ -66,14 +67,14 @@ Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are 
 
 Read `.openspec-auto/auto-mode-report.md` in the project root and summarize:
 - each change and its result:
-  - SUCCESS = done,
-  - NONCRITICAL = done, but a `fix-…` change was created,
+  - SUCCESS = done, and the runner's own test run passed (`Tests` column),
+  - NONCRITICAL = done, but a `fix-…` change was created; if the tests failed, the runner processed the fix right away and it has its own row (`fixes NN-…`), otherwise the fix waits for the user,
   - BLOCKED = architectural problem, the loop stopped,
   - FAILED-CHECK / STOPPED = the runner's check failed,
   - not processed = the loop never reached it;
 - total cost, and the `fix-…` changes waiting for the user;
 - **BLOCKED:** summarize `openspec/changes/<change>/BLOCKED.md` (what blocks, options) and explain the way out. The user decides; you then help fix it, delete `BLOCKED.md`, commit, and `/openspec-auto run` again.
-- **FAILED-CHECK:** read the reason in the report notes. If needed, read only the `result` and `permission_denials` fields of the named log `.openspec-auto/runs/<time>/<change>.runXX.out.json`, never whole logs. Explain it and propose a fix.
+- **FAILED-CHECK:** read the reason in the report notes. If needed, read only the `result` and `permission_denials` fields of the named log `.openspec-auto/runs/<time>/<change>.runXX.out.json`, never whole logs. When the tests failed, read only the end of the named `.tests.txt` log. Explain it and propose a fix. The tests must be green before the next start (an interrupted `fix-…` change is the exception: the runner resumes it).
 - **Everything OK:** offer to review and merge. The last `auto/…` branch contains all changes (`git log --oneline main..auto/<last>`, then `git checkout main` and `git merge auto/<last>`). Merge only when the user agrees.
 - `fix-…` changes: offer `/opsx:apply fix-…` interactively, or renaming them to a numbered change for the next auto-mode run.
 

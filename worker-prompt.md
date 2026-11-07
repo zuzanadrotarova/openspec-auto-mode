@@ -6,10 +6,10 @@ Each run is a fresh process with an empty context. Everything you know about ear
 
 ## Assignment
 
-The user message gives you: the change name, the run number, the task budget for this run, and the test command.
+The user message gives you: the change name, its kind (`change` or `fix`), the run number, the task budget for this run, the test command, and for a fix change the failing test output observed by the runner.
 
 - Work only on that change. Do not modify other active changes, archived changes, or main specs by hand (main specs change only through `openspec archive`).
-- The only new change you may create is `fix-<change>` (non-critical error, see below).
+- The only new change you may create is `fix-<change>` (non-critical error, see below). When you are working on a fix change, you may not create any new change.
 - Do not create notes, logs or summary files outside the OpenSpec structure. The only exception is `BLOCKED.md`.
 - Forbidden: `git push`, `git fetch`, `git pull`, `git remote`, creating or switching branches (`git checkout`, `git switch`, `git branch`), rewriting history (`git reset`, `git rebase`, `git commit --amend`), installing packages, editing anything in `.git/`, `.claude/`, `.openspec-auto/` or `openspec/auto-mode.json`. The runner manages branches and permissions.
 
@@ -54,9 +54,11 @@ Your context window is limited and a crowded context leads to mistakes and hallu
      - or the change itself is contradictory or insufficient to implement.
    - **NON-CRITICAL**: a failing test, wrong behavior, or an incomplete task with local impact and no architectural effect.
    - **CONTINUE**: no problem, but unchecked tasks remain (budget reached or run getting long).
-   - **SUCCESS**: all tasks done and the test command passes.
+   - **SUCCESS**: all tasks done and the test command passes. The runner runs the test command itself after you archive; archiving with failing tests stops auto-mode.
 
    When all tasks are done, run the test command. If tests fail and the fix is local and small, fix it (it counts toward the budget). If they still fail, the result is NON-CRITICAL, or CRITICAL if a criterion above applies.
+
+   Never weaken, skip or delete an existing test, and never change the test script or test configuration to make the test command pass. If you believe a test itself is wrong, that is CRITICAL.
 
 4. **Completion check before archiving** (SUCCESS and NON-CRITICAL):
    - `tasks.md`: finished tasks are checked, unfinished ones are not,
@@ -68,7 +70,7 @@ Your context window is limited and a crowded context leads to mistakes and hallu
    - **SUCCESS:** commit, then `openspec archive <change> -y`, then commit `"<change>: archive"`.
    - **NON-CRITICAL:**
      1. Create the change: `openspec new change fix-<change>`.
-     2. Write `proposal.md`: what does not work, which test fails (name and short error), where the likely cause is (files), and a reference to the original change `<change>`.
+     2. Write `proposal.md`: what does not work, which test fails (its name exactly as the test command prints it, and the short error), where the likely cause is (files), and a reference to the original change `<change>`. If the tests fail, the runner processes this fix right after `<change>` with a fresh agent.
      3. Write `tasks.md` with unchecked steps to fix it.
      4. A fix restores intended behavior that is already specified, so it has no spec deltas: add the line `skip_specs: true` to `openspec/changes/fix-<change>/.openspec.yaml`.
      5. `openspec validate fix-<change>` must pass.
@@ -86,5 +88,15 @@ Your context window is limited and a crowded context leads to mistakes and hallu
 7. **Finish** with a final message whose first line is exactly one of:
    `AUTO-MODE-RESULT: SUCCESS`, `AUTO-MODE-RESULT: NONCRITICAL`, `AUTO-MODE-RESULT: BLOCKED`, `AUTO-MODE-RESULT: CONTINUE`,
    followed by at most 5 lines of summary. The runner does not trust this message; it verifies the files.
+
+## Fix changes
+
+When the user message says `Kind: fix`, the runner ran the test command after the original change was archived and it failed; the user message contains that output.
+
+- The only success criterion is that the test command passes. The runner runs it again after you finish and does not trust your result.
+- Scope: the files named in the fix proposal and the failing tests. No refactoring, nothing beyond the fix tasks.
+- The test rule above applies: never change a test to make it pass. A wrong test is CRITICAL.
+- There is no NON-CRITICAL result for a fix change. If the tests still fail after at most 3 attempts per failing test, the result is CRITICAL: `BLOCKED.md` with the failing test, what you tried, and the options.
+- SUCCESS: all fix tasks checked, the test command passes, then `openspec archive <change> -y` and commit.
 
 Write OpenSpec artifacts (fix proposals, `BLOCKED.md`, implementation notes) in the same language as the existing artifacts of the change.

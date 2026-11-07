@@ -13,7 +13,11 @@
       3. verifies the result from files (git status, OpenSpec validation, archive / BLOCKED.md,
          remote refs) and only then starts the next process,
       4. repeats with a new process while the change reports progress (CONTINUE), so even a
-         large change never fills one context window.
+         large change never fills one context window,
+      5. runs testCommand itself after a change is archived (the agent's word is not enough);
+         a NONCRITICAL change with failing tests gets its fix-NN change processed right away.
+
+    testCommand also runs once before the first change: auto-mode needs a green start.
 
 .PARAMETER Project
     Project root (git repository with OpenSpec). Default: current directory.
@@ -78,6 +82,12 @@ if ($IsWin -and (Get-Command 'openspec.cmd' -ErrorAction SilentlyContinue)) { $O
 function Invoke-OpenSpec([string[]]$Arguments) { Invoke-Exec $OpenSpecExe $Arguments }
 
 function Get-ChangeNumber([string]$Name) { [int]($Name -replace '^(\d+)-.*$', '$1') }
+
+# fix-NN-name -> NN-name (the numbered change it fixes), otherwise $null.
+function Get-FixParent([string]$Name) {
+    if ($Name -match '^fix-(\d{2,}-.+)$') { return $Matches[1] }
+    return $null
+}
 
 function Get-ActiveChanges {
     $r = Invoke-OpenSpec @('list', '--json')
@@ -169,10 +179,16 @@ function Read-Config {
         model              = $null
         effort             = $null
         maxBudgetUsdPerRun = $null
+        testTimeoutMinutes = 20
+        fixMode            = 'immediate'
+        maxRunsPerFix      = 2
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
     foreach ($p in $json.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
+    if ($null -eq $cfg.testTimeoutMinutes) { $cfg.testTimeoutMinutes = 20 }
+    if ($null -eq $cfg.fixMode) { $cfg.fixMode = 'immediate' }
+    if ($null -eq $cfg.maxRunsPerFix) { $cfg.maxRunsPerFix = 2 }
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
 }
@@ -265,15 +281,105 @@ function New-WorkerAgents([string]$Path) {
     Write-TextFile $Path ($agents | ConvertTo-Json -Depth 5)
 }
 
+# Runs a command line through the shell in a NEW process and waits with a timeout
+# (the whole process tree is killed on timeout). Never throws on a non-zero exit code.
+function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$StdIn) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    if ($IsWin) {
+        $psi.FileName = 'cmd.exe'
+        $psi.Arguments = "/d /s /c `"$CommandLine`""
+    } else {
+        $psi.FileName = '/bin/sh'
+        $psi.Arguments = "-c '$($CommandLine.Replace("'", "'\''"))'"
+    }
+    $psi.WorkingDirectory = $Project
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = $Utf8
+    $psi.StandardErrorEncoding = $Utf8
+    $psi.EnvironmentVariables['OPENSPEC_AUTO_MODE'] = '1'
+
+    $started = Get-Date
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    if ($StdIn) { $proc.StandardInput.Write($StdIn) }
+    $proc.StandardInput.Close()
+
+    $timedOut = $false
+    try {
+        if (-not $proc.WaitForExit([int]($TimeoutMinutes * 60 * 1000))) {
+            $timedOut = $true
+            if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
+            $proc.WaitForExit(15000) | Out-Null
+        }
+    } finally {
+        if (-not $proc.HasExited) {
+            if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
+        }
+    }
+    $null = $outTask.Wait(15000); $null = $errTask.Wait(15000)
+    $stdout = ''; $stderr = ''
+    if ($outTask.IsCompleted) { $stdout = $outTask.Result }
+    if ($errTask.IsCompleted) { $stderr = $errTask.Result }
+    $exitCode = -1
+    if ($proc.HasExited) { $exitCode = $proc.ExitCode }
+    [pscustomobject]@{
+        ExitCode = $exitCode; TimedOut = $timedOut; Stdout = $stdout; Stderr = $stderr
+        Minutes = [math]::Round(((Get-Date) - $started).TotalMinutes, 1)
+    }
+}
+
+# The runner runs testCommand itself: "tests exit 0" counts only when a program observes it.
+function Invoke-Tests($Cfg, [string]$LogPath) {
+    $p = Invoke-Process ([string]$Cfg.testCommand) ([double]$Cfg.testTimeoutMinutes) ''
+    $text = [string]$p.Stdout
+    if ($p.Stderr) { $text = $text.TrimEnd() + "`n" + $p.Stderr }
+    Write-TextFile $LogPath $text
+    $lines = @(($text -replace "`r", '') -split "`n" | Where-Object { $_.Trim() -ne '' })
+    $tail = (@($lines | Select-Object -Last 40 | ForEach-Object {
+        if ($_.Length -gt 300) { $_.Substring(0, 300) } else { $_ }
+    }) -join "`n")
+    $passed = (-not $p.TimedOut) -and ($p.ExitCode -eq 0)
+    $label = 'green'
+    if ($p.TimedOut) { $label = "red (timeout after $($Cfg.testTimeoutMinutes) min)" }
+    elseif (-not $passed) { $label = "red (exit $($p.ExitCode))" }
+    [pscustomobject]@{
+        Passed = $passed; ExitCode = $p.ExitCode; TimedOut = $p.TimedOut; Label = $label
+        Tail = $tail; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = $p.Minutes
+    }
+}
+
+function Get-RelPath([string]$Path) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $root = $Project.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { return $full.Substring($root.Length).Replace('\', '/') }
+    $full
+}
+
 # Starts one Claude Code run in a NEW process (= empty context) and waits with a timeout.
-function Invoke-Worker($Cfg, [string]$Change, [int]$Run, [string]$LogBase, [string]$SettingsPath, [string]$AgentsPath) {
+function Invoke-Worker($Cfg, $Item, [int]$Run, [string]$LogBase, [string]$SettingsPath, [string]$AgentsPath) {
     $shell = @($script:AllowedShell | ForEach-Object { "- $_" }) -join "`n"
+    $kind = 'change'
+    $evidence = ''
+    if ($Item.IsFix) {
+        $kind = "fix (fixes $($Item.Parent))"
+        $evidence = @"
+
+Runner test evidence (tests $($Item.EvidenceLabel), last 40 lines of output):
+$($Item.Evidence)
+
+"@
+    }
     $prompt = @"
-Change: $Change
-Run: $Run of max $($Cfg.maxRunsPerChange) for this change
+Change: $($Item.Name)
+Kind: $kind
+Run: $Run of max $($Item.MaxRuns) for this change
 Task budget for this run: $($Cfg.tasksPerRun)
 Test command: $($Cfg.testCommand)
-
+$evidence
 Allowed shell commands (one per Bash call, from the project root; any arguments):
 $shell
 
@@ -297,53 +403,13 @@ Process this change according to your OpenSpec auto-mode instructions.
     if ($Cfg.maxBudgetUsdPerRun) { $claudeArgs += @('--max-budget-usd', [string]$Cfg.maxBudgetUsdPerRun) }
 
     $cmdLine = ((@($ClaudeCommand) + $claudeArgs) | ForEach-Object { ConvertTo-CmdArg $_ }) -join ' '
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    if ($IsWin) {
-        $psi.FileName = 'cmd.exe'
-        $psi.Arguments = "/d /s /c `"$cmdLine`""
-    } else {
-        $psi.FileName = '/bin/sh'
-        $psi.Arguments = "-c '$($cmdLine.Replace("'", "'\''"))'"
-    }
-    $psi.WorkingDirectory = $Project
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.StandardOutputEncoding = $Utf8
-    $psi.StandardErrorEncoding = $Utf8
-    $psi.EnvironmentVariables['OPENSPEC_AUTO_MODE'] = '1'
-
-    $started = Get-Date
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
-    $errTask = $proc.StandardError.ReadToEndAsync()
-    $proc.StandardInput.Write($prompt)
-    $proc.StandardInput.Close()
-
-    $timedOut = $false
-    try {
-        if (-not $proc.WaitForExit([int]$Cfg.timeoutMinutes * 60 * 1000)) {
-            $timedOut = $true
-            if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
-            $proc.WaitForExit(15000) | Out-Null
-        }
-    } finally {
-        if (-not $proc.HasExited) {
-            if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
-        }
-    }
-    $null = $outTask.Wait(15000); $null = $errTask.Wait(15000)
-    $stdout = ''; $stderr = ''
-    if ($outTask.IsCompleted) { $stdout = $outTask.Result }
-    if ($errTask.IsCompleted) { $stderr = $errTask.Result }
-    $exitCode = -1
-    if ($proc.HasExited) { $exitCode = $proc.ExitCode }
+    $p = Invoke-Process $cmdLine ([double]$Cfg.timeoutMinutes) $prompt
+    $stdout = [string]$p.Stdout
     Write-TextFile "$LogBase.out.json" $stdout
-    if ($stderr) { Write-TextFile "$LogBase.err.txt" $stderr }
+    if ($p.Stderr) { Write-TextFile "$LogBase.err.txt" $p.Stderr }
 
     $info = [pscustomobject]@{
-        ExitCode = $exitCode; TimedOut = $timedOut; Minutes = [math]::Round(((Get-Date) - $started).TotalMinutes, 1)
+        ExitCode = $p.ExitCode; TimedOut = $p.TimedOut; Minutes = $p.Minutes
         Claimed = $null; Subtype = $null; IsError = $false; Turns = $null; Cost = $null; Result = ''
     }
     try {
@@ -393,6 +459,7 @@ if (-not (Get-Command $OpenSpecExe -ErrorAction SilentlyContinue)) { $errors += 
 $cfg = Read-Config
 if (-not $cfg) { $errors += "$ConfigRel missing (run with -Init)" }
 elseif (-not $cfg.testCommand) { $errors += "testCommand is not set in $ConfigRel" }
+elseif ($cfg.fixMode -notin @('immediate', 'stop')) { $errors += "fixMode in $ConfigRel must be 'immediate' or 'stop' (is '$($cfg.fixMode)')" }
 $baseBranch = Get-CurrentBranch
 if (-not $baseBranch) { $errors += 'HEAD is detached; check out a branch first' }
 if ((Invoke-Git @('config', 'user.email')).Out -eq '') { $errors += 'git user.email is not set' }
@@ -401,13 +468,20 @@ $dirty = Get-DirtyStatus
 if ($dirty) { $errors += "working tree is not clean:`n$dirty" }
 
 $numbered = @()
+$fixCandidate = $null
 if ($errors.Count -eq 0) {
-    $numbered = Get-NumberedChanges (Get-ActiveChanges)
-    $blocked = @($numbered | Where-Object { Test-Path (Join-Path $Project "openspec/changes/$($_.name)/BLOCKED.md") })
+    $active = Get-ActiveChanges
+    $numbered = Get-NumberedChanges $active
+    # fix-NN changes whose numbered change is already archived (created by an earlier run)
+    $pendingFixes = @($active | Where-Object { $fp = Get-FixParent $_.name; $fp -and (Get-ArchivedDir $fp) })
+    $blocked = @(@($numbered) + @($pendingFixes) | Where-Object { Test-Path (Join-Path $Project "openspec/changes/$($_.name)/BLOCKED.md") })
     foreach ($b in $blocked) {
         $errors += "change $($b.name) is blocked (openspec/changes/$($b.name)/BLOCKED.md); resolve it, delete BLOCKED.md and commit"
     }
-    if ($numbered.Count -eq 0) { $errors += 'no active numbered changes (NN-name) to process' }
+    # an interrupted fix can be resumed only on the branch of the change it fixes
+    $fixCandidate = $pendingFixes | Where-Object { "auto/$(Get-FixParent $_.name)" -eq $baseBranch } |
+        ForEach-Object { $_.name } | Select-Object -First 1
+    if ($numbered.Count -eq 0 -and -not $fixCandidate) { $errors += 'no active numbered changes (NN-name) to process' }
     foreach ($c in $numbered) {
         foreach ($p in (Get-ProposeProblems $c.name)) {
             $errors += "change $($c.name) is not ready (propose incomplete): $p"
@@ -421,8 +495,33 @@ if ($errors.Count -gt 0) {
 
 $resumed = ($baseBranch -like 'auto/*') -or ((Invoke-Git @('branch', '--list', 'auto/*')).Out -ne '')
 Write-Ok "base branch: $baseBranch$(if ($resumed) { ' (resuming)' })"
-Write-Ok ("plan: " + (($numbered | ForEach-Object { $_.name }) -join ' -> '))
-if ($DryRun) { Write-Step 'Dry run, nothing executed.'; exit 0 }
+
+# Baseline: a failure must not be blamed on the first change, so the start has to be green.
+Write-Host '    baseline tests ...' -NoNewline
+$baselineLog = Join-Path $Project "$StateDirName/baseline-tests.txt"
+$baseline = Invoke-Tests $cfg $baselineLog
+Write-Host (" {0}, {1} min" -f $baseline.Label, $baseline.Minutes)
+$resumeFix = $null
+if ($baseline.Dirty) {
+    Write-Bad "testCommand leaves the working tree dirty:`n$($baseline.Dirty)`n    add these files to .gitignore (or clean them up) and run again"
+    exit 2
+}
+if (-not $baseline.Passed) {
+    if ($fixCandidate -and $cfg.fixMode -eq 'immediate') {
+        $resumeFix = $fixCandidate
+        Write-Warn "baseline tests fail; resuming $resumeFix first"
+    } else {
+        Write-Bad "baseline tests fail: $($baseline.Label); auto-mode needs a green start. Output: $StateDirName/baseline-tests.txt"
+        exit 2
+    }
+} else {
+    Write-Ok 'baseline tests green'
+}
+if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered changes (NN-name) to process'; exit 2 }
+
+$planNames = @(@($resumeFix) + @($numbered | ForEach-Object { $_.name }) | Where-Object { $_ })
+Write-Ok ("plan: " + ($planNames -join ' -> '))
+if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runDir = Join-Path $Project "$StateDirName/runs/$stamp"
@@ -444,18 +543,44 @@ $results = @()
 $branches = @()
 $stopReason = $null
 
-foreach ($c in $numbered) {
-    $change = $c.name
-    $branch = "auto/$change"
-    Write-Step "Change $change"
+function New-QueueItem([string]$Name, [bool]$IsFix, [string]$Parent, [string]$Branch, [int]$MaxRuns, [string]$Evidence, [string]$EvidenceLabel) {
+    [pscustomobject]@{
+        Name = $Name; IsFix = $IsFix; Parent = $Parent; Branch = $Branch; MaxRuns = $MaxRuns
+        Evidence = $Evidence; EvidenceLabel = $EvidenceLabel
+    }
+}
 
-    # 1. branch (kap. 5 bod 1, kap. 5.2)
-    if (Test-BranchExists $branch) {
+# Queue instead of a fixed list: a fix-NN change is inserted right after its change.
+$queue = New-Object System.Collections.ArrayList
+if ($resumeFix) {
+    $rp = Get-FixParent $resumeFix
+    [void]$queue.Add((New-QueueItem $resumeFix $true $rp "auto/$rp" ([int]$cfg.maxRunsPerFix) $baseline.Tail $baseline.Label))
+}
+foreach ($c in $numbered) {
+    [void]$queue.Add((New-QueueItem $c.name $false $null "auto/$($c.name)" ([int]$cfg.maxRunsPerChange) $null $null))
+}
+
+for ($qi = 0; $qi -lt $queue.Count; $qi++) {
+    $item = $queue[$qi]
+    $change = $item.Name
+    $branch = $item.Branch
+    Write-Step "$(if ($item.IsFix) { 'Fix' } else { 'Change' }) $change"
+
+    # 1. branch (kap. 5 bod 1, kap. 5.2); a fix runs on the branch of the change it fixes
+    if ($item.IsFix) {
+        $current = Get-CurrentBranch
+        if ($current -ne $branch) {
+            $stopReason = "fix $change must run on $branch, but the current branch is $current; nothing was changed"
+            $results += [pscustomobject]@{ Change = $change; Outcome = 'STOPPED'; Runs = 0; Branch = $branch; Cost = 0; Tests = '-'; Notes = $stopReason }
+            break
+        }
+        Write-Ok "fixing on branch $branch"
+    } elseif (Test-BranchExists $branch) {
         $current = Get-CurrentBranch
         if ($current -ne $branch) {
             if ((Invoke-Git @('merge-base', '--is-ancestor', 'HEAD', $branch)).Code -ne 0) {
                 $stopReason = "branch $branch exists and diverges from the current branch $current; nothing was changed"
-                $results += [pscustomobject]@{ Change = $change; Outcome = 'STOPPED'; Runs = 0; Branch = $branch; Cost = 0; Notes = $stopReason }
+                $results += [pscustomobject]@{ Change = $change; Outcome = 'STOPPED'; Runs = 0; Branch = $branch; Cost = 0; Tests = '-'; Notes = $stopReason }
                 break
             }
             $r = Invoke-Git @('checkout', '-q', $branch)
@@ -467,22 +592,25 @@ foreach ($c in $numbered) {
         if ($r.Code -ne 0) { $stopReason = "git checkout -b $branch failed: $($r.Out)"; break }
         Write-Ok "created branch $branch"
     }
-    $branches += $branch
+    if ($branches -notcontains $branch) { $branches += $branch }
 
-    $outcome = $null; $notes = @(); $cost = 0.0; $run = 0
+    $outcome = $null; $notes = @(); $cost = 0.0; $run = 0; $testsLabel = '-'
+    if ($item.IsFix) { $notes += "fixes $($item.Parent)" }
     while (-not $outcome) {
         $run++
-        if ($run -gt [int]$cfg.maxRunsPerChange) {
-            $outcome = 'STOPPED'; $notes += "no result after $($cfg.maxRunsPerChange) runs (maxRunsPerChange)"; break
+        if ($run -gt $item.MaxRuns) {
+            $outcome = 'STOPPED'
+            if ($item.IsFix) { $notes += "tests still fail after $($item.MaxRuns) runs (maxRunsPerFix); the fix plan is probably wrong" }
+            else { $notes += "no result after $($item.MaxRuns) runs (maxRunsPerChange)" }
+            break
         }
         $before = Get-TaskCounts (Join-Path $Project "openspec/changes/$change")
-        $headBefore = Get-Head
         $refsBefore = Get-RemoteRefs
 
         # 2. new process = empty context (kap. 5.1)
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
-        $w = Invoke-Worker $cfg $change $run $logBase $settingsPath $agentsPath
+        $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath
         if ($w.Cost) { $cost += [double]$w.Cost }
         Write-Host (" exit {0}, {1} min, claims {2}" -f $w.ExitCode, $w.Minutes, $(if ($w.Claimed) { $w.Claimed } else { '-' }))
 
@@ -498,6 +626,9 @@ foreach ($c in $numbered) {
         if ((Get-RemoteRefs) -ne $refsBefore) { $problems += 'remote-tracking refs changed during the run (possible push)' }
         $v = Invoke-OpenSpec @('validate', '--specs', '--no-interactive')
         if ($v.Code -ne 0) { $problems += "openspec validate --specs failed:`n$($v.Out)" }
+        if ($item.IsFix -and (Test-Path (Join-Path $Project "openspec/changes/fix-$change"))) {
+            $problems += "fix-$change was created; a fix change must not create another change"
+        }
 
         # 4. evaluate result from files (kap. 7)
         $activeDir = Join-Path $Project "openspec/changes/$change"
@@ -509,7 +640,10 @@ foreach ($c in $numbered) {
             $t = Get-TaskCounts $archivedDir
             if (Test-Path (Join-Path $archivedDir 'BLOCKED.md')) { $problems += 'archived change contains BLOCKED.md' }
             if ($t.Done -eq $t.Total) { $kind = 'SUCCESS' }
-            else {
+            elseif ($item.IsFix) {
+                $problems += "fix change archived with $($t.Done)/$($t.Total) tasks; a fix change has no NONCRITICAL result"
+                $kind = 'UNEXPECTED'
+            } else {
                 $fix = "fix-$change"
                 if (-not (Test-Path (Join-Path $Project "openspec/changes/$fix"))) {
                     $problems += "change archived with $($t.Done)/$($t.Total) tasks and no $fix change"
@@ -534,6 +668,21 @@ foreach ($c in $numbered) {
             $problems += 'change is neither active nor archived'
             $kind = 'UNEXPECTED'
         }
+
+        # 5. test gate: once the change is archived, the runner runs testCommand itself
+        $tests = $null
+        if ($problems.Count -eq 0 -and $kind -in @('SUCCESS', 'NONCRITICAL')) {
+            Write-Host '    tests ...' -NoNewline
+            $tests = Invoke-Tests $cfg "$logBase.tests.txt"
+            $testsLabel = $tests.Label
+            Write-Host (" {0}, {1} min" -f $tests.Label, $tests.Minutes)
+            $claimText = '-'
+            if ($w.Claimed) { $claimText = $w.Claimed }
+            if ($tests.Dirty) { $problems += "testCommand left the working tree dirty:`n$($tests.Dirty)" }
+            elseif ($kind -eq 'SUCCESS' -and -not $tests.Passed) {
+                $problems += "tests fail after $change was archived ($($tests.Label), agent claimed $claimText); output: $(Get-RelPath $tests.Log)"
+            }
+        }
         if ($w.Claimed -and $w.Claimed -ne $kind -and $problems.Count -eq 0) {
             $notes += "run ${run}: agent claimed $($w.Claimed), files say $kind"
         }
@@ -548,13 +697,33 @@ foreach ($c in $numbered) {
         } else {
             $outcome = $kind
             if ($kind -eq 'BLOCKED') { $stopReason = "change $change is blocked: openspec/changes/$change/BLOCKED.md" }
+            if ($kind -eq 'NONCRITICAL') {
+                $fix = "fix-$change"
+                if ($tests.Passed) {
+                    $notes += "${fix}: no failing test observed, waits for you"
+                } elseif ($cfg.fixMode -eq 'immediate') {
+                    $notes += "tests $($tests.Label); $fix processed next"
+                    $queue.Insert($qi + 1, (New-QueueItem $fix $true $change $branch ([int]$cfg.maxRunsPerFix) $tests.Tail $tests.Label))
+                } else {
+                    $notes += "tests $($tests.Label); $fix waits for you (fixMode=stop)"
+                    $stopReason = "tests fail after NONCRITICAL $change; $fix waits for you (fixMode=stop); output: $(Get-RelPath $tests.Log)"
+                }
+            }
             Write-Ok "result: $kind"
         }
     }
     if ($outcome -eq 'STOPPED' -and -not $stopReason) { $stopReason = "change ${change}: $($notes -join '; ')" }
 
-    $results += [pscustomobject]@{ Change = $change; Outcome = $outcome; Runs = [math]::Min($run, [int]$cfg.maxRunsPerChange); Branch = $branch; Cost = $cost; Notes = ($notes -join '; ') }
-    if ($outcome -notin @('SUCCESS', 'NONCRITICAL')) { break }
+    if ($item.IsFix) {
+        $parentRow = $results | Where-Object { $_.Change -eq $item.Parent } | Select-Object -First 1
+        if ($parentRow) {
+            $fixNote = "$change failed ($outcome)"
+            if ($outcome -eq 'SUCCESS') { $fixNote = "fixed by $change" }
+            $parentRow.Notes = (@($parentRow.Notes, $fixNote) | Where-Object { $_ }) -join '; '
+        }
+    }
+    $results += [pscustomobject]@{ Change = $change; Outcome = $outcome; Runs = [math]::Min($run, $item.MaxRuns); Branch = $branch; Cost = $cost; Tests = $testsLabel; Notes = ($notes -join '; ') }
+    if ($stopReason -or ($outcome -notin @('SUCCESS', 'NONCRITICAL'))) { break }
 }
 
 # ---------------------------------------------------------------- report (kap. 10)
@@ -572,17 +741,20 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("- End: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))")
 [void]$sb.AppendLine("- Base branch: ``$baseBranch``$(if ($resumed) { ' (resumed run)' })")
 [void]$sb.AppendLine("- Final branch: ``$(Get-CurrentBranch)``")
+$baselineText = $baseline.Label
+if ($resumeFix) { $baselineText += " (resuming $resumeFix)" }
+[void]$sb.AppendLine("- Baseline tests: $baselineText")
 if ($stopReason) { [void]$sb.AppendLine("- **Stopped:** $stopReason") } else { [void]$sb.AppendLine('- **Finished:** all numbered changes processed') }
 [void]$sb.AppendLine()
 [void]$sb.AppendLine('## Changes')
 [void]$sb.AppendLine()
-[void]$sb.AppendLine('| Change | Result | Runs | Branch | Cost USD | Notes |')
-[void]$sb.AppendLine('|---|---|---|---|---|---|')
+[void]$sb.AppendLine('| Change | Result | Runs | Tests | Branch | Cost USD | Notes |')
+[void]$sb.AppendLine('|---|---|---|---|---|---|---|')
 foreach ($r in $results) {
     $n = ($r.Notes -replace "`r?`n", ' ' -replace '\|', '/')
-    [void]$sb.AppendLine("| $($r.Change) | $($r.Outcome) | $($r.Runs) | ``$($r.Branch)`` | $([math]::Round($r.Cost, 2)) | $n |")
+    [void]$sb.AppendLine("| $($r.Change) | $($r.Outcome) | $($r.Runs) | $($r.Tests) | ``$($r.Branch)`` | $([math]::Round($r.Cost, 2)) | $n |")
 }
-foreach ($n in $notReached) { [void]$sb.AppendLine("| $n | not processed | 0 | | | |") }
+foreach ($n in $notReached) { [void]$sb.AppendLine("| $n | not processed | 0 | | | | |") }
 [void]$sb.AppendLine()
 [void]$sb.AppendLine('## Fix changes waiting for you')
 [void]$sb.AppendLine()

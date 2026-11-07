@@ -57,7 +57,8 @@ The actual work is done by separate Claude Code processes, each with an empty co
 2. **`/openspec-auto run`** processes them unattended, one after another: implements, tests, archives and commits. Each change gets its own git branch `auto/NN-name`.
 3. Every agent run is a **new process with an empty context**. A large change is split across several runs. Nothing is carried between runs through the conversation, only through files, so the context window never fills up.
 4. After each run it verifies that everything is written and committed. If not, auto-mode stops.
-5. At the end you get a summary. You review and merge the result. Auto-mode never pushes or merges on its own.
+5. It does not take the agent's word that the tests pass: after every finished change it runs the tests itself. It also runs them once before it starts; the start has to be green.
+6. At the end you get a summary. You review and merge the result. Auto-mode never pushes or merges on its own.
 
 ---
 
@@ -75,7 +76,7 @@ Claude:
 - creates the configuration `openspec/auto-mode.json` and finds out on its own how the project runs tests, build and lint,
 - commits everything.
 
-**Prerequisite:** the project's packages are installed and the tests pass. Auto-mode is not allowed to install packages.
+**Prerequisite:** the project's packages are installed and the tests pass. Auto-mode is not allowed to install packages. The tests must not leave files behind (e.g. a coverage report not listed in `.gitignore`).
 
 ### Settings (optional)
 
@@ -91,6 +92,9 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `maxTurns` | max. agent turns in one run | 200 |
 | `model` | `sonnet` (cheaper), `opus`, … | default model |
 | `maxBudgetUsdPerRun` | cost cap of one run in USD | no limit |
+| `testTimeoutMinutes` | time limit of one test run by auto-mode itself | 20 |
+| `fixMode` | what happens when a change is NONCRITICAL and the tests fail: `immediate` = fix it right away, `stop` = stop and leave it to you | `immediate` |
+| `maxRunsPerFix` | max. runs to fix such a bug | 2 |
 
 ---
 
@@ -107,7 +111,7 @@ For each change:
 | Name | Processed by auto-mode? |
 |---|---|
 | `01-login`, `02-profile`, `10-export` | Yes, in order of the number |
-| `fix-01-login` | No, fix changes wait for you |
+| `fix-01-login` | Only right after `01-login`, when auto-mode created it and the tests fail (section 4); otherwise it waits for you |
 | `login` (no number) | No |
 
 If a change got a different name, ask Claude to rename it (e.g. "rename the change login to 01-login").
@@ -130,7 +134,7 @@ When the changes are ready, tell Claude "commit the proposals".
 /openspec-auto check
 ```
 
-Claude verifies that everything is ready: clean git, numbered changes, each with a complete and valid proposal, no unresolved block. If something is missing, it explains what and offers a fix.
+Claude verifies that everything is ready: clean git, numbered changes, each with a complete and valid proposal, no unresolved block, and passing tests (the check runs them, so it takes as long as your tests). If something is missing, it explains what and offers a fix.
 
 ```
 /openspec-auto run
@@ -148,10 +152,10 @@ You get a summary at the end. `/openspec-auto report` repeats it any time later.
 
 | Result | Meaning | Next step |
 |---|---|---|
-| **SUCCESS** | Done, tests pass, archived. | Review and merge. |
-| **NONCRITICAL** | Done, but something does not work (e.g. a test). A `fix-NN-name` change describing the bug was created. Auto-mode continued. | Fix it via the `fix-` change (section 5.3). |
+| **SUCCESS** | Done, archived, and the tests passed when auto-mode ran them itself. | Review and merge. |
+| **NONCRITICAL** | Done, but something does not work. A `fix-NN-name` change describing the bug was created. If the tests fail, auto-mode fixed it right away with a fresh agent (the `fix-` row in the summary, same branch); if the tests pass, the fix waits for you. | Review the fix, or do the waiting `fix-` change (section 5.3). |
 | **BLOCKED** | Architectural problem, auto-mode stopped. | Decide and resolve (section 5.1). |
-| **FAILED-CHECK / STOPPED** | The check after a run failed (nothing written, crash, timeout, no progress, push attempt). Auto-mode stopped. | Claude explains the cause and proposes a fix (section 5.2). |
+| **FAILED-CHECK / STOPPED** | The check after a run failed (nothing written, crash, timeout, no progress, push attempt, tests fail although the agent reported success, the fix did not make the tests pass). Auto-mode stopped. | Claude explains the cause and proposes a fix (section 5.2). |
 | **not processed** | The loop never reached the change. | It is processed on the next start. |
 
 ### Merge
@@ -173,11 +177,11 @@ Restarting is always the same command, `/openspec-auto run`. It skips finished c
 
 ### 5.2 FAILED-CHECK, STOPPED or interruption
 
-Claude explains the cause and proposes a fix. After the fix, `/openspec-auto run`.
+Claude explains the cause and proposes a fix. After the fix, `/openspec-auto run`. The tests must pass again before the next start; the only exception is an interrupted `fix-` change, which auto-mode resumes on its own.
 
 ### 5.3 Fix changes `fix-…`
 
-Auto-mode does not process them. Either do them with Claude interactively (`/opsx:apply fix-02-profile`), or say "rename fix-02-profile to a numbered change" and the next `/openspec-auto run` processes it.
+Auto-mode processes a `fix-` change on its own only right after the change it belongs to, and only when the tests fail. The others wait for you (the bug is not visible to the tests, `fixMode` is `stop`, or you wrote the change yourself). Either do them with Claude interactively (`/opsx:apply fix-02-profile`), or say "rename fix-02-profile to a numbered change" and the next `/openspec-auto run` processes it.
 
 ### 5.4 More changes
 
@@ -216,6 +220,9 @@ This is mostly for Claude, not for you.
 |---|---|
 | `openspec/auto-mode.json missing` | `/openspec-auto init` |
 | `testCommand is not set` | set `testCommand` |
+| `fixMode … must be 'immediate' or 'stop'` | fix the value in `openspec/auto-mode.json` |
+| `baseline tests fail` | make the tests pass first (output in `.openspec-auto/baseline-tests.txt`); a script in the project root needs `.\name.cmd` |
+| `testCommand leaves the working tree dirty` | add the listed test outputs to `.gitignore`, delete them, commit |
 | `is not a git repository` | `git init` and a first commit |
 | `HEAD is detached` | `git checkout <branch>` |
 | `git user.email is not set` | `git config user.email …` |
@@ -226,5 +233,7 @@ This is mostly for Claude, not for you.
 | `not ready …: openspec validate failed: [ERROR] …` | fix according to the error text |
 | `not ready …: tasks.md has no tasks` | add tasks `- [ ] 1.1 …` |
 | `branch auto/NN-x exists and diverges` (STOPPED in the report) | switch to that branch or delete it |
+| `tests fail after NN-x was archived` (FAILED-CHECK) | the agent reported success but the tests fail; output in the named `.tests.txt` log; fix, commit, run again |
+| `tests still fail after N runs (maxRunsPerFix)` (STOPPED) | the automatic fix did not work; do the `fix-` change interactively |
 
 - **Tool tests** (no API calls): `tests/run-tests.ps1`.

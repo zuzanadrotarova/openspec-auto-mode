@@ -6,12 +6,15 @@ The core idea: **every agent run is a new Claude Code process with an empty cont
 
 ```
 openspec-auto.ps1 (deterministic script)
+  testCommand once: must be green before anything starts
   for each change 01-…, 02-…, …:
     branch auto/NN-name (chained from the previous one)
     ┌─ new process: claude -p --agent openspec-auto   ← empty context
     │    implements at most tasksPerRun tasks, commits, exits
     ├─ script verifies the files (git status, validate, archive/BLOCKED.md, push)
-    └─ not done yet and progress was made? → again, new process
+    ├─ not done yet and progress was made? → again, new process
+    └─ archived? → script runs testCommand itself (the agent's word is not enough)
+         NONCRITICAL + red tests → fix-NN-name right away, new process, same branch
   report → .openspec-auto/auto-mode-report.md
 ```
 
@@ -60,7 +63,10 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 
 | Key | Meaning | Default |
 |---|---|---|
-| `testCommand` | test command (required) | – |
+| `testCommand` | test command (required); the agent runs it, and the script runs it itself at start and after every archived change | – |
+| `testTimeoutMinutes` | time limit of one test run by the script | 20 |
+| `fixMode` | `immediate`: after a NONCRITICAL with failing tests, process its `fix-NN-name` right away; `stop`: stop the loop instead | `immediate` |
+| `maxRunsPerFix` | max. runs for one `fix-NN-name` change | 2 |
 | `allowedCommands` | additional commands the agent may run (build, lint…) | `[]` |
 | `tasksPerRun` | max. tasks from `tasks.md` per run (one context) | 8 |
 | `maxRunsPerChange` | max. runs per change | 10 |
@@ -70,6 +76,8 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `maxBudgetUsdPerRun` | cost cap of one run | no limit |
 
 Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
+
+The tests must pass and must not leave files behind (add test outputs such as coverage reports to `.gitignore`), otherwise the script refuses to start. A script in the project root needs an explicit path (`.\test.cmd`, not `test.cmd`): Claude Code sets `NoDefaultCurrentDirectoryInExePath`, so Windows does not find programs in the current directory by name.
 
 ## Usage
 
@@ -87,10 +95,10 @@ powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\other
 
 | Result | What happens |
 |---|---|
-| SUCCESS | change implemented, tests pass, archived → next change |
-| NONCRITICAL | archived + a `fix-NN-name` change describing the bug is created (not implemented) → next change |
+| SUCCESS | change implemented and archived, the script's own test run passes → next change |
+| NONCRITICAL | archived + a `fix-NN-name` change describing the bug is created. Tests green (bug not visible to tests): the fix waits for you → next change. Tests red: the script processes the fix right away on the same branch (at most `maxRunsPerFix` runs, done = tests green) → next change, or **stop** if the fix does not pass |
 | BLOCKED | architectural problem, `openspec/changes/NN-name/BLOCKED.md`, not archived → **stop** |
-| FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress) → **stop** |
+| FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress, tests fail after archiving) → **stop** |
 
 Report: `.openspec-auto/auto-mode-report.md`, logs of every run: `.openspec-auto/runs/<time>/`. The folder is listed in `.git/info/exclude`, so it never gets into the repository.
 
@@ -101,8 +109,9 @@ Nothing is pushed or merged. You review and merge the `auto/NN-…` branches you
 The script keeps no state of its own; re-running is the same command.
 
 - **BLOCKED:** stay on `auto/NN-name`, resolve the problem (e.g. `/opsx:update NN-name`, install a package, edit `design.md`), delete `BLOCKED.md`, commit, run again. While `BLOCKED.md` exists, the script refuses to start.
-- **FAILED-CHECK:** check the report and the run log, fix the state (commit or revert), run again from the current branch.
-- **`fix-…` changes** are not processed by the loop. Implement them interactively (`/opsx:apply fix-NN-name`), or rename them to a numbered change.
+- **FAILED-CHECK:** check the report and the run log, fix the state (commit or revert), run again from the current branch. The tests must be green again before the next start.
+- **Interrupted fix:** if a `fix-NN-name` run was interrupted (crash, timeout), run again from `auto/NN-name`; the script resumes the fix even though the tests are still red.
+- **`fix-…` changes waiting for you** (tests were green, `fixMode: stop`, or written by hand) are not processed by the loop. Implement them interactively (`/opsx:apply fix-NN-name`), or rename them to a numbered change.
 
 ## Safety
 
