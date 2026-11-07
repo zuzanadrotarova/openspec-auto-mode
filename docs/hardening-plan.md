@@ -1,6 +1,6 @@
 # Hardening openspec-auto-mode: discussion and plan
 
-Status: step 1 implemented (not committed yet); `tests/run-tests.ps1` passes (73 checks). Next: try it on a small real project.
+Status: step 1 merged into `main` (2bc022f), tried on a real project (section 6.9). Step 2 implemented on branch `harden/step-2-task-groups` (section 7.8), fake-agent tests pass.
 Date: 2026-11-07
 
 ## 1. Starting point
@@ -236,3 +236,115 @@ be checked on a real project (step 2 of the order).
 - The fix row's result is also noted on the parent row (`fixed by fix-NN` / `fix-NN failed (…)`).
 - `null` for one of the three new keys in `auto-mode.json` means its default; existing keys behave
   as before (e.g. `"maxTurns": null` still means no turn limit).
+
+### 6.9 Trial on a real project (2026-11-07)
+Demo project `openspec-auto-demo` (Node, `node --test`, no packages), changes `01-slugify`,
+`02-truncate`, `03-unique-slug` (two task groups each: implementation, tests), model `sonnet`.
+- All three SUCCESS in one run each, runner's own test run green after every archive.
+- Total USD 0.52, under 2 minutes.
+- The agent did not touch the existing test; one test per spec scenario, nothing missing.
+- **Finding:** the agent committed all tasks of a change in one commit (`1.1-2.1 …`) although the
+  worker prompt asks for a commit per task. Per-task discipline cannot be relied on → step 2 makes
+  the runner enforce the unit (task group) and test between units.
+- Not exercised by the real agent: NONCRITICAL + immediate fix, SUCCESS with red tests (covered only
+  by the fake-agent tests).
+
+## 7. Step 2 – task groups as units (plan)
+
+### 7.1 Idea
+A task group in `tasks.md` (`## N. Title` and its `- [ ]` lines) is the unit of work. One run works
+on one group only. When a group is complete, the runner runs the tests. Red inside a group is
+allowed; red at a group end is sent back as that group only, with the test output and a file scope,
+for at most `maxGroupRepairs` runs. Archiving happens in a separate short final run after the runner
+has seen the last group green, so a red last group is repaired like any other instead of ending in
+FAILED-CHECK.
+
+### 7.2 Config keys
+| Key | Meaning | Default |
+|---|---|---|
+| `groupTesting` | one group per run + runner tests after every group | `true` (open decision) |
+| `maxGroupRepairs` | repair runs per group when the runner's tests are red at the group end | 2 |
+
+`tasksPerRun` stays: a group larger than the budget is split over several runs; the runner tests
+only at the group end.
+
+### 7.3 Runner (`openspec-auto.ps1`)
+1. `Get-TaskGroups($dir)` – parses `## N. Title` headings; tasks before the first heading form an
+   implicit group 0. Returns `{ Id; Title; Total; Done; Open[] }`. Same task regex as `Get-TaskCounts`.
+2. Run state per change: current group = first group with unchecked tasks; `groupStartHead` (HEAD
+   when the group's first run started; on resume = HEAD at start); `repairs` per group.
+3. Prompt from the runner (new lines):
+   ```
+   Task group for this run: 2. Truncate (open tasks: 2.1, 2.2)
+   Finish this group only and end with CONTINUE; do not archive in this run.
+   ```
+   repair run:
+   ```
+   Repair: group 1 is complete but the runner's tests fail (exit 1).
+   Scope: fix only the cause, in these files changed by the group: src/text.js, tests/slugify.test.js
+   Runner test evidence (last 40 lines): ...
+   ```
+   final run:
+   ```
+   Final run: all task groups are done and the runner's tests are green.
+   Do the completion check and archive.
+   ```
+4. Evaluation after a CONTINUE-like run (change still active, no BLOCKED.md):
+   - a group became complete → `Invoke-Tests` → log `<change>.runNN.group<N>.tests.txt`.
+     green → progress, next group (or final run); red → next run is a repair run for that group.
+   - repair run → `Invoke-Tests`: green → progress; red → `repairs++`; above `maxGroupRepairs` →
+     STOPPED `group N still red after M repair runs`.
+   - "progress" = more tasks ticked, or a repair run that turned the tests green. Otherwise the
+     existing no-progress stop applies.
+   - tasks ticked outside the current group → note in the report (not a stop); the test gate still
+     runs, only attribution is coarser. (Open decision: note or FAILED-CHECK.)
+5. Archive without the final run (agent ignored the rule) → step 1 gate still applies (red =
+   FAILED-CHECK, green = SUCCESS with a note).
+6. Fix changes (`fix-NN`) keep the step 1 flow (they have one group and a test target already).
+7. Report: per change the groups with their test result, e.g. `1 green, 2 red→green (1 repair)`.
+
+### 7.4 `worker-prompt.md` (outline of the diff)
+- Assignment: the user message also gives the task group, or a repair or final instruction.
+- Implement: work only on the given group; when its tasks are done, run the test command, commit,
+  end with `CONTINUE`. The runner tests again and decides.
+- Repair: fix only the cause of the failing tests within the given files; no new features, no ticks
+  of other tasks; the test rule (never weaken tests) applies; if not fixable → classify as today.
+- Act / SUCCESS: archive only in a final run (or when the runner gives no group, i.e. groupTesting off).
+
+### 7.5 Tests (fake agent)
+New fake modes: `group` (ticks the open tasks of the group named in the prompt, archives only when
+the prompt says Final run), `group-red` (group 1 creates `broken.txt`, repair run removes it),
+`group-stuck` (never repairs), existing `success` (ignores groups).
+| Test | Expected |
+|---|---|
+| T12 one group per run | 2 groups → 3 runs (group 1, group 2, final), prompts name the groups, two group test logs |
+| T13 repair converges | group 1 red → run 2 is a repair run with evidence and scope `src`; then green → SUCCESS, report `red→green` |
+| T14 repair does not converge | STOPPED `group 1 still red after 2 repair runs`, next change not processed |
+| T15 agent ignores groups | `success` mode archives in run 1 → SUCCESS with note `ticked tasks outside group 1` |
+| T16 groupTesting off | old behavior: one run, no group logs |
+Existing T1–T11 must stay green with the default on.
+
+### 7.6 Docs
+GUIDE section 2 (proposing): a group should be a logical unit that ends in a testable state and
+contains its own tests — "1. Slugify (code + tests)", not "1. Implementation / 2. Tests" (with that
+layout the first gate checks nothing new). README/GUIDE config tables, SKILL report wording.
+
+### 7.7 Risks
+- Cost and time: each group is a fresh process that re-reads the change. The demo would need 3 runs
+  per change instead of 1 (estimate 2–2.5× cost for small changes). Larger changes gain the most.
+- The unit only means something if proposals have sensible groups; old "Implementation / Tests"
+  layouts gain little.
+- Scope after a resume is coarser (files since resume start, not since the group start).
+
+### 7.8 Decisions and implementation notes
+- Decisions: `groupTesting` default `true`; ticks outside the current group are a report note, not a stop.
+- Start check (exit 2): with `groupTesting`, a change needs `open groups + 1` runs; a too small
+  `maxRunsPerChange` is refused before anything runs.
+- A repair run does not need to tick tasks; its progress is the runner's test result. Every red
+  repair counts; at `maxGroupRepairs` the change is STOPPED.
+- Scope of a repair = `git diff --name-only` from the commit where the group started to HEAD.
+- Report notes use ASCII (`red->green`) because Windows PowerShell 5.1 reads the BOM-less script as ANSI.
+- Known gap: if a change is resumed with all tasks ticked but not archived, there is no extra test
+  run before the final run; the step 1 gate after archiving still catches red tests (FAILED-CHECK).
+  Tests at start (baseline) cover the common case where the change's branch is checked out.
+- Fake-agent tests T12–T17 added; T1–T11 unchanged and green with `groupTesting` on.

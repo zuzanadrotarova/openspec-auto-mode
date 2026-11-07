@@ -57,7 +57,7 @@ The actual work is done by separate Claude Code processes, each with an empty co
 2. **`/openspec-auto run`** processes them unattended, one after another: implements, tests, archives and commits. Each change gets its own git branch `auto/NN-name`.
 3. Every agent run is a **new process with an empty context**. A large change is split across several runs. Nothing is carried between runs through the conversation, only through files, so the context window never fills up.
 4. After each run it verifies that everything is written and committed. If not, auto-mode stops.
-5. It does not take the agent's word that the tests pass: after every finished change it runs the tests itself. It also runs them once before it starts; the start has to be green.
+5. It does not take the agent's word that the tests pass: it runs the tests itself after every task group (the `## 1. …`, `## 2. …` sections of `tasks.md`) and after every finished change. If a group breaks the tests, the next run repairs only that group. It also runs the tests once before it starts; the start has to be green.
 6. At the end you get a summary. You review and merge the result. Auto-mode never pushes or merges on its own.
 
 ---
@@ -95,6 +95,8 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `testTimeoutMinutes` | time limit of one test run by auto-mode itself | 20 |
 | `fixMode` | what happens when a change is NONCRITICAL and the tests fail: `immediate` = fix it right away, `stop` = stop and leave it to you | `immediate` |
 | `maxRunsPerFix` | max. runs to fix such a bug | 2 |
+| `groupTesting` | one task group per run and tests after every group; `false` = faster and cheaper, but tests only at the end | `true` |
+| `maxGroupRepairs` | how many times the agent may try to repair a group that broke the tests | 2 |
 
 ---
 
@@ -121,6 +123,7 @@ If a change got a different name, ask Claude to rename it (e.g. "rename the chan
 - Each change must have all parts: `proposal.md`, `design.md`, `tasks.md` and spec deltas.
 - Architectural decisions belong in `design.md`. The agent must not deviate from it; if it would have to, it stops and asks you.
 - Concrete tasks in `tasks.md` (file, function, what it should do) mean fewer stops.
+- Split `tasks.md` into groups (`## 1. …`, `## 2. …`) that are logical units ending in a working state, each with its own tests: "1. Slugify (code + tests)", "2. Truncate (code + tests)". Not "1. Implementation / 2. Tests": then the check after group 1 tests nothing new. Every group costs one agent run (plus one short final run per change).
 - Small changes (3 to 10 tasks) work best. Split a large feature into several changes.
 - You do not have to propose the whole project at once. A batch is enough; add more changes later.
 
@@ -235,5 +238,7 @@ This is mostly for Claude, not for you.
 | `branch auto/NN-x exists and diverges` (STOPPED in the report) | switch to that branch or delete it |
 | `tests fail after NN-x was archived` (FAILED-CHECK) | the agent reported success but the tests fail; output in the named `.tests.txt` log; fix, commit, run again |
 | `tests still fail after N runs (maxRunsPerFix)` (STOPPED) | the automatic fix did not work; do the `fix-` change interactively |
+| `group N still red after M repair runs` (STOPPED) | the group broke the tests and the agent could not repair it; look at the named `.tests.txt`, fix interactively, commit, run again |
+| `has N open task groups; … needs at least N+1 runs` | raise `maxRunsPerChange`, merge small groups, or set `groupTesting` to `false` |
 
 - **Tool tests** (no API calls): `tests/run-tests.ps1`.

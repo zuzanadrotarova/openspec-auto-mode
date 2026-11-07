@@ -14,5 +14,7 @@
   "maxBudgetUsdPerRun": null,
   "testTimeoutMinutes": 20,
   "fixMode": "immediate",
-  "maxRunsPerFix": 2
+  "maxRunsPerFix": 2,
+  "groupTesting": true,
+  "maxGroupRepairs": 2
 }

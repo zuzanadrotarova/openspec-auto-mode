@@ -138,6 +138,44 @@ function Get-TaskCounts([string]$ChangeDir) {
     [pscustomobject]@{ Total = $total; Done = $done }
 }
 
+# Task groups of tasks.md: a "## N. Title" heading and the task lines under it. Tasks before the
+# first numbered heading form group 0. Groups without tasks are left out.
+function Get-TaskGroups([string]$ChangeDir) {
+    $file = Join-Path $ChangeDir 'tasks.md'
+    $groups = New-Object System.Collections.ArrayList
+    $cur = $null
+    if (Test-Path $file) {
+        foreach ($line in [System.IO.File]::ReadAllLines($file)) {
+            if ($line -match '^\s*##\s+(\d+)\.?\s*(.*)$') {
+                $cur = [pscustomobject]@{ Id = $Matches[1]; Title = $Matches[2].Trim(); Total = 0; Done = 0; Open = @() }
+                [void]$groups.Add($cur)
+                continue
+            }
+            if ($line -match '^\s*[-*]\s+\[( |x|X)\]\s*(.*)$') {
+                $mark = $Matches[1]; $text = $Matches[2].Trim()
+                if (-not $cur) {
+                    $cur = [pscustomobject]@{ Id = '0'; Title = '(tasks without a group)'; Total = 0; Done = 0; Open = @() }
+                    [void]$groups.Add($cur)
+                }
+                $cur.Total++
+                if ($mark -ne ' ') { $cur.Done++ }
+                else {
+                    $tid = ($text -split '\s+')[0]
+                    if ($tid -notmatch '^\d+(\.\d+)*$') { $tid = $text.Substring(0, [math]::Min(40, $text.Length)) }
+                    $cur.Open += $tid
+                }
+            }
+        }
+    }
+    @($groups | Where-Object { $_.Total -gt 0 })
+}
+
+function Get-GroupDone($Groups) {
+    $h = @{}
+    foreach ($g in @($Groups)) { $h[$g.Id] = $g.Done }
+    $h
+}
+
 function Get-ArchivedDir([string]$Change) {
     $archive = Join-Path $Project 'openspec/changes/archive'
     if (-not (Test-Path $archive)) { return $null }
@@ -182,6 +220,8 @@ function Read-Config {
         testTimeoutMinutes = 20
         fixMode            = 'immediate'
         maxRunsPerFix      = 2
+        groupTesting       = $true
+        maxGroupRepairs    = 2
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -189,6 +229,8 @@ function Read-Config {
     if ($null -eq $cfg.testTimeoutMinutes) { $cfg.testTimeoutMinutes = 20 }
     if ($null -eq $cfg.fixMode) { $cfg.fixMode = 'immediate' }
     if ($null -eq $cfg.maxRunsPerFix) { $cfg.maxRunsPerFix = 2 }
+    if ($null -eq $cfg.groupTesting) { $cfg.groupTesting = $true }
+    if ($null -eq $cfg.maxGroupRepairs) { $cfg.maxGroupRepairs = 2 }
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
 }
@@ -360,7 +402,7 @@ function Get-RelPath([string]$Path) {
 }
 
 # Starts one Claude Code run in a NEW process (= empty context) and waits with a timeout.
-function Invoke-Worker($Cfg, $Item, [int]$Run, [string]$LogBase, [string]$SettingsPath, [string]$AgentsPath) {
+function Invoke-Worker($Cfg, $Item, [int]$Run, [string]$LogBase, [string]$SettingsPath, [string]$AgentsPath, [string]$UnitText) {
     $shell = @($script:AllowedShell | ForEach-Object { "- $_" }) -join "`n"
     $kind = 'change'
     $evidence = ''
@@ -379,7 +421,7 @@ Kind: $kind
 Run: $Run of max $($Item.MaxRuns) for this change
 Task budget for this run: $($Cfg.tasksPerRun)
 Test command: $($Cfg.testCommand)
-$evidence
+$UnitText$evidence
 Allowed shell commands (one per Bash call, from the project root; any arguments):
 $shell
 
@@ -485,6 +527,13 @@ if ($errors.Count -eq 0) {
     foreach ($c in $numbered) {
         foreach ($p in (Get-ProposeProblems $c.name)) {
             $errors += "change $($c.name) is not ready (propose incomplete): $p"
+        }
+        if ($cfg.groupTesting) {
+            # one run per open group plus the final run must fit into maxRunsPerChange
+            $open = @(Get-TaskGroups (Join-Path $Project "openspec/changes/$($c.name)") | Where-Object { $_.Done -lt $_.Total })
+            if ($open.Count + 1 -gt [int]$cfg.maxRunsPerChange) {
+                $errors += "change $($c.name) has $($open.Count) open task groups; with groupTesting it needs at least $($open.Count + 1) runs, but maxRunsPerChange is $($cfg.maxRunsPerChange)"
+            }
         }
     }
 }
@@ -596,6 +645,13 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
 
     $outcome = $null; $notes = @(); $cost = 0.0; $run = 0; $testsLabel = '-'
     if ($item.IsFix) { $notes += "fixes $($item.Parent)" }
+
+    # task groups as units (step 2): one group per run, runner tests after every group
+    $useGroups = [bool]$cfg.groupTesting -and -not $item.IsFix
+    $groupHistory = [ordered]@{}            # group id -> list of 'green' / 'red'
+    $repairGroup = $null; $repairCount = 0; $repairEvidence = ''; $repairLabel = ''; $repairScope = @()
+    $groupStartHead = Get-Head
+
     while (-not $outcome) {
         $run++
         if ($run -gt $item.MaxRuns) {
@@ -605,12 +661,50 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
             break
         }
         $before = Get-TaskCounts (Join-Path $Project "openspec/changes/$change")
+        $groupsBefore = @(Get-TaskGroups (Join-Path $Project "openspec/changes/$change"))
+        $doneBefore = Get-GroupDone $groupsBefore
         $refsBefore = Get-RemoteRefs
 
+        # the unit of this run: one task group, a repair of a red group, or the final (archive) run
+        $mode = $null; $unitGroup = $null; $unitText = ''
+        if ($useGroups) {
+            $openGroup = $groupsBefore | Where-Object { $_.Done -lt $_.Total } | Select-Object -First 1
+            if ($repairGroup) {
+                $mode = 'repair'; $unitGroup = $repairGroup
+                $scopeText = 'not known after a restart; change as little as possible'
+                if ($repairScope.Count) { $scopeText = $repairScope -join ', ' }
+                $unitText = @"
+Repair: task group $repairGroup is complete, but the runner's tests fail ($repairLabel).
+Fix only the cause of the failure. Files changed by the group (scope): $scopeText
+Do not tick or start other tasks and do not archive. End with CONTINUE.
+
+Runner test evidence (last 40 lines of output):
+$repairEvidence
+
+"@
+            } elseif ($openGroup) {
+                $mode = 'group'; $unitGroup = $openGroup.Id
+                $unitText = @"
+Task group for this run: $($openGroup.Id). $($openGroup.Title) (open tasks: $($openGroup.Open -join ', '))
+Finish this group only and end with CONTINUE; do not archive in this run. The runner runs the tests when the group is complete.
+
+"@
+            } else {
+                $mode = 'final'
+                $unitText = @"
+Final run: all task groups are done and the runner's tests are green.
+Do the completion check and archive (SUCCESS).
+
+"@
+            }
+        }
+
         # 2. new process = empty context (kap. 5.1)
-        Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done) ..." -NoNewline
+        $unitLabel = ''
+        if ($mode -eq 'group') { $unitLabel = ", group $unitGroup" } elseif ($mode -eq 'repair') { $unitLabel = ", repair of group $unitGroup" } elseif ($mode -eq 'final') { $unitLabel = ', final' }
+        Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
-        $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath
+        $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath $unitText
         if ($w.Cost) { $cost += [double]$w.Cost }
         Write-Host (" exit {0}, {1} min, claims {2}" -f $w.ExitCode, $w.Minutes, $(if ($w.Claimed) { $w.Claimed } else { '-' }))
 
@@ -660,6 +754,7 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
             $cv = Invoke-OpenSpec @('validate', $change, '--no-interactive')
             if ($cv.Code -ne 0) { $problems += "openspec validate $change failed:`n$($cv.Out)" }
             if ($after.Done -gt $before.Done) { $kind = 'CONTINUE' }
+            elseif ($mode -eq 'repair') { $kind = 'CONTINUE' }   # progress of a repair = tests turn green (below)
             else {
                 $problems += "no progress: change not archived, no BLOCKED.md, tasks $($after.Done)/$($after.Total) unchanged (kap. 7.4)"
                 $kind = 'UNEXPECTED'
@@ -687,10 +782,59 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
             $notes += "run ${run}: agent claimed $($w.Claimed), files say $kind"
         }
 
+        # 6. group gate (step 2): tests after every completed group, repair of a red group
+        $groupStop = $null
+        if ($useGroups -and $problems.Count -eq 0) {
+            $groupsDir = $activeDir
+            if ($archivedDir -and -not $isActive) { $groupsDir = $archivedDir }
+            $groupsAfter = @(Get-TaskGroups $groupsDir)
+            if ($mode -eq 'group') {
+                $outside = @($groupsAfter | Where-Object { $_.Id -ne $unitGroup -and $_.Done -gt [int]$doneBefore[$_.Id] } | ForEach-Object { $_.Id })
+                if ($outside.Count) { $notes += "run ${run}: ticked tasks outside group $unitGroup (groups $($outside -join ', '))" }
+            }
+            if ($kind -eq 'SUCCESS' -and $mode -ne 'final') { $notes += "run ${run}: archived without a final run" }
+            if ($kind -eq 'CONTINUE') {
+                $completed = @($groupsAfter | Where-Object { $_.Done -eq $_.Total -and [int]$doneBefore[$_.Id] -lt $_.Total } | ForEach-Object { $_.Id })
+                $gid = $null
+                if ($mode -eq 'repair') { $gid = $repairGroup } elseif ($completed.Count) { $gid = $completed[-1] }
+                if ($gid) {
+                    Write-Host "    tests after group $gid ..." -NoNewline
+                    $gt = Invoke-Tests $cfg ("{0}.group{1}.tests.txt" -f $logBase, $gid)
+                    Write-Host (" {0}, {1} min" -f $gt.Label, $gt.Minutes)
+                    if ($gt.Dirty) { $problems += "testCommand left the working tree dirty:`n$($gt.Dirty)" }
+                    else {
+                        if (-not $groupHistory.Contains($gid)) { $groupHistory[$gid] = @() }
+                        if ($gt.Passed) {
+                            $groupHistory[$gid] += 'green'
+                            $repairGroup = $null; $repairCount = 0; $groupStartHead = Get-Head
+                            Write-Ok "group $gid green"
+                        } else {
+                            $groupHistory[$gid] += 'red'
+                            if ($mode -eq 'repair') { $repairCount++ }
+                            else {
+                                $repairGroup = $gid; $repairCount = 0
+                                $repairScope = @(((Invoke-Git @('diff', '--name-only', $groupStartHead, 'HEAD')).Out -split "`n") | Where-Object { $_ })
+                            }
+                            $repairEvidence = $gt.Tail; $repairLabel = $gt.Label
+                            if ($repairCount -ge [int]$cfg.maxGroupRepairs) {
+                                $groupStop = "group $gid still red after $repairCount repair runs (maxGroupRepairs); output: $(Get-RelPath $gt.Log)"
+                            } else {
+                                Write-Warn "group $gid red ($($gt.Label)); the next run repairs it"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if ($problems.Count -gt 0) {
             foreach ($p in $problems) { Write-Bad $p }
             $outcome = 'FAILED-CHECK'; $notes += $problems
             $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+        } elseif ($groupStop) {
+            Write-Bad $groupStop
+            $outcome = 'STOPPED'; $notes += $groupStop
+            $stopReason = "change ${change}: $groupStop"
         } elseif ($kind -eq 'CONTINUE') {
             $after = Get-TaskCounts $activeDir
             Write-Ok "progress $($before.Done) -> $($after.Done)/$($after.Total); starting a fresh process"
@@ -713,6 +857,16 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
         }
     }
     if ($outcome -eq 'STOPPED' -and -not $stopReason) { $stopReason = "change ${change}: $($notes -join '; ')" }
+    if ($groupHistory.Count) {
+        # e.g. "groups: 1 green, 2 red->green (1 repair)"
+        $parts = foreach ($k in $groupHistory.Keys) {
+            $h = @($groupHistory[$k])
+            $s = "$k $($h -join '->')"
+            if ($h.Count -gt 1) { $s += " ($($h.Count - 1) repair$(if ($h.Count -gt 2) { 's' }))" }
+            $s
+        }
+        $notes = @("groups: $($parts -join ', ')") + @($notes)
+    }
 
     if ($item.IsFix) {
         $parentRow = $results | Where-Object { $_.Change -eq $item.Parent } | Select-Object -First 1

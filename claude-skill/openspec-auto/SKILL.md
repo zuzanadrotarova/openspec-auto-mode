@@ -45,7 +45,7 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
    - A script in the project root needs an explicit path (`.\test.cmd`); the tests must pass and must not leave untracked files (add test outputs such as coverage to `.gitignore`).
 5. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
 6. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
-7. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`.
+7. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
 
 ## check – readiness
 
@@ -67,7 +67,7 @@ Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are 
 
 Read `.openspec-auto/auto-mode-report.md` in the project root and summarize:
 - each change and its result:
-  - SUCCESS = done, and the runner's own test run passed (`Tests` column),
+  - SUCCESS = done, and the runner's own test run passed (`Tests` column); the notes show the test result after each task group (`groups: 1 green, 2 red->green (1 repair)`),
   - NONCRITICAL = done, but a `fix-…` change was created; if the tests failed, the runner processed the fix right away and it has its own row (`fixes NN-…`), otherwise the fix waits for the user,
   - BLOCKED = architectural problem, the loop stopped,
   - FAILED-CHECK / STOPPED = the runner's check failed,

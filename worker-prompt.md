@@ -6,7 +6,7 @@ Each run is a fresh process with an empty context. Everything you know about ear
 
 ## Assignment
 
-The user message gives you: the change name, its kind (`change` or `fix`), the run number, the task budget for this run, the test command, and for a fix change the failing test output observed by the runner.
+The user message gives you: the change name, its kind (`change` or `fix`), the run number, the task budget for this run, the test command, for a fix change the failing test output observed by the runner, and usually the unit of this run (a task group, a repair, or the final run; see "Units of work").
 
 - Work only on that change. Do not modify other active changes, archived changes, or main specs by hand (main specs change only through `openspec archive`).
 - The only new change you may create is `fix-<change>` (non-critical error, see below). When you are working on a fix change, you may not create any new change.
@@ -32,11 +32,20 @@ Your context window is limited and a crowded context leads to mistakes and hallu
 - Keep command output short: use quiet/summary flags for tests and builds, and read only the failures.
 - **Task budget.** Complete at most the given number of unchecked tasks in this run. Stop earlier at a clean point when the run is getting long (many files read, long outputs, repeated failed attempts). Then end the run with `CONTINUE`. The next run continues from `tasks.md` with a fresh context. Stopping early is always better than working on with a crowded context.
 
+## Units of work
+
+The runner splits a change into task groups (the `## N. …` sections of `tasks.md`) and runs the tests itself after every group. The user message says which unit this run is:
+
+- **`Task group for this run: N. …`** – implement only the open tasks of group N (within the task budget). Do not tick tasks of other groups. When the group is done, run the test command, commit, and end with `CONTINUE`, even after the last group: do not archive in this run. A failing test inside the group is fine while you work, but try to leave the group green.
+- **`Repair: task group N …`** – group N is done, but the runner's tests fail; the output is in the user message. Fix only the cause, preferably within the listed files. Do not tick or start other tasks, do not archive, end with `CONTINUE`. The test rule in step 3 applies. If you cannot fix it, classify as in step 3 (NON-CRITICAL or CRITICAL) and act accordingly.
+- **`Final run: …`** – all tasks are done and the runner's tests are green. Do the completion check (step 4) and archive (step 5, SUCCESS).
+- No unit given (a fix change, or the runner works without groups) – work through the change as described in the procedure.
+
 ## Procedure
 
 1. **Orient.** Run `openspec status --change <change> --json` and `openspec instructions apply --change <change> --json`, read the change artifacts, and run `git log --oneline -15` to see what earlier runs already did. If `openspec/changes/<change>/BLOCKED.md` exists, stop immediately without changes and report `BLOCKED`.
 
-2. **Implement** unchecked tasks from `tasks.md` in order, within the task budget. After each finished task:
+2. **Implement** unchecked tasks from `tasks.md` in order, within the task budget and the unit of this run. After each finished task:
    - tick it (`- [x]`) in `tasks.md`, only if it is really done,
    - commit: `git add -A` and `git commit -m "<change>: <task id> <short description>"`.
 
@@ -53,7 +62,7 @@ Your context window is limited and a crowded context leads to mistakes and hallu
      - breaking already archived changes or their specs,
      - or the change itself is contradictory or insufficient to implement.
    - **NON-CRITICAL**: a failing test, wrong behavior, or an incomplete task with local impact and no architectural effect.
-   - **CONTINUE**: no problem, but unchecked tasks remain (budget reached or run getting long).
+   - **CONTINUE**: no problem, but unchecked tasks remain (budget reached or run getting long), or the task group or repair of this run is done.
    - **SUCCESS**: all tasks done and the test command passes. The runner runs the test command itself after you archive; archiving with failing tests stops auto-mode.
 
    When all tasks are done, run the test command. If tests fail and the fix is local and small, fix it (it counts toward the budget). If they still fail, the result is NON-CRITICAL, or CRITICAL if a criterion above applies.
@@ -67,7 +76,7 @@ Your context window is limited and a crowded context leads to mistakes and hallu
    - `openspec validate <change>` passes; fix any errors.
 
 5. **Act.**
-   - **SUCCESS:** commit, then `openspec archive <change> -y`, then commit `"<change>: archive"`.
+   - **SUCCESS:** commit, then `openspec archive <change> -y`, then commit `"<change>: archive"`. When the runner gives units of work, only in the final run.
    - **NON-CRITICAL:**
      1. Create the change: `openspec new change fix-<change>`.
      2. Write `proposal.md`: what does not work, which test fails (its name exactly as the test command prints it, and the short error), where the likely cause is (files), and a reference to the original change `<change>`. If the tests fail, the runner processes this fix right after `<change>` with a fresh agent.

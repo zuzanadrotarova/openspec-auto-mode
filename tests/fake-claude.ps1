@@ -21,6 +21,39 @@ function Tick([int]$Count) {
     }
     [System.IO.File]::WriteAllText((Resolve-Path $tasks), (($lines -join "`n") + "`n"))
 }
+# Ticks the open tasks of one "## N." group in tasks.md.
+function Tick-Group([string]$Group) {
+    $lines = [System.IO.File]::ReadAllLines((Resolve-Path $tasks))
+    $cur = $null
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        if ($lines[$i] -match '^##\s+(\d+)\.') { $cur = $Matches[1]; continue }
+        if ($cur -eq $Group -and $lines[$i] -match '^- \[ \]') { $lines[$i] = $lines[$i] -replace '^- \[ \]', '- [x]' }
+    }
+    [System.IO.File]::WriteAllText((Resolve-Path $tasks), (($lines -join "`n") + "`n"))
+}
+function Unit {
+    if ($prompt -match 'Final run:') { return 'final' }
+    if ($prompt -match 'Repair: task group (\d+)') { return "repair:$($Matches[1])" }
+    if ($prompt -match 'Task group for this run: (\d+)\.') { return "group:$($Matches[1])" }
+    'none'
+}
+# Group-aware worker: one group per run, archive only in the final run.
+# $RedGroup: the group that breaks the tests; $Repairs: whether a repair run fixes them.
+function Group-Worker([string]$RedGroup, [bool]$Repairs) {
+    $u = Unit
+    if ($u -eq 'final') { Archive; Result 'SUCCESS' }
+    if ($u -like 'repair:*') {
+        if ($Repairs) { Remove-Item 'broken.txt' -ErrorAction SilentlyContinue; Commit "$change repair" }
+        Result 'CONTINUE'
+    }
+    if ($u -like 'group:*') {
+        $g = $u.Substring(6)
+        Tick-Group $g
+        if ($g -eq $RedGroup) { Break-Tests }
+        Commit "$change group $g"; Result 'CONTINUE'
+    }
+    Write-Output "no unit in prompt"; exit 5
+}
 function Commit([string]$Msg) { git add -A 2>&1 | Out-Null; git commit -q -m $Msg 2>&1 | Out-Null }
 function Archive { & $os archive $change -y 2>&1 | Out-Null; Commit "$change archive" }
 function Result([string]$Kind) {
@@ -38,6 +71,9 @@ function New-Fix {
 }
 
 switch ($mode) {
+    'group' { Group-Worker '' $true }
+    'group-red' { Group-Worker '1' $true }
+    'group-stuck' { Group-Worker '1' $false }
     'success' { Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'success-red' { Tick 999; Break-Tests; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'fixgreen' { Remove-Item 'broken.txt' -ErrorAction SilentlyContinue; Tick 999; Commit "$change fixed"; Archive; Result 'SUCCESS' }

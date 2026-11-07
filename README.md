@@ -10,9 +10,11 @@ openspec-auto.ps1 (deterministic script)
   for each change 01-…, 02-…, …:
     branch auto/NN-name (chained from the previous one)
     ┌─ new process: claude -p --agent openspec-auto   ← empty context
-    │    implements at most tasksPerRun tasks, commits, exits
+    │    implements one task group of tasks.md (at most tasksPerRun tasks), commits, exits
     ├─ script verifies the files (git status, validate, archive/BLOCKED.md, push)
+    ├─ group complete? → script runs testCommand; red → next run repairs only that group
     ├─ not done yet and progress was made? → again, new process
+    ├─ all groups green → short final run archives the change
     └─ archived? → script runs testCommand itself (the agent's word is not enough)
          NONCRITICAL + red tests → fix-NN-name right away, new process, same branch
   report → .openspec-auto/auto-mode-report.md
@@ -67,6 +69,10 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `testTimeoutMinutes` | time limit of one test run by the script | 20 |
 | `fixMode` | `immediate`: after a NONCRITICAL with failing tests, process its `fix-NN-name` right away; `stop`: stop the loop instead | `immediate` |
 | `maxRunsPerFix` | max. runs for one `fix-NN-name` change | 2 |
+| `groupTesting` | one task group (`## N. …` in `tasks.md`) per run, the script tests after every group, archiving in a separate final run | `true` |
+| `maxGroupRepairs` | repair runs for a group whose tests are red when it is complete | 2 |
+
+With `groupTesting`, a change needs at least one run per task group plus the final run; the script refuses to start when `maxRunsPerChange` is too small. Write each group as a logical unit with its own tests ("1. Slugify (code + tests)"), not "1. Implementation / 2. Tests".
 | `allowedCommands` | additional commands the agent may run (build, lint…) | `[]` |
 | `tasksPerRun` | max. tasks from `tasks.md` per run (one context) | 8 |
 | `maxRunsPerChange` | max. runs per change | 10 |
@@ -99,6 +105,9 @@ powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\other
 | NONCRITICAL | archived + a `fix-NN-name` change describing the bug is created. Tests green (bug not visible to tests): the fix waits for you → next change. Tests red: the script processes the fix right away on the same branch (at most `maxRunsPerFix` runs, done = tests green) → next change, or **stop** if the fix does not pass |
 | BLOCKED | architectural problem, `openspec/changes/NN-name/BLOCKED.md`, not archived → **stop** |
 | FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress, tests fail after archiving) → **stop** |
+| STOPPED | a limit was reached (`maxRunsPerChange`, `maxRunsPerFix`, a group still red after `maxGroupRepairs` repair runs) → **stop** |
+
+The notes column shows the test result of every task group, e.g. `groups: 1 green, 2 red->green (1 repair)`.
 
 Report: `.openspec-auto/auto-mode-report.md`, logs of every run: `.openspec-auto/runs/<time>/`. The folder is listed in `.git/info/exclude`, so it never gets into the repository.
 

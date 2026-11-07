@@ -15,12 +15,17 @@ function Check([bool]$Cond, [string]$Msg) {
     else { Write-Host "    FAIL $Msg" -ForegroundColor Red; $script:Failed++ }
 }
 
-function New-Change([string]$Name, [int]$Tasks) {
+# $Tasks tasks split evenly into $Groups task groups ("## 1. Group 1", "## 2. Group 2", ...).
+function New-Change([string]$Name, [int]$Tasks, [int]$Groups = 1) {
     & $os new change $Name 2>&1 | Out-Null
     $d = "openspec/changes/$Name"
     Set-Content "$d/proposal.md" "## Why`nThe project needs the capability described by change $Name for testing auto-mode.`n## What Changes`n- Add $Name.`n"
     Set-Content "$d/design.md" "## Decisions`n- Keep it simple.`n"
-    $t = "## 1. Impl`n"; for ($i = 1; $i -le $Tasks; $i++) { $t += "- [ ] 1.$i Task $i`n" }
+    $t = ''; $per = [math]::Ceiling($Tasks / $Groups)
+    for ($g = 1; $g -le $Groups; $g++) {
+        $t += "## $g. Group $g`n"
+        for ($i = 1; $i -le $per -and (($g - 1) * $per + $i) -le $Tasks; $i++) { $t += "- [ ] $g.$i Task $i`n" }
+    }
     Set-Content "$d/tasks.md" $t
     $cap = "cap-$($Name -replace '^\d+-', '')"
     New-Item -ItemType Directory -Force "$d/specs/$cap" | Out-Null
@@ -41,7 +46,11 @@ function New-Project([string]$Name, [string[]]$Changes, [string]$Config = $Defau
     git config user.name 'Test'; git config user.email 'test@example.com'; git config core.autocrlf false
     Set-Content .gitattributes '* text=auto eol=lf'
     & $os init --tools none --no-animation 2>&1 | Out-Null
-    foreach ($c in $Changes) { $n, $k = $c -split ':'; New-Change $n ([int]$k) }
+    foreach ($c in $Changes) {
+        $parts = $c -split ':'; $groups = 1
+        if ($parts.Count -gt 2) { $groups = [int]$parts[2] }
+        New-Change $parts[0] ([int]$parts[1]) $groups
+    }
     Set-Content 'openspec/auto-mode.json' $Config
     Set-Content 'run-tests.cmd' '@if exist broken.txt (echo FAIL broken.txt & exit /b 1) else (echo ok)'
     git add -A 2>&1 | Out-Null; git commit -q -m init 2>&1 | Out-Null
@@ -218,6 +227,58 @@ Check ($r.Code -eq 1) 'crashed fix stops the loop'
 $r = Invoke-Runner $p 'fix-01-a=fixgreen;02-b=success'
 Check ($r.Code -eq 0 -and $r.Out -match 'resuming fix-01-a') 'restart resumes the fix despite red baseline'
 Check ((Archived $p 'fix-01-a') -and (Archived $p '02-b')) 'fix-01-a and 02-b archived after resume'
+
+function Count-Prompts([string]$P, [string]$C) { @(Get-ChildItem "$P/.openspec-auto/runs/*/$C.run*.prompt.txt" -ErrorAction SilentlyContinue).Count }
+
+Write-Host "T12 task groups: one group per run, runner tests after every group, final archive run"
+$p = New-Project 't12' @('01-a:4:2', '02-b:1')
+$r = Invoke-Runner $p '01-a=group;02-b=group'
+Check ($r.Code -eq 0) 'runner exit 0'
+Check ((Archived $p '01-a') -and (Archived $p '02-b')) 'both archived'
+Check ((Count-Prompts $p '01-a') -eq 3) '01-a: 3 runs (group 1, group 2, final)'
+Check ((Read-RunPrompt $p '01-a.run01.prompt.txt') -match 'Task group for this run: 1\. Group 1 \(open tasks: 1\.1, 1\.2\)') 'run 1 names group 1 and its open tasks'
+Check ((Read-RunPrompt $p '01-a.run02.prompt.txt') -match 'Task group for this run: 2\.') 'run 2 names group 2'
+Check ((Read-RunPrompt $p '01-a.run03.prompt.txt') -match 'Final run:') 'run 3 is the final run'
+Check ((Test-Path "$p/.openspec-auto/runs/*/01-a.run01.group1.tests.txt") -and (Test-Path "$p/.openspec-auto/runs/*/01-a.run02.group2.tests.txt")) 'runner tested after each group'
+Check ((Count-Prompts $p '02-b') -eq 2) '02-b (one group): 2 runs'
+Check ($r.Out -match 'groups: 1 green, 2 green') 'report shows group results'
+
+Write-Host "T13 red group is repaired"
+$p = New-Project 't13' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'change finishes after the repair'
+$rp = Read-RunPrompt $p '01-a.run02.prompt.txt'
+Check ($rp -match 'Repair: task group 1 is complete') 'run 2 is a repair of group 1'
+Check ($rp -match 'FAIL broken\.txt') 'repair prompt carries the runner test evidence'
+Check ($rp -match 'scope\): .*broken\.txt') 'repair scope lists the files changed by the group'
+Check ((Count-Prompts $p '01-a') -eq 4) '4 runs (group 1, repair, group 2, final)'
+Check ($r.Out -match '1 red->green \(1 repair\)') 'report shows the repair'
+
+Write-Host "T14 red group is not repaired"
+$p = New-Project 't14' @('01-a:4:2', '02-b:1')
+$r = Invoke-Runner $p '01-a=group-stuck;02-b=group'
+Check ($r.Code -eq 1 -and $r.Out -match 'group 1 still red after 2 repair runs') 'stops after maxGroupRepairs'
+Check ((Count-Prompts $p '01-a') -eq 3) '3 runs (group 1, 2 repairs)'
+Check ((Count-Prompts $p '02-b') -eq 0) '02-b not processed'
+
+Write-Host "T15 agent ignores the groups"
+$p = New-Project 't15' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'still SUCCESS (step 1 gate was green)'
+Check ($r.Out -match 'ticked tasks outside group 1') 'note: ticked tasks outside the group'
+Check ($r.Out -match 'archived without a final run') 'note: archived without a final run'
+
+Write-Host "T16 groupTesting off"
+$p = New-Project 't16' @('01-a:4:2') '{ "testCommand": ".\\run-tests.cmd", "timeoutMinutes": 2, "groupTesting": false }'
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and (Count-Prompts $p '01-a') -eq 1) 'one run as before'
+Check ((Read-RunPrompt $p '01-a.run01.prompt.txt') -notmatch 'Task group') 'prompt has no task group'
+Check (-not (Test-Path "$p/.openspec-auto/runs/*/01-a.run01.group*.tests.txt")) 'no group test runs'
+
+Write-Host "T17 too many groups for maxRunsPerChange"
+$p = New-Project 't17' @('01-a:6:6')
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'needs at least 7 runs') 'refused at start'
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
