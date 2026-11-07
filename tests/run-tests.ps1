@@ -280,6 +280,85 @@ $p = New-Project 't17' @('01-a:6:6')
 $r = Invoke-Runner $p '01-a=group'
 Check ($r.Code -eq 2 -and $r.Out -match 'needs at least 7 runs') 'refused at start'
 
+$AcceptConfig = '{ "testCommand": ".\\run-tests.cmd", "timeoutMinutes": 2, "maxRunsPerChange": 5, "acceptanceMode": "reviewed", "acceptanceCommand": ".\\acceptance\\{change}\\check.cmd" }'
+
+# Acceptance test of a change: passes once the fake agent has written impl/<change>.txt.
+function Add-Acceptance([string]$P, [string[]]$Changes) {
+    Push-Location $P
+    foreach ($c in $Changes) {
+        New-Item -ItemType Directory -Force "acceptance/$c" | Out-Null
+        Set-Content "acceptance/$c/check.cmd" "@if exist impl\$c.txt (echo ok $c) else (echo FAIL acceptance $c & exit /b 1)"
+    }
+    git add -A 2>&1 | Out-Null; git commit -q -m 'acceptance tests' 2>&1 | Out-Null
+    Pop-Location
+}
+function Read-RunFile([string]$P, [string]$File) { Read-RunPrompt $P $File }
+
+Write-Host "T18 acceptance tests (reviewed): run after the last group, after archive, and as regression"
+$p = New-Project 't18' @('01-a:4:2', '02-b:2:2') $AcceptConfig
+Add-Acceptance $p @('01-a', '02-b')
+$r = Invoke-Runner $p '01-a=group;02-b=group'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Archived $p '02-b')) 'both archived'
+Check ((Read-RunPrompt $p '01-a.run01.prompt.txt') -match 'Acceptance tests \(frozen.*acceptance/01-a/') 'prompt names the frozen acceptance tests'
+Check ((Read-RunPrompt $p '01-a.run01.prompt.txt') -match 'Acceptance test command: \.\\acceptance\\01-a\\check\.cmd') 'prompt gives the acceptance command'
+Check ((Read-RunFile $p '01-a.run01.group1.tests.txt') -notmatch 'check\.cmd') 'group 1 (not last): no acceptance run'
+Check ((Read-RunFile $p '01-a.run02.group2.tests.txt') -match 'acceptance\\01-a\\check\.cmd') 'last group: acceptance tests run'
+$fin = Read-RunFile $p '02-b.run03.tests.txt'
+Check ($fin -match 'ok 01-a' -and $fin -match 'ok 02-b') 'after archive of 02-b: acceptance of 01-a (regression) and 02-b'
+$set = Read-RunFile $p 'worker-settings.json'
+Check ($set -match 'Edit\(\./acceptance/\*\*\)' -and $set -match 'Write\(\./acceptance/\*\*\)') 'Edit/Write on acceptance/ denied'
+Check ($set -match 'Bash\(\.\\\\acceptance\\\\02-b\\\\check\.cmd:\*\)') 'acceptance commands allowed'
+Check ($r.Out -match 'Acceptance tests: reviewed') 'report shows the acceptance mode'
+
+Write-Host "T18b red acceptance of an archived change refuses the start"
+Push-Location $p
+Remove-Item impl/01-a.txt; New-Change '03-c' 1; Add-Acceptance $p @('03-c')
+Pop-Location
+$r = Invoke-Runner $p '03-c=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'baseline tests fail: red \(acceptance 01-a exit 1\)') 'baseline includes acceptance of archived changes'
+
+Write-Host "T19 acceptance config and missing tests refuse the start"
+$p = New-Project 't19' @('01-a:1', '02-b:1') $AcceptConfig
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=group;02-b=group'
+Check ($r.Code -eq 2 -and $r.Out -match '02-b has no acceptance tests') 'change without acceptance tests refused'
+Check ($r.Out -notmatch '01-a has no acceptance') 'change with acceptance tests not reported'
+$p = New-Project 't19b' @('01-a:1') '{ "testCommand": ".\\run-tests.cmd", "acceptanceMode": "reviewed", "acceptanceCommand": "node --test acceptance" }'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'must contain \{change\}') 'acceptanceCommand without {change} refused'
+$p = New-Project 't19c' @('01-a:1') '{ "testCommand": ".\\run-tests.cmd", "acceptanceMode": "agent" }'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match "acceptanceMode .* must be 'off' or 'reviewed'") 'unsupported acceptanceMode refused'
+
+Write-Host "T20 agent changes frozen acceptance tests"
+$p = New-Project 't20' @('01-a:1', '02-b:1') $AcceptConfig
+Add-Acceptance $p @('01-a', '02-b')
+$r = Invoke-Runner $p '01-a=tamper;02-b=group'
+Check ($r.Code -eq 1 -and $r.Out -match 'agent changed frozen acceptance tests: acceptance/01-a/check\.cmd') 'edited acceptance test stops the loop'
+Check ($r.Out -match '\| 01-a \| FAILED-CHECK') '01-a is FAILED-CHECK'
+Check ((Count-Prompts $p '02-b') -eq 0) '02-b not processed'
+$p = New-Project 't20b' @('01-a:1') $AcceptConfig
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=tamper-rm'
+Check ($r.Code -eq 1 -and $r.Out -match 'agent changed frozen acceptance tests') 'git rm of acceptance tests stops the loop'
+
+Write-Host "T21 red acceptance after the last group is repaired"
+$p = New-Project 't21' @('01-a:4:2') $AcceptConfig
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=group-late'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'change finishes after the repair'
+$rp = Read-RunPrompt $p '01-a.run03.prompt.txt'
+Check ($rp -match 'Repair: task group 2 is complete, but the runner''s tests fail \(red \(acceptance 01-a exit 1\)\)') 'run 3 repairs group 2 (acceptance red)'
+Check ($rp -match 'FAIL acceptance 01-a') 'repair prompt carries the acceptance output'
+Check ((Count-Prompts $p '01-a') -eq 4) '4 runs (group 1, group 2, repair, final)'
+
+Write-Host "T22 regression: a later change breaks the acceptance tests of an archived one"
+$p = New-Project 't22' @('01-a:1', '02-b:1') ($AcceptConfig -replace ' }$', ', "groupTesting": false }')
+Add-Acceptance $p @('01-a', '02-b')
+$r = Invoke-Runner $p '01-a=success;02-b=success-regress'
+Check ($r.Code -eq 1 -and $r.Out -match 'tests fail after 02-b was archived \(red \(acceptance 01-a exit 1\)') 'regression stops the loop'
+Check ($r.Out -match '\| 01-a \| SUCCESS') '01-a itself was SUCCESS'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

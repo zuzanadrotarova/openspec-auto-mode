@@ -6,7 +6,7 @@ Each run is a fresh process with an empty context. Everything you know about ear
 
 ## Assignment
 
-The user message gives you: the change name, its kind (`change` or `fix`), the run number, the task budget for this run, the test command, for a fix change the failing test output observed by the runner, and usually the unit of this run (a task group, a repair, or the final run; see "Units of work").
+The user message gives you: the change name, its kind (`change` or `fix`), the run number, the task budget for this run, the test command, for a fix change the failing test output observed by the runner, usually the unit of this run (a task group, a repair, or the final run; see "Units of work"), and, if the project uses them, the frozen acceptance tests of the change (see "Acceptance tests").
 
 - Work only on that change. Do not modify other active changes, archived changes, or main specs by hand (main specs change only through `openspec archive`).
 - The only new change you may create is `fix-<change>` (non-critical error, see below). When you are working on a fix change, you may not create any new change.
@@ -41,6 +41,15 @@ The runner splits a change into task groups (the `## N. …` sections of `tasks.
 - **`Final run: …`** – all tasks are done and the runner's tests are green. Do the completion check (step 4) and archive (step 5, SUCCESS).
 - No unit given (a fix change, or the runner works without groups) – work through the change as described in the procedure.
 
+## Acceptance tests
+
+When the user message names acceptance tests, they were written before this change started and define when it is done. They are frozen:
+
+- Never edit, move, rename or delete any file in the acceptance folder (not with Edit or Write, not with `git rm`, `git mv` or `git restore`). The runner checks the git history after every run and stops auto-mode if anything there changed.
+- They are expected to fail until the change is implemented. When the last task group is done, run the acceptance test command; the runner runs it too and returns the group as a repair if it fails.
+- Make them pass by implementing the specified behavior, not by special-casing the test inputs.
+- If you believe an acceptance test is wrong (it contradicts the spec deltas or `design.md`, or cannot pass), that is CRITICAL: `BLOCKED.md` names the test, quotes the conflicting requirement, and gives the options.
+
 ## Procedure
 
 1. **Orient.** Run `openspec status --change <change> --json` and `openspec instructions apply --change <change> --json`, read the change artifacts, and run `git log --oneline -15` to see what earlier runs already did. If `openspec/changes/<change>/BLOCKED.md` exists, stop immediately without changes and report `BLOCKED`.
@@ -63,7 +72,7 @@ The runner splits a change into task groups (the `## N. …` sections of `tasks.
      - or the change itself is contradictory or insufficient to implement.
    - **NON-CRITICAL**: a failing test, wrong behavior, or an incomplete task with local impact and no architectural effect.
    - **CONTINUE**: no problem, but unchecked tasks remain (budget reached or run getting long), or the task group or repair of this run is done.
-   - **SUCCESS**: all tasks done and the test command passes. The runner runs the test command itself after you archive; archiving with failing tests stops auto-mode.
+   - **SUCCESS**: all tasks done, the test command passes, and the acceptance test command passes if the user message gives one. The runner runs these commands itself after you archive; archiving with failing tests stops auto-mode.
 
    When all tasks are done, run the test command. If tests fail and the fix is local and small, fix it (it counts toward the budget). If they still fail, the result is NON-CRITICAL, or CRITICAL if a criterion above applies.
 

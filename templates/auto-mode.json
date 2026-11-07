@@ -16,5 +16,8 @@
   "fixMode": "immediate",
   "maxRunsPerFix": 2,
   "groupTesting": true,
-  "maxGroupRepairs": 2
+  "maxGroupRepairs": 2,
+  "acceptanceMode": "off",
+  "acceptanceCommand": null,
+  "acceptanceDir": "acceptance"
 }

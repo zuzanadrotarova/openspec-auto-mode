@@ -29,13 +29,15 @@ The agent never grades itself. Its final message ("SUCCESS") is ignored; the scr
 | Evidence | Checked by the script |
 |---|---|
 | tests exit 0 | before the first change, after every task group, after every archived change |
+| acceptance tests exit 0 (optional) | tests written before the change and frozen: after its last task group, after archiving, and for all earlier changes again (regression) |
+| acceptance tests unchanged | `git diff` of the acceptance folder after every run is empty |
 | everything written down | `git status` clean, `openspec validate` passes, archive or `BLOCKED.md` present |
 | progress | more tasks ticked, or a red group repaired; otherwise the loop stops |
 | nothing left the machine | remote refs unchanged (no push) |
 
 When a check fails, only the failing unit goes back to a fresh agent, with the test output and a file scope, and with a hard limit on attempts (`maxGroupRepairs`, `maxRunsPerFix`). After that a human decides. Architectural questions are never decided by the agent: it writes `BLOCKED.md` with options and the loop stops.
 
-Limit: tests prove that nothing *known* broke. The agent is told never to weaken or delete tests, but nothing technically prevents it yet; protected acceptance tests are the next step (see [docs/hardening-plan.md](docs/hardening-plan.md)).
+Limit: tests prove that nothing *known* broke. The agent is told never to weaken or delete tests, but only acceptance tests (below) are technically protected: tests the agent writes during a change can still be changed by it. Background: [docs/hardening-plan.md](docs/hardening-plan.md).
 
 ## Using it from Claude Code (recommended)
 
@@ -93,6 +95,9 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `maxGroupRepairs` | repair runs for a group whose tests are red when it is complete | 2 |
 | `fixMode` | `immediate`: after a NONCRITICAL with failing tests, process its `fix-NN-name` right away; `stop`: stop the loop instead | `immediate` |
 | `maxRunsPerFix` | max. runs for one `fix-NN-name` change | 2 |
+| `acceptanceMode` | `reviewed`: every numbered change needs acceptance tests in `acceptanceDir/<change>/`, written before the start (with Claude) and reviewed by you; `off`: none | `off` |
+| `acceptanceCommand` | runs the acceptance tests of one change; `{change}` is replaced by its name, e.g. `node --test "acceptance/{change}/*.accept.js"` | - |
+| `acceptanceDir` | folder of the acceptance tests (frozen for the agent) | `acceptance` |
 
 Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
 
@@ -112,6 +117,16 @@ With `groupTesting`, every group is one agent run followed by a test run of the 
 ```
 
 Avoid "1. Implementation / 2. Tests": the check after group 1 would test nothing new. A change needs at least one run per group plus the final run; the script refuses to start when `maxRunsPerChange` is too small.
+
+### Acceptance tests (optional, `acceptanceMode: reviewed`)
+
+Acceptance tests say when a change is done, and they exist before the agent writes any code. You write them with Claude during propose and review them ( `/openspec-auto acceptance 01-login`), one test per scenario of the spec deltas, into `acceptance/<change>/`, and commit them with the proposal. They fail until the change is implemented.
+
+- The agent may not edit `acceptance/` (deny rules), and the script checks after every run that no commit touched it. A change there stops the loop (FAILED-CHECK).
+- The script runs them when the last task group is done (red: repair run with the output), after archiving, and the tests of all archived changes before the start and after every archive.
+- If the agent thinks an acceptance test is wrong, it stops with `BLOCKED.md`; you decide.
+- `testCommand` must not pick them up, otherwise the tests of changes not yet implemented make the start red. With `node --test`, which finds `**/*.test.js`, name them `*.accept.js`. Run them directly (`node --test ...`), not through a `package.json` script: the agent can edit `package.json`, but not `openspec/auto-mode.json`.
+- What they cannot prevent: an implementation fitted to the test inputs, or changes to helper files the tests import from outside `acceptance/`. Keep acceptance tests self-contained and use more than one example per scenario.
 
 ## Usage
 
@@ -158,7 +173,7 @@ Every run is a full Claude Code session on your account: with a Claude subscript
 
 - The agent runs in `dontAsk` mode: it may only do what is on the allowlist (file tools, `openspec`, local git without branch operations, `testCommand` and `allowedCommands`).
 - Push is blocked by three layers: deny rules, a `pre-push` hook active when `OPENSPEC_AUTO_MODE=1`, and a check of remote refs after every run.
-- The agent must not modify `.git/`, `.claude/`, `.openspec-auto/` or `openspec/auto-mode.json`.
+- The agent must not modify `.git/`, `.claude/`, `.openspec-auto/`, `openspec/auto-mode.json` or, with `acceptanceMode`, the acceptance folder (also checked with `git diff` after every run).
 - `claude -p` skips the folder trust dialog. Only run it in projects you trust.
 
 ## Files

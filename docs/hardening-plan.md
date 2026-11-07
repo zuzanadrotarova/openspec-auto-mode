@@ -1,6 +1,6 @@
 # Hardening openspec-auto-mode: discussion and plan
 
-Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Next: step 3, frozen acceptance tests (not planned in detail yet).
+Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; real-project trial pending. Step 3b (agent-written acceptance tests) later.
 Date: 2026-11-07
 
 ## 1. Starting point
@@ -358,3 +358,62 @@ tests each), model `sonnet`.
   are now per group (`1.1-1.2 …`, `2.1-2.2 …`), so a failure is attributable to one group.
 - Existing tests untouched; one test per scenario; `titleCase` reuses `capitalize` as `design.md` says.
 - Not exercised by the real agent: the repair run (covered by fake-agent tests T13, T14).
+
+## 8. Step 3 – frozen acceptance tests
+
+### 8.1 Decisions (2026-11-07)
+- Split: **3a** = mechanism + C1 (written during propose with Claude, reviewed and approved by the user; what counts is before the code, outside the implementing agent, reviewed, frozen); **3b** = C2
+  (the agent writes them in a first run, then they are frozen) later, after a trial of 3a.
+- Regression: acceptance tests of already archived changes run at the start (baseline) and after
+  every archive.
+- 3b: agent-written acceptance tests that are green before the implementation check nothing new →
+  STOPPED (not just a note).
+
+### 8.2 Benefits and risks
+- Benefit: SUCCESS means tests passed that were written before the code and that the agent could not
+  change. Until now only a prompt rule kept the agent from weakening tests.
+- Risks: a change to the safety layers (a mistake would stop valid work); heavier propose for the
+  human; a wrong acceptance test means BLOCKED; not covered: helper files the tests import from
+  outside the acceptance folder, implementations fitted to the test inputs.
+- Verified: `node --test` without arguments finds `acceptance/**/*.test.js` (future changes would
+  make the baseline red) → acceptance tests use another name (`*.accept.js`) or `testCommand` is
+  narrowed. `node --test <dir>/` fails in Node 24; a quoted glob (`"acceptance/x/*.js"`) works.
+
+### 8.3 Design of 3a (as implemented)
+- Config: `acceptanceMode` (`off` default | `reviewed`: written before the start with Claude in an interactive session and approved by the user; renamed from `human`, since who types them does not matter), `acceptanceCommand` with `{change}`
+  (required when not `off`), `acceptanceDir` (default `acceptance`, plain relative folder).
+  `agent` is refused at start until 3b.
+- Acceptance tests of a change = files committed under `acceptanceDir/<change>/` (`git ls-files`).
+  `reviewed`: a numbered change without them is refused at start (exit 2). Fix changes need none; they
+  are checked against their parent's tests.
+- Freeze: deny `Edit/Write(./<acceptanceDir>/**)`; after every run the runner checks
+  `git diff --name-only <HEAD before the run> HEAD -- <acceptanceDir>/` is empty, otherwise
+  FAILED-CHECK `agent changed frozen acceptance tests: …`. Catches `git rm` / `git mv` too, needs
+  no stored state (works after a restart); uncommitted changes are caught by the dirty check.
+- `Invoke-Tests` takes a list of changes whose acceptance command runs after `testCommand`; all
+  must pass; label and evidence come from the first failing command (`red (acceptance 01-a exit 1)`).
+- Where: baseline = acceptance of all archived changes; group gate = the change's own acceptance
+  only when all its groups are done (red → the usual repair run with the output); after archive
+  (SUCCESS / NONCRITICAL / fix) = acceptance of all archived changes, which includes the current one.
+- Prompt: the runner names the frozen folder and the acceptance command; the expanded commands are
+  on the allowlist. `worker-prompt.md` has a section "Acceptance tests": never touch them, expect
+  red until done, no special-casing of test inputs, a wrong acceptance test is CRITICAL.
+- Report: `Acceptance tests: reviewed, frozen under acceptance/`, baseline line lists the regression set.
+- Skill: new mode `acceptance <change>` writes the tests interactively with the user (one per
+  scenario, must fail because code is missing, commit only after the user's ok).
+
+### 8.4 Tests (fake agent)
+Fake modes: every mode writes `impl/<change>.txt` when the last task is ticked (the test
+acceptance scripts check it); `group-late` (only the repair run writes it), `tamper` (edits the
+acceptance script), `tamper-rm` (`git rm`), `success-regress` (removes other changes' `impl/`).
+
+| Test | Expected |
+|---|---|
+| T18 | acceptance not run after group 1, run after the last group, after the archive of 02-b also 01-a (regression); deny + allow rules; report line |
+| T18b | archived change's acceptance red → baseline refused (exit 2) |
+| T19 / b / c | change without acceptance tests, command without `{change}`, `acceptanceMode: agent` → exit 2 |
+| T20 / b | edited / `git rm`-ed acceptance test → FAILED-CHECK, next change not processed |
+| T21 | acceptance red after the last group → repair of that group with the output → SUCCESS in 4 runs |
+| T22 | later change breaks an earlier change's acceptance → FAILED-CHECK after its archive |
+
+All 115 checks (T1–T22) green.

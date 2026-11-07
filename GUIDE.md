@@ -97,6 +97,9 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `maxRunsPerFix` | max. runs to fix such a bug | 2 |
 | `groupTesting` | one task group per run and tests after every group; `false` = faster and cheaper, but tests only at the end | `true` |
 | `maxGroupRepairs` | how many times the agent may try to repair a group that broke the tests | 2 |
+| `acceptanceMode` | `reviewed` = every change needs acceptance tests, written with Claude and checked by you before the start (section 2); `off` = none | `off` |
+| `acceptanceCommand` | how to run the acceptance tests of one change, `{change}` stands for its name | - |
+| `acceptanceDir` | folder of the acceptance tests | `acceptance` |
 
 ---
 
@@ -126,6 +129,8 @@ If a change got a different name, ask Claude to rename it (e.g. "rename the chan
 - Split `tasks.md` into groups (`## 1. …`, `## 2. …`) that are logical units ending in a working state, each with its own tests: "1. Slugify (code + tests)", "2. Truncate (code + tests)". Not "1. Implementation / 2. Tests": then the check after group 1 tests nothing new. Every group costs one agent run (plus one short final run per change).
 - Small changes (3 to 10 tasks) work best. Split a large feature into several changes.
 - You do not have to propose the whole project at once. A batch is enough; add more changes later.
+
+**Acceptance tests (if `acceptanceMode` is `reviewed`):** for every change, write tests that say when it is done, before auto-mode starts. Tell Claude "write acceptance tests for 01-login" (or `/openspec-auto acceptance 01-login`); together you write one test per scenario into `acceptance/01-login/`. The agent cannot change them: if it does, auto-mode stops. They are the strongest check auto-mode has, because they were written before the code, outside auto-mode, and you approved them. Read them before you commit them: a wrong acceptance test stops the change with `BLOCKED`.
 
 When the changes are ready, tell Claude "commit the proposals".
 
@@ -240,5 +245,9 @@ This is mostly for Claude, not for you.
 | `tests still fail after N runs (maxRunsPerFix)` (STOPPED) | the automatic fix did not work; do the `fix-` change interactively |
 | `group N still red after M repair runs` (STOPPED) | the group broke the tests and the agent could not repair it; look at the named `.tests.txt`, fix interactively, commit, run again |
 | `has N open task groups; … needs at least N+1 runs` | raise `maxRunsPerChange`, merge small groups, or set `groupTesting` to `false` |
+| `has no acceptance tests (acceptance/NN-x/ ...)` | write and commit the acceptance tests of that change (`/openspec-auto acceptance NN-x`), or set `acceptanceMode` to `off` |
+| `acceptanceCommand ... must contain {change}` / `acceptanceMode ... must be 'off' or 'reviewed'` | fix the value in `openspec/auto-mode.json` |
+| `baseline tests fail: red (acceptance NN-x exit N)` | an archived change no longer passes its acceptance tests; fix it interactively first. If the tests of a change not yet implemented fail inside `testCommand`, it picks up acceptance tests: rename them (`*.accept.js`) or narrow `testCommand` |
+| `agent changed frozen acceptance tests: ...` (FAILED-CHECK) | the agent changed an acceptance test; look at the commit (`git log -p -- acceptance/`), revert it, run again |
 
 - **Tool tests** (no API calls): `tests/run-tests.ps1`.

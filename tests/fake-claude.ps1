@@ -20,6 +20,17 @@ function Tick([int]$Count) {
         if ($n -lt $Count -and $lines[$i] -match '^- \[ \]') { $lines[$i] = $lines[$i] -replace '^- \[ \]', '- [x]'; $n++ }
     }
     [System.IO.File]::WriteAllText((Resolve-Path $tasks), (($lines -join "`n") + "`n"))
+    Mark-Impl
+}
+# "Implementation" for acceptance tests: impl/<change>.txt appears when the last task is ticked
+# (acceptance check scripts of the tests look for it). $script:LateImpl: only the repair run writes it.
+$script:LateImpl = $false
+function Mark-Impl([switch]$Force) {
+    if ($script:LateImpl -and -not $Force) { return }
+    if (@(Get-Content $tasks | Where-Object { $_ -match '^- \[ \]' }).Count -eq 0 -or $Force) {
+        New-Item -ItemType Directory -Force 'impl' | Out-Null
+        Set-Content "impl/$change.txt" 'implemented'
+    }
 }
 # Ticks the open tasks of one "## N." group in tasks.md.
 function Tick-Group([string]$Group) {
@@ -30,6 +41,7 @@ function Tick-Group([string]$Group) {
         if ($cur -eq $Group -and $lines[$i] -match '^- \[ \]') { $lines[$i] = $lines[$i] -replace '^- \[ \]', '- [x]' }
     }
     [System.IO.File]::WriteAllText((Resolve-Path $tasks), (($lines -join "`n") + "`n"))
+    Mark-Impl
 }
 function Unit {
     if ($prompt -match 'Final run:') { return 'final' }
@@ -43,7 +55,7 @@ function Group-Worker([string]$RedGroup, [bool]$Repairs) {
     $u = Unit
     if ($u -eq 'final') { Archive; Result 'SUCCESS' }
     if ($u -like 'repair:*') {
-        if ($Repairs) { Remove-Item 'broken.txt' -ErrorAction SilentlyContinue; Commit "$change repair" }
+        if ($Repairs) { Remove-Item 'broken.txt' -ErrorAction SilentlyContinue; if ($script:LateImpl) { Mark-Impl -Force }; Commit "$change repair" }
         Result 'CONTINUE'
     }
     if ($u -like 'group:*') {
@@ -74,6 +86,13 @@ switch ($mode) {
     'group' { Group-Worker '' $true }
     'group-red' { Group-Worker '1' $true }
     'group-stuck' { Group-Worker '1' $false }
+    'group-late' { $script:LateImpl = $true; Group-Worker '' $true }
+    'tamper' {
+        Get-ChildItem "acceptance/$change" -File | ForEach-Object { Set-Content $_.FullName '@echo ok' }
+        Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
+    }
+    'tamper-rm' { git rm -q -r "acceptance/$change" 2>&1 | Out-Null; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
+    'success-regress' { Remove-Item 'impl/*' -Exclude "$change.txt"; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'success' { Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'success-red' { Tick 999; Break-Tests; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'fixgreen' { Remove-Item 'broken.txt' -ErrorAction SilentlyContinue; Tick 999; Commit "$change fixed"; Archive; Result 'SUCCESS' }

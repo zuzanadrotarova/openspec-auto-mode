@@ -15,7 +15,9 @@
       4. repeats with a new process while the change reports progress (CONTINUE), so even a
          large change never fills one context window,
       5. runs testCommand itself after a change is archived (the agent's word is not enough);
-         a NONCRITICAL change with failing tests gets its fix-NN change processed right away.
+         a NONCRITICAL change with failing tests gets its fix-NN change processed right away,
+      6. with acceptanceMode, also runs the change's frozen acceptance tests (written before the
+         change started, under acceptanceDir/<change>/) and stops if the agent changed them.
 
     testCommand also runs once before the first change: auto-mode needs a green start.
 
@@ -176,6 +178,24 @@ function Get-GroupDone($Groups) {
     $h
 }
 
+# Acceptance tests (step 3): files under acceptanceDir/<change>/, written before the change
+# started and frozen for the agent. Only files committed to git count.
+function Test-HasAcceptance([string]$Change) {
+    if ($script:cfg.acceptanceMode -eq 'off') { return $false }
+    (Invoke-Git @('ls-files', '--', "$($script:cfg.acceptanceDir)/$Change/")).Out -ne ''
+}
+
+# Archived numbered changes with acceptance tests: they must stay green (regression).
+function Get-DoneAcceptance {
+    $archive = Join-Path $Project 'openspec/changes/archive'
+    if ($script:cfg.acceptanceMode -eq 'off' -or -not (Test-Path $archive)) { return @() }
+    $names = @(Get-ChildItem -Path $archive -Directory | ForEach-Object { $_.Name -replace '^\d{4}-\d{2}-\d{2}-', '' } |
+        Where-Object { $_ -match '^\d{2,}-' } | Sort-Object @{ Expression = { Get-ChangeNumber $_ } }, @{ Expression = { $_ } })
+    @($names | Where-Object { Test-HasAcceptance $_ })
+}
+
+function Get-AcceptanceCommand([string]$Change) { ([string]$script:cfg.acceptanceCommand).Replace('{change}', $Change) }
+
 function Get-ArchivedDir([string]$Change) {
     $archive = Join-Path $Project 'openspec/changes/archive'
     if (-not (Test-Path $archive)) { return $null }
@@ -222,6 +242,9 @@ function Read-Config {
         maxRunsPerFix      = 2
         groupTesting       = $true
         maxGroupRepairs    = 2
+        acceptanceMode     = 'off'
+        acceptanceCommand  = $null
+        acceptanceDir      = 'acceptance'
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -231,6 +254,9 @@ function Read-Config {
     if ($null -eq $cfg.maxRunsPerFix) { $cfg.maxRunsPerFix = 2 }
     if ($null -eq $cfg.groupTesting) { $cfg.groupTesting = $true }
     if ($null -eq $cfg.maxGroupRepairs) { $cfg.maxGroupRepairs = 2 }
+    if ($null -eq $cfg.acceptanceMode) { $cfg.acceptanceMode = 'off' }
+    if ($null -eq $cfg.acceptanceDir) { $cfg.acceptanceDir = 'acceptance' }
+    $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
 }
@@ -286,12 +312,13 @@ function ConvertTo-CmdArg([string]$Value) {
 }
 
 # Layer 1 of push protection + general sandbox: only allowlisted tools run (dontAsk mode).
-function New-WorkerSettings($Cfg, [string]$Path) {
+function New-WorkerSettings($Cfg, [string]$Path, [string[]]$AcceptChanges) {
     $shell = @(
         'openspec', 'git add', 'git commit', 'git status', 'git diff', 'git log', 'git show',
         'git rm', 'git mv', 'git restore', 'ls', 'mkdir', 'pwd'
     )
-    foreach ($c in @($Cfg.testCommand) + @($Cfg.allowedCommands)) {
+    $accept = @($AcceptChanges | Where-Object { $_ } | ForEach-Object { Get-AcceptanceCommand $_ })
+    foreach ($c in @($Cfg.testCommand) + @($Cfg.allowedCommands) + $accept) {
         if ($c -and ($shell -notcontains $c.Trim())) { $shell += $c.Trim() }
     }
     $script:AllowedShell = $shell
@@ -309,6 +336,8 @@ function New-WorkerSettings($Cfg, [string]$Path) {
         "Edit(./$ConfigRel)", "Write(./$ConfigRel)",
         'WebFetch', 'WebSearch', 'PowerShell'
     )
+    # frozen acceptance tests; the runner's git diff check after every run is the real guard
+    if ($Cfg.acceptanceMode -ne 'off') { $deny += @("Edit(./$($Cfg.acceptanceDir)/**)", "Write(./$($Cfg.acceptanceDir)/**)") }
     $settings = @{ permissions = @{ defaultMode = 'dontAsk'; allow = $allow; deny = $deny } }
     Write-TextFile $Path ($settings | ConvertTo-Json -Depth 5)
 }
@@ -375,22 +404,37 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
 }
 
 # The runner runs testCommand itself: "tests exit 0" counts only when a program observes it.
-function Invoke-Tests($Cfg, [string]$LogPath) {
-    $p = Invoke-Process ([string]$Cfg.testCommand) ([double]$Cfg.testTimeoutMinutes) ''
-    $text = [string]$p.Stdout
-    if ($p.Stderr) { $text = $text.TrimEnd() + "`n" + $p.Stderr }
-    Write-TextFile $LogPath $text
-    $lines = @(($text -replace "`r", '') -split "`n" | Where-Object { $_.Trim() -ne '' })
-    $tail = (@($lines | Select-Object -Last 40 | ForEach-Object {
-        if ($_.Length -gt 300) { $_.Substring(0, 300) } else { $_ }
-    }) -join "`n")
-    $passed = (-not $p.TimedOut) -and ($p.ExitCode -eq 0)
-    $label = 'green'
-    if ($p.TimedOut) { $label = "red (timeout after $($Cfg.testTimeoutMinutes) min)" }
-    elseif (-not $passed) { $label = "red (exit $($p.ExitCode))" }
+# $AcceptFor: changes whose acceptance tests run after testCommand (all must pass). The label and
+# the evidence tail come from the first failing command.
+function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
+    $cmds = @([pscustomobject]@{ Name = ''; Line = [string]$Cfg.testCommand })
+    foreach ($c in @($AcceptFor | Where-Object { $_ })) {
+        $cmds += [pscustomobject]@{ Name = "acceptance $c "; Line = (Get-AcceptanceCommand $c) }
+    }
+    $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0
+    foreach ($c in $cmds) {
+        $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) ''
+        $minutes += $p.Minutes
+        $text = [string]$p.Stdout
+        if ($p.Stderr) { $text = $text.TrimEnd() + "`n" + $p.Stderr }
+        if ($cmds.Count -gt 1) { $log += "===== $($c.Line) (exit $($p.ExitCode))`n" }
+        $log += $text.TrimEnd() + "`n"
+        $ok = (-not $p.TimedOut) -and ($p.ExitCode -eq 0)
+        if (-not $ok -and $passed) {
+            $passed = $false; $exitCode = $p.ExitCode; $timedOut = $p.TimedOut
+            if ($p.TimedOut) { $label = "red ($($c.Name)timeout after $($Cfg.testTimeoutMinutes) min)" }
+            else { $label = "red ($($c.Name)exit $($p.ExitCode))" }
+            $lines = @(($text -replace "`r", '') -split "`n" | Where-Object { $_.Trim() -ne '' })
+            $tail = (@($lines | Select-Object -Last 40 | ForEach-Object {
+                if ($_.Length -gt 300) { $_.Substring(0, 300) } else { $_ }
+            }) -join "`n")
+            if ($c.Name) { $tail = "[$($c.Line)]`n$tail" }
+        }
+    }
+    Write-TextFile $LogPath $log
     [pscustomobject]@{
-        Passed = $passed; ExitCode = $p.ExitCode; TimedOut = $p.TimedOut; Label = $label
-        Tail = $tail; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = $p.Minutes
+        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label
+        Tail = $tail; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = [math]::Round($minutes, 1)
     }
 }
 
@@ -415,13 +459,23 @@ $($Item.Evidence)
 
 "@
     }
+    $acceptText = ''
+    $target = $Item.Name
+    if ($Item.IsFix) { $target = $Item.Parent }
+    if (Test-HasAcceptance $target) {
+        $acceptText = @"
+Acceptance tests (frozen, written before this change; never modify, move or delete anything under $($Cfg.acceptanceDir)/): $($Cfg.acceptanceDir)/$target/
+Acceptance test command: $(Get-AcceptanceCommand $target)
+
+"@
+    }
     $prompt = @"
 Change: $($Item.Name)
 Kind: $kind
 Run: $Run of max $($Item.MaxRuns) for this change
 Task budget for this run: $($Cfg.tasksPerRun)
 Test command: $($Cfg.testCommand)
-$UnitText$evidence
+$acceptText$UnitText$evidence
 Allowed shell commands (one per Bash call, from the project root; any arguments):
 $shell
 
@@ -502,6 +556,13 @@ $cfg = Read-Config
 if (-not $cfg) { $errors += "$ConfigRel missing (run with -Init)" }
 elseif (-not $cfg.testCommand) { $errors += "testCommand is not set in $ConfigRel" }
 elseif ($cfg.fixMode -notin @('immediate', 'stop')) { $errors += "fixMode in $ConfigRel must be 'immediate' or 'stop' (is '$($cfg.fixMode)')" }
+elseif ($cfg.acceptanceMode -notin @('off', 'reviewed')) { $errors += "acceptanceMode in $ConfigRel must be 'off' or 'reviewed' (is '$($cfg.acceptanceMode)')" }
+elseif ($cfg.acceptanceMode -ne 'off') {
+    if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }
+    if (-not $cfg.acceptanceDir -or [System.IO.Path]::IsPathRooted($cfg.acceptanceDir) -or $cfg.acceptanceDir -match '(^|/)\.\.?(/|$)' -or $cfg.acceptanceDir -match '[*?]') {
+        $errors += "acceptanceDir in $ConfigRel must be a plain relative folder inside the project (is '$($cfg.acceptanceDir)')"
+    }
+}
 $baseBranch = Get-CurrentBranch
 if (-not $baseBranch) { $errors += 'HEAD is detached; check out a branch first' }
 if ((Invoke-Git @('config', 'user.email')).Out -eq '') { $errors += 'git user.email is not set' }
@@ -528,6 +589,9 @@ if ($errors.Count -eq 0) {
         foreach ($p in (Get-ProposeProblems $c.name)) {
             $errors += "change $($c.name) is not ready (propose incomplete): $p"
         }
+        if ($cfg.acceptanceMode -eq 'reviewed' -and -not (Test-HasAcceptance $c.name)) {
+            $errors += "change $($c.name) has no acceptance tests ($($cfg.acceptanceDir)/$($c.name)/ with committed files); write them before the start (acceptanceMode=reviewed)"
+        }
         if ($cfg.groupTesting) {
             # one run per open group plus the final run must fit into maxRunsPerChange
             $open = @(Get-TaskGroups (Join-Path $Project "openspec/changes/$($c.name)") | Where-Object { $_.Done -lt $_.Total })
@@ -548,8 +612,10 @@ Write-Ok "base branch: $baseBranch$(if ($resumed) { ' (resuming)' })"
 # Baseline: a failure must not be blamed on the first change, so the start has to be green.
 Write-Host '    baseline tests ...' -NoNewline
 $baselineLog = Join-Path $Project "$StateDirName/baseline-tests.txt"
-$baseline = Invoke-Tests $cfg $baselineLog
+$baselineAccept = @(Get-DoneAcceptance)
+$baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
 Write-Host (" {0}, {1} min" -f $baseline.Label, $baseline.Minutes)
+if ($baselineAccept.Count) { Write-Ok "acceptance tests of archived changes included: $($baselineAccept -join ', ')" }
 $resumeFix = $null
 if ($baseline.Dirty) {
     Write-Bad "testCommand leaves the working tree dirty:`n$($baseline.Dirty)`n    add these files to .gitignore (or clean them up) and run again"
@@ -577,7 +643,8 @@ $runDir = Join-Path $Project "$StateDirName/runs/$stamp"
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 $settingsPath = Join-Path $runDir 'worker-settings.json'
 $agentsPath = Join-Path $runDir 'worker-agents.json'
-New-WorkerSettings $cfg $settingsPath
+$acceptChanges = @(@($baselineAccept) + @($numbered | ForEach-Object { $_.name } | Where-Object { Test-HasAcceptance $_ }))
+New-WorkerSettings $cfg $settingsPath $acceptChanges
 New-WorkerAgents $agentsPath
 
 $warnings = @()
@@ -664,6 +731,7 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
         $groupsBefore = @(Get-TaskGroups (Join-Path $Project "openspec/changes/$change"))
         $doneBefore = Get-GroupDone $groupsBefore
         $refsBefore = Get-RemoteRefs
+        $headBefore = Get-Head
 
         # the unit of this run: one task group, a repair of a red group, or the final (archive) run
         $mode = $null; $unitGroup = $null; $unitText = ''
@@ -723,6 +791,11 @@ Do the completion check and archive (SUCCESS).
         if ($item.IsFix -and (Test-Path (Join-Path $Project "openspec/changes/fix-$change"))) {
             $problems += "fix-$change was created; a fix change must not create another change"
         }
+        if ($cfg.acceptanceMode -ne 'off') {
+            # frozen acceptance tests: any commit touching acceptanceDir (edit, git rm, git mv) stops the loop
+            $touched = @(((Invoke-Git @('diff', '--name-only', $headBefore, 'HEAD', '--', "$($cfg.acceptanceDir)/")).Out -split "`n") | Where-Object { $_ })
+            if ($touched.Count) { $problems += "agent changed frozen acceptance tests: $($touched -join ', ')" }
+        }
 
         # 4. evaluate result from files (kap. 7)
         $activeDir = Join-Path $Project "openspec/changes/$change"
@@ -768,7 +841,8 @@ Do the completion check and archive (SUCCESS).
         $tests = $null
         if ($problems.Count -eq 0 -and $kind -in @('SUCCESS', 'NONCRITICAL')) {
             Write-Host '    tests ...' -NoNewline
-            $tests = Invoke-Tests $cfg "$logBase.tests.txt"
+            # the change is archived now, so its acceptance tests are part of the regression set
+            $tests = Invoke-Tests $cfg "$logBase.tests.txt" @(Get-DoneAcceptance)
             $testsLabel = $tests.Label
             Write-Host (" {0}, {1} min" -f $tests.Label, $tests.Minutes)
             $claimText = '-'
@@ -798,8 +872,12 @@ Do the completion check and archive (SUCCESS).
                 $gid = $null
                 if ($mode -eq 'repair') { $gid = $repairGroup } elseif ($completed.Count) { $gid = $completed[-1] }
                 if ($gid) {
-                    Write-Host "    tests after group $gid ..." -NoNewline
-                    $gt = Invoke-Tests $cfg ("{0}.group{1}.tests.txt" -f $logBase, $gid)
+                    # acceptance tests must pass once all groups are done (before the final run)
+                    $gAccept = @()
+                    $allDone = -not ($groupsAfter | Where-Object { $_.Done -lt $_.Total })
+                    if ($allDone -and (Test-HasAcceptance $change)) { $gAccept = @($change) }
+                    Write-Host "    tests after group $gid$(if ($gAccept.Count) { ' (+ acceptance)' }) ..." -NoNewline
+                    $gt = Invoke-Tests $cfg ("{0}.group{1}.tests.txt" -f $logBase, $gid) $gAccept
                     Write-Host (" {0}, {1} min" -f $gt.Label, $gt.Minutes)
                     if ($gt.Dirty) { $problems += "testCommand left the working tree dirty:`n$($gt.Dirty)" }
                     else {
@@ -897,7 +975,11 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine("- Final branch: ``$(Get-CurrentBranch)``")
 $baselineText = $baseline.Label
 if ($resumeFix) { $baselineText += " (resuming $resumeFix)" }
+if ($baselineAccept.Count) { $baselineText += " (incl. acceptance tests of $($baselineAccept -join ', '))" }
 [void]$sb.AppendLine("- Baseline tests: $baselineText")
+if ($cfg.acceptanceMode -ne 'off') {
+    [void]$sb.AppendLine("- Acceptance tests: $($cfg.acceptanceMode), frozen under ``$($cfg.acceptanceDir)/``")
+}
 if ($stopReason) { [void]$sb.AppendLine("- **Stopped:** $stopReason") } else { [void]$sb.AppendLine('- **Finished:** all numbered changes processed') }
 [void]$sb.AppendLine()
 [void]$sb.AppendLine('## Changes')

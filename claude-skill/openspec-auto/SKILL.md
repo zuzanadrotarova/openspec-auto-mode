@@ -1,7 +1,7 @@
 ---
 name: openspec-auto
 description: OpenSpec auto-mode – unattended implementation of numbered OpenSpec changes (01-…, 02-…), each in a fresh Claude Code process with an empty context. Use when the user wants to set up auto-mode in a project, check readiness, start it, or see its report ("openspec-auto", "auto-mode", "spusti auto-mode", "priprav projekt na auto-mode", "ako dopadol auto-mode").
-argument-hint: "[init | check | run | report]"
+argument-hint: "[init | check | acceptance <change> | run | report]"
 ---
 
 # OpenSpec auto-mode
@@ -29,6 +29,7 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
 |---|---|
 | `init` | Set up the project |
 | `check` | Readiness check only |
+| `acceptance <change>` | Write the acceptance tests of a change with the user |
 | `run` | Start auto-mode |
 | `report` | Summarize the last report |
 | none | `check`; if everything passes, ask whether to start it |
@@ -55,6 +56,16 @@ Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are 
 - Do not fix architectural content of a change on your own; propose the fix and let the user decide.
 - If everything passes, show the plan (order of changes).
 
+## acceptance – write acceptance tests with the user
+
+Used when `openspec/auto-mode.json` has `acceptanceMode: "reviewed"`, or when the user wants it (then offer to set `acceptanceMode`, `acceptanceCommand` and `acceptanceDir`). This is interactive: the user owns these tests, the auto-mode agent can never change them.
+
+1. Read the change's spec deltas (`openspec/changes/<change>/specs/**`), `proposal.md` and `design.md`.
+2. Propose one test per `#### Scenario:` (named after the scenario), plus edge cases the scenario implies. Use the API named in `design.md` / `tasks.md` (module path, function names), more than one example per scenario, and no helper files outside `acceptanceDir/<change>/`.
+3. Write them into `acceptanceDir/<change>/` with a name `testCommand` does not pick up (with `node --test`: `*.accept.js`, not `*.test.js`).
+4. Run `acceptanceCommand` for the change: the tests must fail because the code is missing, not because of a mistake in the test itself.
+5. Show the user the tests in short (scenario: what is checked) and let them confirm or correct. Commit only after their ok (`<change>: acceptance tests`).
+
 ## run – start auto-mode
 
 1. Run `check` first. If it fails, stop and explain, do not start.
@@ -70,7 +81,7 @@ Read `.openspec-auto/auto-mode-report.md` in the project root and summarize:
   - SUCCESS = done, and the runner's own test run passed (`Tests` column); the notes show the test result after each task group (`groups: 1 green, 2 red->green (1 repair)`),
   - NONCRITICAL = done, but a `fix-…` change was created; if the tests failed, the runner processed the fix right away and it has its own row (`fixes NN-…`), otherwise the fix waits for the user,
   - BLOCKED = architectural problem, the loop stopped,
-  - FAILED-CHECK / STOPPED = the runner's check failed,
+  - FAILED-CHECK / STOPPED = the runner's check failed (`agent changed frozen acceptance tests` = the agent touched the acceptance folder; show the commit with `git log -p -- <acceptanceDir>/`),
   - not processed = the loop never reached it;
 - total cost, and the `fix-…` changes waiting for the user;
 - **BLOCKED:** summarize `openspec/changes/<change>/BLOCKED.md` (what blocks, options) and explain the way out. The user decides; you then help fix it, delete `BLOCKED.md`, commit, and `/openspec-auto run` again.
