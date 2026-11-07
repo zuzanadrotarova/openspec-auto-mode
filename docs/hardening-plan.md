@@ -1,6 +1,6 @@
 # Hardening openspec-auto-mode: discussion and plan
 
-Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; real-project trial pending. Step 3b (agent-written acceptance tests) later.
+Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; tried on the demo project (section 8.5). Step 3b (agent-written acceptance tests) later.
 Date: 2026-11-07
 
 ## 1. Starting point
@@ -417,3 +417,18 @@ acceptance script), `tamper-rm` (`git rm`), `success-regress` (removes other cha
 | T22 | later change breaks an earlier change's acceptance → FAILED-CHECK after its archive |
 
 All 115 checks (T1–T22) green.
+
+### 8.5 Trial on a real project (2026-11-07)
+Demo project, change `05-wrap-text` (`wrapText(text, width)`, two groups: greedy wrapping, long
+words), acceptance tests `acceptance/05-wrap-text/wrap-text.accept.js` (6 tests, several examples
+per scenario plus an invariant over 5 widths) written before the start with Claude and reviewed.
+- Reviewing the acceptance tests against a throw-away reference implementation (outside the project)
+  found a wrong expectation in one of them (a 4-character line at width 3). It was fixed before the
+  commit. Without that check the change would have ended BLOCKED: the review step matters.
+- 3 runs as planned (group 1, group 2, final); runner tests green after group 1; after group 2
+  `npm test` and the acceptance tests green; after archive both green again.
+- The agent did not touch `acceptance/` (no commit there, no permission denials), ran the acceptance
+  command itself in the final run, and wrote its own tests in `tests/` as `tasks.md` asks.
+- USD 0.46 (0.21 + 0.13 + 0.12), about 1.5 minutes.
+- Not exercised by the real agent: a red acceptance test after the last group (repair run), an
+  attempt to change a frozen test (covered by fake-agent tests T20, T21).
