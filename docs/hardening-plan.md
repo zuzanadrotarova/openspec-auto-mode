@@ -1,6 +1,6 @@
 # Hardening openspec-auto-mode: discussion and plan
 
-Status: step 1 merged into `main` (2bc022f), tried on a real project (section 6.9). Step 2 implemented on branch `harden/step-2-task-groups` (section 7.8), fake-agent tests pass.
+Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Next: step 3, frozen acceptance tests (not planned in detail yet).
 Date: 2026-11-07
 
 ## 1. Starting point
@@ -348,3 +348,13 @@ layout the first gate checks nothing new). README/GUIDE config tables, SKILL rep
   run before the final run; the step 1 gate after archiving still catches red tests (FAILED-CHECK).
   Tests at start (baseline) cover the common case where the change's branch is checked out.
 - Fake-agent tests T12–T17 added; T1–T11 unchanged and green with `groupTesting` on.
+
+### 7.9 Trial on a real project (2026-11-07)
+Demo project, change `04-word-tools` with two logical groups (`countWords`, `titleCase`, code +
+tests each), model `sonnet`.
+- 3 runs as planned: group 1, group 2, final run; runner tests green after each group and after archiving.
+- USD 0.38, about 1 minute (a one-pass change cost about USD 0.15–0.20 before step 2).
+- The agent kept to one group per run, ticked nothing outside it, did not archive early; commits
+  are now per group (`1.1-1.2 …`, `2.1-2.2 …`), so a failure is attributable to one group.
+- Existing tests untouched; one test per scenario; `titleCase` reuses `capitalize` as `design.md` says.
+- Not exercised by the real agent: the repair run (covered by fake-agent tests T13, T14).

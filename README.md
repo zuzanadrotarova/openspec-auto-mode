@@ -22,6 +22,21 @@ openspec-auto.ps1 (deterministic script)
 
 **Step-by-step guide: [GUIDE.md](GUIDE.md).**
 
+## How the work is verified
+
+The agent never grades itself. Its final message ("SUCCESS") is ignored; the script decides from evidence a program produces:
+
+| Evidence | Checked by the script |
+|---|---|
+| tests exit 0 | before the first change, after every task group, after every archived change |
+| everything written down | `git status` clean, `openspec validate` passes, archive or `BLOCKED.md` present |
+| progress | more tasks ticked, or a red group repaired; otherwise the loop stops |
+| nothing left the machine | remote refs unchanged (no push) |
+
+When a check fails, only the failing unit goes back to a fresh agent, with the test output and a file scope, and with a hard limit on attempts (`maxGroupRepairs`, `maxRunsPerFix`). After that a human decides. Architectural questions are never decided by the agent: it writes `BLOCKED.md` with options and the loop stops.
+
+Limit: tests prove that nothing *known* broke. The agent is told never to weaken or delete tests, but nothing technically prevents it yet; protected acceptance tests are the next step (see [docs/hardening-plan.md](docs/hardening-plan.md)).
+
 ## Using it from Claude Code (recommended)
 
 The `/openspec-auto` skill (`init`, `check`, `run`, `report`) runs the runner for you and summarizes the result. Installation (once per machine):
@@ -65,14 +80,7 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 
 | Key | Meaning | Default |
 |---|---|---|
-| `testCommand` | test command (required); the agent runs it, and the script runs it itself at start and after every archived change | – |
-| `testTimeoutMinutes` | time limit of one test run by the script | 20 |
-| `fixMode` | `immediate`: after a NONCRITICAL with failing tests, process its `fix-NN-name` right away; `stop`: stop the loop instead | `immediate` |
-| `maxRunsPerFix` | max. runs for one `fix-NN-name` change | 2 |
-| `groupTesting` | one task group (`## N. …` in `tasks.md`) per run, the script tests after every group, archiving in a separate final run | `true` |
-| `maxGroupRepairs` | repair runs for a group whose tests are red when it is complete | 2 |
-
-With `groupTesting`, a change needs at least one run per task group plus the final run; the script refuses to start when `maxRunsPerChange` is too small. Write each group as a logical unit with its own tests ("1. Slugify (code + tests)"), not "1. Implementation / 2. Tests".
+| `testCommand` | test command (required); the agent runs it, and the script runs it itself at start, after every task group and after every archived change | – |
 | `allowedCommands` | additional commands the agent may run (build, lint…) | `[]` |
 | `tasksPerRun` | max. tasks from `tasks.md` per run (one context) | 8 |
 | `maxRunsPerChange` | max. runs per change | 10 |
@@ -80,10 +88,30 @@ With `groupTesting`, a change needs at least one run per task group plus the fin
 | `maxTurns` | max. agent turns in one run | 200 |
 | `model`, `effort` | model and reasoning effort for Claude Code | Claude Code default |
 | `maxBudgetUsdPerRun` | cost cap of one run | no limit |
+| `testTimeoutMinutes` | time limit of one test run by the script | 20 |
+| `groupTesting` | one task group (`## N. …` in `tasks.md`) per run, the script tests after every group, archiving in a separate final run; `false` = one pass, tests only at the end | `true` |
+| `maxGroupRepairs` | repair runs for a group whose tests are red when it is complete | 2 |
+| `fixMode` | `immediate`: after a NONCRITICAL with failing tests, process its `fix-NN-name` right away; `stop`: stop the loop instead | `immediate` |
+| `maxRunsPerFix` | max. runs for one `fix-NN-name` change | 2 |
 
 Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
 
 The tests must pass and must not leave files behind (add test outputs such as coverage reports to `.gitignore`), otherwise the script refuses to start. A script in the project root needs an explicit path (`.\test.cmd`, not `test.cmd`): Claude Code sets `NoDefaultCurrentDirectoryInExePath`, so Windows does not find programs in the current directory by name.
+
+### Writing `tasks.md` for task groups
+
+With `groupTesting`, every group is one agent run followed by a test run of the script, so a group should be a logical unit that ends in a working state and brings its own tests:
+
+```markdown
+## 1. Slugify (code + tests)
+- [ ] 1.1 Add `slugify(text)` to `src/text.js` and export it
+- [ ] 1.2 Add `tests/slugify.test.js`, one test per scenario of the spec
+
+## 2. Truncate (code + tests)
+- [ ] 2.1 …
+```
+
+Avoid "1. Implementation / 2. Tests": the check after group 1 would test nothing new. A change needs at least one run per group plus the final run; the script refuses to start when `maxRunsPerChange` is too small.
 
 ## Usage
 
@@ -122,6 +150,10 @@ The script keeps no state of its own; re-running is the same command.
 - **Interrupted fix:** if a `fix-NN-name` run was interrupted (crash, timeout), run again from `auto/NN-name`; the script resumes the fix even though the tests are still red.
 - **`fix-…` changes waiting for you** (tests were green, `fixMode: stop`, or written by hand) are not processed by the loop. Implement them interactively (`/opsx:apply fix-NN-name`), or rename them to a numbered change.
 
+## Cost
+
+Every run is a full Claude Code session on your account: with a Claude subscription it counts toward your plan's usage limits, with an API key it is billed. The cost shown in the report comes from Claude Code itself. Measured on a small Node project with `sonnet`: about USD 0.15–0.20 per change in one pass (`groupTesting: false`), about USD 0.38 for a change with two task groups (three runs). Set a cap with `maxBudgetUsdPerRun`. The tests in `tests/` use a fake agent and make no API calls.
+
 ## Safety
 
 - The agent runs in `dontAsk` mode: it may only do what is on the allowlist (file tools, `openspec`, local git without branch operations, `testCommand` and `allowedCommands`).
@@ -138,8 +170,9 @@ The script keeps no state of its own; re-running is the same command.
 | `install.ps1` | installs the `/openspec-auto` skill for the current user |
 | `claude-skill/openspec-auto/SKILL.md` | skill source (`install.ps1` fills in the runner path) |
 | `templates/auto-mode.json` | project configuration template |
-| `tests/run-tests.ps1` | tests of the loop logic with a fake agent (no API calls) |
+| `tests/run-tests.ps1`, `tests/fake-claude.ps1` | tests of the loop logic with a fake agent (no API calls) |
 | `GUIDE.md` | step-by-step guide |
+| `docs/hardening-plan.md` | design notes: why the script verifies the agent, decisions, and the roadmap |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1
