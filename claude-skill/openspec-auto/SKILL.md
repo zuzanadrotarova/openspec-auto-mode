@@ -16,7 +16,7 @@ If the paths above still contain the placeholder OPENSPEC_AUTO_HOME in double cu
 Invoke it with the PowerShell tool, always with the project root as `-Project`:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File "{{OPENSPEC_AUTO_HOME}}\openspec-auto.ps1" -Project "<project root>" [-Init | -DryRun]
+powershell -NoProfile -ExecutionPolicy Bypass -File "{{OPENSPEC_AUTO_HOME}}\openspec-auto.ps1" -Project "<project root>" [-Init | -SetupAcceptanceSchema | -DryRun]
 ```
 
 The project root is the git repository root of the current working directory (`git rev-parse --show-toplevel`).
@@ -44,9 +44,10 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
    - `allowedCommands`: build and lint commands the project actually has (e.g. `npm run build`, `npm run lint`). Remove template entries the project does not have.
    - If the project has no tests or no code yet, say so and ask what the test command will be.
    - A script in the project root needs an explicit path (`.\test.cmd`); the tests must pass and must not leave untracked files (add test outputs such as coverage to `.gitignore`).
-5. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
-6. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
-7. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
+5. Offer acceptance tests (recommended when the project has tests): set `acceptanceMode: "reviewed"`, `acceptanceCommand` (e.g. `node --test "acceptance/{change}/*.accept.js"`) and `acceptanceDir`, then run the runner with `-SetupAcceptanceSchema`. It adds an `acceptance` artifact to the project's OpenSpec workflow (proposal, specs, design, **acceptance**, tasks), so `/opsx:propose` writes the acceptance tests with the user as part of every change. Say that this uses OpenSpec's custom schemas, which are experimental; after an OpenSpec update, run `-SetupAcceptanceSchema` again.
+6. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
+7. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
+8. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
 
 ## check – readiness
 
@@ -58,7 +59,7 @@ Run with `-DryRun`. Lines starting with `+` passed, lines starting with `x` are 
 
 ## acceptance – write acceptance tests with the user
 
-Used when `openspec/auto-mode.json` has `acceptanceMode: "reviewed"`, or when the user wants it (then offer to set `acceptanceMode`, `acceptanceCommand` and `acceptanceDir`). This is interactive: the user owns these tests, the auto-mode agent can never change them.
+Used when `openspec/auto-mode.json` has `acceptanceMode: "reviewed"`, or when the user wants it (then offer to set `acceptanceMode`, `acceptanceCommand` and `acceptanceDir`). This is interactive: the user owns these tests, the auto-mode agent can never change them. With the acceptance schema (`-SetupAcceptanceSchema`), `/opsx:propose` does this as the `acceptance` artifact; this mode is for changes created before, or to redo the tests of one change. If the change's schema has the artifact, also write `openspec/changes/<change>/acceptance.md` (the table scenario -> test).
 
 1. Read the change's spec deltas (`openspec/changes/<change>/specs/**`), `proposal.md` and `design.md`.
 2. Propose one test per `#### Scenario:` (named after the scenario), plus edge cases the scenario implies. Use the API named in `design.md` / `tasks.md` (module path, function names), more than one example per scenario, and no helper files outside `acceptanceDir/<change>/`.

@@ -120,7 +120,11 @@ Avoid "1. Implementation / 2. Tests": the check after group 1 would test nothing
 
 ### Acceptance tests (optional, `acceptanceMode: reviewed`)
 
-Acceptance tests say when a change is done, and they exist before the agent writes any code. You write them with Claude during propose and review them ( `/openspec-auto acceptance 01-login`), one test per scenario of the spec deltas, into `acceptance/<change>/`, and commit them with the proposal. They fail until the change is implemented.
+Acceptance tests say when a change is done, and they exist before the agent writes any code. You write them with Claude during propose and review them, one test per scenario of the spec deltas, into `acceptance/<change>/`, and commit them with the proposal. They fail until the change is implemented.
+
+Two ways to write them:
+- **As part of the OpenSpec workflow (recommended):** `openspec-auto.ps1 -SetupAcceptanceSchema` copies OpenSpec's built-in `spec-driven` schema to `openspec/schemas/spec-driven-acceptance/`, adds an `acceptance` artifact between `design` and `tasks` and selects the schema in `openspec/config.yaml`. `/opsx:propose` then writes the tests and `acceptance.md` (table scenario -> test) for every new change and asks you to review them; the start check refuses a change without `acceptance.md`. OpenSpec custom schemas are experimental: after an OpenSpec update, run `-SetupAcceptanceSchema` again (it starts from the current built-in schema; edits of that folder are overwritten). Changes created before keep their schema; `fix-…` changes use the built-in `spec-driven` (they are checked against the acceptance tests of the change they fix).
+- **Separately:** `/openspec-auto acceptance 01-login` after propose.
 
 - The agent may not edit `acceptance/` (deny rules), and the script checks after every run that no commit touched it. A change there stops the loop (FAILED-CHECK).
 - The script runs them when the last task group is done (red: repair run with the output), after archiving, and the tests of all archived changes before the start and after every archive.
@@ -137,6 +141,7 @@ Acceptance tests say when a change is done, and they exist before the agent writ
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-auto.ps1   # in the project root
 powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -DryRun                      # checks and plan only
+powershell -ExecutionPolicy Bypass -File ...openspec-auto.ps1 -SetupAcceptanceSchema       # acceptance artifact in the OpenSpec workflow
 powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\other\project
 ```
 

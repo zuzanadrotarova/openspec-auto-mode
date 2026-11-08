@@ -359,6 +359,66 @@ $r = Invoke-Runner $p '01-a=success;02-b=success-regress'
 Check ($r.Code -eq 1 -and $r.Out -match 'tests fail after 02-b was archived \(red \(acceptance 01-a exit 1\)') 'regression stops the loop'
 Check ($r.Out -match '\| 01-a \| SUCCESS') '01-a itself was SUCCESS'
 
+function Invoke-Setup([string]$P) {
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner -Project $P -SetupAcceptanceSchema 2>&1 | ForEach-Object { "$_" }
+    [pscustomobject]@{ Code = $LASTEXITCODE; Out = ($out -join "`n") }
+}
+function Commit-All([string]$P, [string]$Msg) { Push-Location $P; git add -A 2>&1 | Out-Null; git commit -q -m $Msg 2>&1 | Out-Null; Pop-Location }
+function Write-AcceptanceMd([string]$P, [string]$C) {
+    Set-Content "$P/openspec/changes/$C/acceptance.md" "# Acceptance tests`n- Command: .\acceptance\$C\check.cmd`n| Scenario | Test |`n|---|---|`n| Basic | check |`n"
+}
+
+Write-Host "T23 -SetupAcceptanceSchema adds the acceptance artifact to the OpenSpec workflow"
+$p = New-Project 't23' @()
+$r = Invoke-Setup $p
+Check ($r.Code -eq 0) 'setup exit 0'
+$sf = "$p/openspec/schemas/spec-driven-acceptance/schema.yaml"
+$schemaText = [System.IO.File]::ReadAllText($sf)
+Check ($schemaText -match '(?m)^  - id: acceptance\s*$' -and $schemaText -match 'generates: acceptance\.md') 'schema has the acceptance artifact'
+Check ($schemaText -match '(?s)- id: acceptance.*- id: tasks.*requires:\s*\n\s*- specs\s*\n\s*- design\s*\n\s*- acceptance') 'acceptance comes before tasks, tasks requires it'
+Check (Test-Path "$p/openspec/schemas/spec-driven-acceptance/templates/acceptance.md") 'acceptance.md template copied'
+Check ((Get-Content "$p/openspec/config.yaml" -Raw) -match '(?m)^schema: spec-driven-acceptance\s*$') 'config.yaml selects the schema'
+Push-Location $p; $v = & $os schema validate spec-driven-acceptance 2>&1; $vc = $LASTEXITCODE; Pop-Location
+Check ($vc -eq 0) 'openspec schema validate passes'
+Check ($r.Out -match "set acceptanceMode to 'reviewed'") 'hint: acceptanceMode not set'
+$r = Invoke-Setup $p
+Check ($r.Code -eq 0 -and [System.IO.File]::ReadAllText($sf) -eq $schemaText) 'second run gives the same schema'
+Check (([regex]::Matches([System.IO.File]::ReadAllText($sf), '- id: acceptance')).Count -eq 1) 'artifact inserted once'
+
+Write-Host "T24 with the acceptance artifact: a change without acceptance.md is refused"
+$p = New-Project 't24' @() $AcceptConfig
+$r = Invoke-Setup $p
+Check ($r.Code -eq 0 -and $r.Out -notmatch "set acceptanceMode") 'setup with acceptanceMode set: no hint'
+Commit-All $p 'acceptance schema'
+Push-Location $p; New-Change '01-a' 2 2; Pop-Location
+Check ((Get-Content "$p/openspec/changes/01-a/.openspec.yaml" -Raw) -match 'schema: spec-driven-acceptance') 'new change uses the acceptance schema'
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'missing artifacts: acceptance \(acceptance\.md\)') 'missing acceptance.md refused at start'
+Write-AcceptanceMd $p '01-a'; Commit-All $p 'acceptance.md'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'with acceptance.md: change finishes'
+Check ($r.Out -notmatch 'without the acceptance artifact') 'no note about a missing artifact'
+Check (Test-Path "$p/openspec/changes/archive/*-01-a/acceptance.md") 'acceptance.md archived with the change'
+$p = New-Project 't24b' @('01-a:1') $AcceptConfig
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and $r.Out -match 'Note: without the acceptance artifact in their OpenSpec workflow: 01-a') 'old schema: change runs, report notes it'
+
+Write-Host "T25 with the acceptance schema: a fix change (built-in schema) is processed right away"
+$p = New-Project 't25' @() $AcceptConfig
+[void](Invoke-Setup $p); Commit-All $p 'acceptance schema'
+Push-Location $p; New-Change '01-a' 2; New-Change '02-b' 1; Pop-Location
+Write-AcceptanceMd $p '01-a'; Write-AcceptanceMd $p '02-b'
+Add-Acceptance $p @('01-a', '02-b')
+# 01-a ends NONCRITICAL (1 of 2 tasks), so its acceptance test must not depend on impl/01-a.txt
+Set-Content "$p/acceptance/01-a/check.cmd" '@echo ok 01-a'; Commit-All $p '01-a acceptance'
+$r = Invoke-Runner $p '01-a=noncritical-red;fix-01-a=fixgreen;02-b=success'
+Check ($r.Code -eq 0 -and (Archived $p 'fix-01-a') -and (Archived $p '02-b')) 'fix-01-a and 02-b archived'
+$fixMeta = Get-ChildItem "$p/openspec/changes/archive/*-fix-01-a/.openspec.yaml" | Select-Object -First 1
+Check ($fixMeta -and ((Get-Content $fixMeta.FullName -Raw) -match 'schema: spec-driven\s')) 'fix change uses the built-in schema'
+Check ([System.IO.File]::ReadAllText((Join-Path $Tool 'worker-prompt.md')) -match 'openspec new change fix-<change> --schema spec-driven') 'worker prompt: fixes with --schema spec-driven'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

@@ -27,6 +27,12 @@
 .PARAMETER Init
     Creates openspec/auto-mode.json from the template and prepares local git exclusions.
 
+.PARAMETER SetupAcceptanceSchema
+    Adds an "acceptance" artifact to the project's OpenSpec workflow: copies the current built-in
+    spec-driven schema to openspec/schemas/spec-driven-acceptance/, inserts the artifact before
+    tasks and selects the schema in openspec/config.yaml. Safe to run again (e.g. after an
+    OpenSpec update); custom edits of that schema folder are overwritten.
+
 .PARAMETER DryRun
     Runs the start checks and prints the plan without running anything.
 
@@ -37,6 +43,7 @@
 param(
     [string]$Project = (Get-Location).Path,
     [switch]$Init,
+    [switch]$SetupAcceptanceSchema,
     [switch]$DryRun,
     [string]$ClaudeCommand = 'claude'
 )
@@ -47,6 +54,7 @@ $ToolDir = $PSScriptRoot
 $StateDirName = '.openspec-auto'
 $ConfigRel = 'openspec/auto-mode.json'
 $AgentName = 'openspec-auto'
+$AcceptSchemaName = 'spec-driven-acceptance'
 $HookMarker = '# openspec-auto-mode pre-push guard'
 $IsWin = ($env:OS -eq 'Windows_NT')
 $Utf8 = New-Object System.Text.UTF8Encoding $false
@@ -113,6 +121,7 @@ function Get-ProposeProblems([string]$Change) {
     $start = $s.Out.IndexOf('{')
     if ($s.Code -ne 0 -or $start -lt 0) { return @("openspec status failed: $($s.Out)") }
     $status = $s.Out.Substring($start) | ConvertFrom-Json
+    if (@($status.artifacts | Where-Object { $_.id -eq 'acceptance' }).Count -eq 0) { $script:NoAcceptArtifact += $Change }
     $missing = @($status.artifacts | Where-Object { $_.status -notin @('done', 'skipped') } | ForEach-Object { "$($_.id) ($($_.outputPath))" })
     if ($missing.Count) { $problems += "missing artifacts: $($missing -join ', ')" }
     $t = Get-TaskCounts (Join-Path $Project "openspec/changes/$Change")
@@ -547,6 +556,56 @@ if ($Init) {
     return
 }
 
+if ($SetupAcceptanceSchema) {
+    Write-Step 'Setup acceptance schema'
+    if (-not (Test-Path (Join-Path $Project 'openspec'))) { throw 'openspec/ not found; run openspec init first.' }
+    # always start from the current built-in schema, so an OpenSpec update is picked up by re-running
+    $r = Invoke-OpenSpec @('schema', 'fork', 'spec-driven', $AcceptSchemaName, '--force')
+    if ($r.Code -ne 0) { throw "openspec schema fork failed:`n$($r.Out)" }
+    $schemaDir = Join-Path $Project "openspec/schemas/$AcceptSchemaName"
+    $schemaFile = Join-Path $schemaDir 'schema.yaml'
+    if (-not (Test-Path $schemaFile)) { throw "schema not found after fork: $schemaFile" }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.AddRange([string[]][System.IO.File]::ReadAllLines($schemaFile))
+    if ($lines -match '^\s*-\s+id:\s*acceptance\s*$') { throw "the built-in spec-driven schema already has an 'acceptance' artifact; check it before adding ours" }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^description:') { $lines[$i] = 'description: OpenSpec workflow with acceptance tests (OpenSpec auto-mode) - proposal, specs, design, acceptance, tasks'; break }
+    }
+    $tasksAt = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^  - id: tasks\s*$') { $tasksAt = $i; break } }
+    if ($tasksAt -lt 0) { throw "artifact 'tasks' not found in $schemaFile; add the acceptance artifact by hand (templates/schema/)" }
+    # tasks requires acceptance: insert after the last entry of its block-style requires list
+    $reqAt = -1
+    for ($i = $tasksAt + 1; $i -lt $lines.Count -and $lines[$i] -notmatch '^\S|^  - '; $i++) {
+        if ($lines[$i] -match '^    requires:\s*$') { $reqAt = $i; break }
+    }
+    if ($reqAt -lt 0) { throw "'requires:' list of artifact 'tasks' not found in $schemaFile; add the acceptance artifact by hand (templates/schema/)" }
+    $last = $reqAt
+    while ($last + 1 -lt $lines.Count -and $lines[$last + 1] -match '^      - ') { $last++ }
+    $lines.Insert($last + 1, '      - acceptance')
+    $artifact = [System.IO.File]::ReadAllLines((Join-Path $ToolDir 'templates/schema/acceptance-artifact.yaml'))
+    $lines.InsertRange($tasksAt, [string[]]$artifact)
+    Write-TextFile $schemaFile (($lines -join "`n") + "`n")
+    Copy-Item (Join-Path $ToolDir 'templates/schema/acceptance.md') (Join-Path $schemaDir 'templates/acceptance.md') -Force
+    $osConfig = Join-Path $Project 'openspec/config.yaml'
+    $text = ''
+    if (Test-Path $osConfig) { $text = [System.IO.File]::ReadAllText($osConfig) }
+    if ($text -match '(?m)^schema:.*$') { $text = $text -replace '(?m)^schema:.*$', "schema: $AcceptSchemaName" }
+    else { $text = "schema: $AcceptSchemaName`n" + $text }
+    Write-TextFile $osConfig $text
+    $v = Invoke-OpenSpec @('schema', 'validate', $AcceptSchemaName)
+    if ($v.Code -ne 0) { throw "openspec schema validate $AcceptSchemaName failed:`n$($v.Out)" }
+    Write-Ok "openspec/schemas/$AcceptSchemaName/ created (proposal, specs, design, acceptance, tasks), schema valid"
+    Write-Ok "openspec/config.yaml uses schema $AcceptSchemaName for new changes"
+    $c = Read-Config
+    if (-not $c -or $c.acceptanceMode -ne 'reviewed' -or -not $c.acceptanceCommand) {
+        Write-Warn "set acceptanceMode to 'reviewed' and acceptanceCommand in $ConfigRel, otherwise the runner does not run these tests"
+    }
+    Write-Warn 'changes created before keep their schema (.openspec.yaml); fix changes use spec-driven'
+    Write-Host '    Commit openspec/schemas/ and openspec/config.yaml.'
+    return
+}
+
 # ---------------------------------------------------------------- start checks (kap. 5.2)
 
 Write-Step "OpenSpec auto-mode in $Project"
@@ -572,6 +631,7 @@ if ($dirty) { $errors += "working tree is not clean:`n$dirty" }
 
 $numbered = @()
 $fixCandidate = $null
+$NoAcceptArtifact = @()
 if ($errors.Count -eq 0) {
     $active = Get-ActiveChanges
     $numbered = Get-NumberedChanges $active
@@ -617,6 +677,9 @@ $baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
 Write-Host (" {0}, {1} min" -f $baseline.Label, $baseline.Minutes)
 if ($baselineAccept.Count) { Write-Ok "acceptance tests of archived changes included: $($baselineAccept -join ', ')" }
 $resumeFix = $null
+if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
+    Write-Warn "without the acceptance artifact in their OpenSpec workflow: $($NoAcceptArtifact -join ', ') (optional, see -SetupAcceptanceSchema)"
+}
 if ($baseline.Dirty) {
     Write-Bad "testCommand leaves the working tree dirty:`n$($baseline.Dirty)`n    add these files to .gitignore (or clean them up) and run again"
     exit 2
@@ -979,6 +1042,9 @@ if ($baselineAccept.Count) { $baselineText += " (incl. acceptance tests of $($ba
 [void]$sb.AppendLine("- Baseline tests: $baselineText")
 if ($cfg.acceptanceMode -ne 'off') {
     [void]$sb.AppendLine("- Acceptance tests: $($cfg.acceptanceMode), frozen under ``$($cfg.acceptanceDir)/``")
+    if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
+        [void]$sb.AppendLine("- Note: without the acceptance artifact in their OpenSpec workflow: $($NoAcceptArtifact -join ', ') (optional, see -SetupAcceptanceSchema)")
+    }
 }
 if ($stopReason) { [void]$sb.AppendLine("- **Stopped:** $stopReason") } else { [void]$sb.AppendLine('- **Finished:** all numbered changes processed') }
 [void]$sb.AppendLine()

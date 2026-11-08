@@ -1,0 +1,48 @@
+  - id: acceptance
+    generates: acceptance.md
+    description: Acceptance tests of the change, written and reviewed before the implementation
+    template: acceptance.md
+    instruction: |
+      Write the acceptance tests of this change: executable tests that say when the change
+      is done. They are written now, before any code exists, reviewed by the user, and then
+      frozen: the agent that later implements the change can never modify them (OpenSpec
+      auto-mode stops if it does).
+
+      Writing these test files is part of planning, not implementation. This artifact
+      authorizes creating files in exactly one place outside openspec/: the acceptance folder
+      of this change. Do not touch any other project file (no implementation, no helpers,
+      no other tests).
+
+      Where and how:
+      - Read `openspec/auto-mode.json`: `acceptanceDir` (default `acceptance`) and
+        `acceptanceCommand` (`{change}` stands for the change name). Write the tests into
+        `<acceptanceDir>/<change>/`. If the file is missing or `acceptanceMode` is `off`,
+        ask the user whether to set up acceptance tests before writing any.
+      - Use a file name the project's normal test command does not pick up (with
+        `node --test`: `*.accept.js`, not `*.test.js`), so the tests of a change that is not
+        implemented yet do not make the normal tests red.
+      - One test per `#### Scenario:` of the spec deltas, named after the scenario, plus edge
+        cases the scenario implies. Use more than one example per scenario, so that an
+        implementation cannot be fitted to a single input.
+      - Use the public API named in design.md (module path, function names, error types).
+        Test only externally visible behavior from the specs, not internals.
+      - Self-contained: no helper files outside `<acceptanceDir>/<change>/`, no imports of
+        other tests.
+      - Run the acceptance command for this change: the tests must fail because the code is
+        missing (for example the module the change creates does not exist yet), not because
+        of a mistake in a test.
+
+      Then write this artifact (acceptance.md) from the template: the command, the files and
+      the table scenario -> test. Every scenario of the spec deltas must appear in the table.
+
+      Review: show the user every test in short (scenario: inputs and expected results) and
+      ask them to confirm or correct the expectations. A wrong expectation stops auto-mode
+      later (BLOCKED), so this review is the point of the artifact. The tests are committed
+      together with the change, after the user's ok.
+
+      A change without spec deltas (skip_specs) gets an acceptance.md with the line
+      "No acceptance tests: <reason>" and no test files.
+    requires:
+      - specs
+      - design
+

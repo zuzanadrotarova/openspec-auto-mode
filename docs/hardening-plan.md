@@ -1,6 +1,6 @@
 # Hardening openspec-auto-mode: discussion and plan
 
-Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; tried on the demo project (section 8.5). Step 3b (agent-written acceptance tests) later.
+Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; tried on the demo project (section 8.5). Step 3b (agent-written acceptance tests) later, probably not needed. Step 3c (acceptance tests as an artifact of the OpenSpec workflow, section 9) implemented on branch `step3c-acceptance-artifact`, fake-agent tests green; trial pending.
 Date: 2026-11-07
 
 ## 1. Starting point
@@ -432,3 +432,57 @@ per scenario plus an invariant over 5 widths) written before the start with Clau
 - USD 0.46 (0.21 + 0.13 + 0.12), about 1.5 minutes.
 - Not exercised by the real agent: a red acceptance test after the last group (repair run), an
   attempt to change a frozen test (covered by fake-agent tests T20, T21).
+
+## 9. Step 3c - acceptance tests as an artifact of the OpenSpec workflow
+
+### 9.1 What OpenSpec already has (checked 2026-11-08, OpenSpec 1.13.2)
+- Every requirement needs at least one `#### Scenario:` (WHEN / THEN); the schema says "each scenario
+  is a potential test case". So OpenSpec has acceptance criteria, but only as prose.
+- No executable acceptance tests: the agent writes tests during apply (the same agent that writes the
+  code), nothing protects them, nothing checks that every scenario has a test.
+- Custom workflows: `openspec schema fork spec-driven <name>` copies the built-in schema to
+  `openspec/schemas/<name>/` (experimental); `openspec status` / `instructions` and `/opsx:propose`
+  follow the artifacts of the schema in dependency order.
+- Verified: an artifact can only generate files inside the change folder ("generates field must be a
+  relative path inside its allowed directory"). Every change records its schema in `.openspec.yaml`;
+  `openspec new change` uses the schema of `config.yaml` unless `--schema` is given.
+
+### 9.2 Decisions (2026-11-08)
+- Over 3b: the value is the human review before the code; an artifact makes it part of every propose.
+  Next: scenario coverage check (step 4 B), using the table in `acceptance.md`.
+- New artifact `acceptance` (generates `acceptance.md`: command, files, table scenario -> test),
+  between design and tasks: requires specs + design (the tests use the API of design.md), tasks
+  requires acceptance. Its instruction has the tests written into `acceptanceDir/<change>/` (outside
+  the change folder, as in 3a, so freeze, regression and paths stay unchanged), and explicitly
+  authorizes these files despite the planning boundary of `/opsx:propose` ("do not edit project code").
+- Optional: without the schema everything works as in 3a; the report notes changes without the artifact.
+- Fix changes are created with `--schema spec-driven`: they have no acceptance tests of their own.
+
+### 9.3 Benefits and risks
+- Benefit: acceptance tests cannot be forgotten; the start check (all artifacts done) refuses a change
+  without `acceptance.md` with no new runner code.
+- Risks: custom schemas are experimental (mitigation: setup forks the current built-in schema and
+  validates, re-run after an update); `/opsx:propose` may refuse to write files outside `openspec/`
+  (checked in the trial; fallback: tests inside the change folder, a bigger runner change); a
+  slightly longer propose.
+
+### 9.4 Implementation
+- `templates/schema/acceptance-artifact.yaml` (artifact and instruction), `templates/schema/acceptance.md` (template).
+- `openspec-auto.ps1 -SetupAcceptanceSchema`: `schema fork spec-driven spec-driven-acceptance --force`, inserts
+  the artifact before `tasks`, adds `acceptance` to the requires of `tasks`, copies the template, sets
+  `schema:` in `openspec/config.yaml`, `openspec schema validate`; hint if `acceptanceMode` is not set.
+  Refuses if the built-in schema has no `tasks` artifact with a block `requires:` list or already has
+  an `acceptance` artifact.
+- Start check: with `acceptanceMode: reviewed`, changes whose schema has no `acceptance` artifact are
+  listed as a warning and a report note (not an error).
+- `worker-prompt.md` and the fake agent: `openspec new change fix-<change> --schema spec-driven`.
+- SKILL.md (init offers it; the `acceptance` mode also writes `acceptance.md`), README, GUIDE.
+
+### 9.5 Tests (fake agent)
+| Test | Expected |
+|---|---|
+| T23 | setup: artifact before tasks, tasks requires it, template copied, config.yaml selects the schema, schema valid, hint without acceptanceMode; second run gives the same file, artifact once |
+| T24 | new change gets the schema; without `acceptance.md` refused at start (`missing artifacts: acceptance`); with it SUCCESS, `acceptance.md` archived; T24b: old schema runs, report note |
+| T25 | NONCRITICAL with red tests under the acceptance schema: `fix-01-a` has `schema: spec-driven` and is processed right away |
+
+All 134 checks (T1-T25) green.

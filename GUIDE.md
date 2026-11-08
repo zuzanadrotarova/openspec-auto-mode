@@ -130,7 +130,7 @@ If a change got a different name, ask Claude to rename it (e.g. "rename the chan
 - Small changes (3 to 10 tasks) work best. Split a large feature into several changes.
 - You do not have to propose the whole project at once. A batch is enough; add more changes later.
 
-**Acceptance tests (if `acceptanceMode` is `reviewed`):** for every change, write tests that say when it is done, before auto-mode starts. Tell Claude "write acceptance tests for 01-login" (or `/openspec-auto acceptance 01-login`); together you write one test per scenario into `acceptance/01-login/`. The agent cannot change them: if it does, auto-mode stops. They are the strongest check auto-mode has, because they were written before the code, outside auto-mode, and you approved them. Read them before you commit them: a wrong acceptance test stops the change with `BLOCKED`.
+**Acceptance tests (if `acceptanceMode` is `reviewed`):** for every change, write tests that say when it is done, before auto-mode starts. If the project uses the acceptance workflow (set up by `/openspec-auto init`), `/opsx:propose` writes them with you as one part of the change, next to the proposal, specs, design and tasks. Otherwise tell Claude "write acceptance tests for 01-login" (or `/openspec-auto acceptance 01-login`). Either way you write one test per scenario into `acceptance/01-login/`. The agent cannot change them: if it does, auto-mode stops. They are the strongest check auto-mode has, because they were written before the code, outside auto-mode, and you approved them. Read them before you commit them: a wrong acceptance test stops the change with `BLOCKED`.
 
 When the changes are ready, tell Claude "commit the proposals".
 
@@ -219,7 +219,7 @@ A small change on the `sonnet` model costs about USD 0.15. The summary shows the
 
 This is mostly for Claude, not for you.
 
-- **Runner:** `openspec-auto.ps1` with the switches `-Init`, `-DryRun`, `-Project <path>`.
+- **Runner:** `openspec-auto.ps1` with the switches `-Init`, `-SetupAcceptanceSchema`, `-DryRun`, `-Project <path>`.
 - **Skill:** `/openspec-auto` lives in `~/.claude/skills/openspec-auto/SKILL.md`; its source is `claude-skill/` in this repository. `install.ps1` installs it and fills in the runner path. After changing the source or moving the repository, run `install.ps1` again.
 - **Report and logs:** `.openspec-auto/` in the project (not in git).
 - **Runner start-up messages and fixes:**
@@ -238,6 +238,7 @@ This is mostly for Claude, not for you.
 | `no active numbered changes` | propose a change or rename one to `NN-name` |
 | `change NN-x is blocked` | section 5.1 |
 | `not ready …: missing artifacts: …` | add the missing artifact (`/opsx:update`) |
+| `missing artifacts: acceptance (acceptance.md)` | the acceptance tests of that change are not written yet: ask Claude to write them (`/openspec-auto acceptance NN-x`), review and commit |
 | `not ready …: openspec validate failed: [ERROR] …` | fix according to the error text |
 | `not ready …: tasks.md has no tasks` | add tasks `- [ ] 1.1 …` |
 | `branch auto/NN-x exists and diverges` (STOPPED in the report) | switch to that branch or delete it |

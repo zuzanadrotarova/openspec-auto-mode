@@ -76,7 +76,7 @@ function Result([string]$Kind) {
 
 function Break-Tests { Set-Content 'broken.txt' 'the project test script fails while this file exists' }
 function New-Fix {
-    & $os new change "fix-$change" 2>&1 | Out-Null
+    & $os new change "fix-$change" --schema spec-driven 2>&1 | Out-Null
     Add-Content "openspec/changes/fix-$change/.openspec.yaml" 'skip_specs: true'
     Set-Content "openspec/changes/fix-$change/proposal.md" "## Why`nTest for greeting fails after change $change, the output has a trailing space.`n## What Changes`n- Fix greeting output.`n"
     Set-Content "openspec/changes/fix-$change/tasks.md" "- [ ] 1.1 Fix trailing space`n- [ ] 1.2 Check the caller`n- [ ] 1.3 Re-run the tests`n"

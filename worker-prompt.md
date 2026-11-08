@@ -87,7 +87,7 @@ When the user message names acceptance tests, they were written before this chan
 5. **Act.**
    - **SUCCESS:** commit, then `openspec archive <change> -y`, then commit `"<change>: archive"`. When the runner gives units of work, only in the final run.
    - **NON-CRITICAL:**
-     1. Create the change: `openspec new change fix-<change>`.
+     1. Create the change: `openspec new change fix-<change> --schema spec-driven` (the built-in schema: a fix has no acceptance tests of its own, it is checked against those of `<change>`).
      2. Write `proposal.md`: what does not work, which test fails (its name exactly as the test command prints it, and the short error), where the likely cause is (files), and a reference to the original change `<change>`. If the tests fail, the runner processes this fix right after `<change>` with a fresh agent.
      3. Write `tasks.md` with unchecked steps to fix it.
      4. A fix restores intended behavior that is already specified, so it has no spec deltas: add the line `skip_specs: true` to `openspec/changes/fix-<change>/.openspec.yaml`.
