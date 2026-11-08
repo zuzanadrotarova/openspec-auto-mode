@@ -1,6 +1,6 @@
 # Hardening openspec-auto-mode: discussion and plan
 
-Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; tried on the demo project (section 8.5). Step 3b (agent-written acceptance tests) later, probably not needed. Step 3c (acceptance tests as an artifact of the OpenSpec workflow, section 9) implemented on branch `step3c-acceptance-artifact`, fake-agent tests green; trial pending.
+Status: steps 1 and 2 merged into `main` and pushed (8856e64, 1be4dd9), both tried on a real project (sections 6.9, 7.9). Step 3a (frozen acceptance tests written before the start and reviewed by the user, section 8) implemented on branch `step3-acceptance-tests`, fake-agent tests green; tried on the demo project (section 8.5). Step 3b (agent-written acceptance tests) later, probably not needed. Step 3c (acceptance tests as an artifact of the OpenSpec workflow, section 9) implemented, fake-agent tests green, tried on the demo project (section 9.6).
 Date: 2026-11-07
 
 ## 1. Starting point
@@ -486,3 +486,22 @@ per scenario plus an invariant over 5 widths) written before the start with Clau
 | T25 | NONCRITICAL with red tests under the acceptance schema: `fix-01-a` has `schema: spec-driven` and is processed right away |
 
 All 134 checks (T1-T25) green.
+
+### 9.6 Trial on a real project (2026-11-08)
+Demo project, branch `auto/06-prep` from `auto/05-wrap-text`: `-SetupAcceptanceSchema` created the
+schema and selected it in `openspec/config.yaml` (committed). Change `06-pad-text`
+(`padText(text, width, align)`, two groups: left/right, center).
+- Proposal: created by Claude following the `openspec-propose` skill step by step (not a fresh
+  `/opsx:propose` session). The new change got the schema `spec-driven-acceptance`; the `acceptance`
+  artifact came between design and tasks, its instruction led to `acceptance/06-pad-text/pad-text.accept.js`
+  (6 tests) plus `acceptance.md`; nothing stopped the write outside `openspec/`. The tests were red
+  for the missing function, green on a throw-away reference implementation, and reviewed by the user
+  before the commit. `openspec validate --strict` passed.
+- Cosmetic: `openspec new change` prints "with schema 'spec-driven'" but writes `spec-driven-acceptance`
+  to `.openspec.yaml` (status confirms).
+- Before the commit the runner refused the start (working tree not clean), after it `-DryRun` planned
+  the change without the "no acceptance artifact" warning.
+- Run: SUCCESS, 3 runs (group 1, group 2 + acceptance, final), all tests green, USD 0.47, about
+  2 minutes. `acceptance/06-pad-text/` unchanged.
+- Still open: whether a fresh `/opsx:propose` session respects the authorization in the artifact
+  instruction or refuses because of the skill's planning boundary.
