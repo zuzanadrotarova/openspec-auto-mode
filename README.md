@@ -98,6 +98,7 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `acceptanceMode` | `reviewed`: every numbered change needs acceptance tests in `acceptanceDir/<change>/`, written before the start (with Claude) and reviewed by you; `off`: none | `off` |
 | `acceptanceCommand` | runs the acceptance tests of one change; `{change}` is replaced by its name, e.g. `node --test "acceptance/{change}/*.accept.js"` | - |
 | `acceptanceDir` | folder of the acceptance tests (frozen for the agent) | `acceptance` |
+| `scenarioCoverage` | with `acceptanceMode: reviewed`: every `#### Scenario:` of a change's spec deltas (not under REMOVED) must be named literally in its acceptance test files, otherwise the start is refused | `true` |
 
 Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
 
@@ -126,6 +127,7 @@ Two ways to write them:
 - **As part of the OpenSpec workflow (recommended):** `openspec-auto.ps1 -SetupAcceptanceSchema` copies OpenSpec's built-in `spec-driven` schema to `openspec/schemas/spec-driven-acceptance/`, adds an `acceptance` artifact between `design` and `tasks` and selects the schema in `openspec/config.yaml`. `/opsx:propose` then writes the tests and `acceptance.md` (table scenario -> test) for every new change and asks you to review them; the start check refuses a change without `acceptance.md`. OpenSpec custom schemas are experimental: after an OpenSpec update, run `-SetupAcceptanceSchema` again (it starts from the current built-in schema; edits of that folder are overwritten). Changes created before keep their schema; `fix-…` changes use the built-in `spec-driven` (they are checked against the acceptance tests of the change they fix).
 - **Separately:** `/openspec-auto acceptance 01-login` after propose.
 
+- Scenario coverage (`scenarioCoverage`, on by default): before the start, the script checks that the name of every scenario appears in the acceptance test files of its change (e.g. `test('Scenario: Valid password', ...)`) and names the missing ones. It checks that a test exists, not that it is good; that is what your review is for.
 - The agent may not edit `acceptance/` (deny rules), and the script checks after every run that no commit touched it. A change there stops the loop (FAILED-CHECK).
 - The script runs them when the last task group is done (red: repair run with the output), after archiving, and the tests of all archived changes before the start and after every archive.
 - If the agent thinks an acceptance test is wrong, it stops with `BLOCKED.md`; you decide.

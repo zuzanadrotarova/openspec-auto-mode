@@ -505,3 +505,38 @@ schema and selected it in `openspec/config.yaml` (committed). Change `06-pad-tex
   2 minutes. `acceptance/06-pad-text/` unchanged.
 - Still open: whether a fresh `/opsx:propose` session respects the authorization in the artifact
   instruction or refuses because of the skill's planning boundary.
+
+## 10. Step 4 B - scenario coverage
+
+### 10.1 Decisions (2026-11-08)
+- Checked at the start, not at SUCCESS: since 3a/3c the acceptance tests exist before the start, so a
+  forgotten scenario is found before any paid run, and the check is about the reviewed tests, not
+  the agent's own tests.
+- Source of truth: the committed files under `acceptanceDir/<change>/` (not the table in
+  `acceptance.md`, which is the model's claim). Every `#### Scenario: <name>` of the change's spec
+  deltas, except under `## REMOVED Requirements`, must appear there as literal text.
+- Config `scenarioCoverage` (bool), default `true`, active only with `acceptanceMode: reviewed`.
+  Fix changes and `skip_specs` changes are not checked (no acceptance tests / no scenarios).
+- The acceptance artifact instruction and the skill now say that a test name must contain the exact
+  scenario name. Projects with the schema re-run `-SetupAcceptanceSchema` to get the new text.
+
+### 10.2 Benefits and risks
+- Benefit: free, deterministic, refuses before the agent starts, lists the missing scenarios.
+- Limits: existence, not quality (a name in a comment counts); case- and spelling-sensitive.
+  Existing projects with differently named tests are stopped at the start (exit 2, no cost, clear
+  message, `scenarioCoverage: false`).
+
+### 10.3 Tests (fake agent)
+| Test | Expected |
+|---|---|
+| T26 | spec with two scenarios, test names one: exit 2 naming the other, no agent run |
+| T27 | second scenario added to the test: change finishes |
+| T28 | scenario under REMOVED not required; `scenarioCoverage: false` accepts an unnamed test; non-boolean value refused |
+
+All 141 checks (T1-T28) green.
+
+### 10.4 Trial on a real project (2026-11-08, free)
+Demo project, throw-away branch from `auto/06-pad-text` with a change `07-repeat-text` (two
+scenarios, acceptance test naming one): `-DryRun` refused the start with
+`scenarios without an acceptance test: "Negative count is rejected"`; after adding the second test
+`-DryRun` planned the change, with the acceptance tests of 05 and 06 in the baseline. Branch deleted.

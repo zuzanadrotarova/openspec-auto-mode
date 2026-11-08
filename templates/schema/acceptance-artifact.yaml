@@ -21,7 +21,9 @@
       - Use a file name the project's normal test command does not pick up (with
         `node --test`: `*.accept.js`, not `*.test.js`), so the tests of a change that is not
         implemented yet do not make the normal tests red.
-      - One test per `#### Scenario:` of the spec deltas, named after the scenario, plus edge
+      - One test per `#### Scenario:` of the spec deltas whose name contains the exact
+        scenario name (e.g. `test('Scenario: <name>', ...)`; OpenSpec auto-mode refuses to
+        start a change whose scenario is not named in its acceptance tests), plus edge
         cases the scenario implies. Use more than one example per scenario, so that an
         implementation cannot be fitted to a single input.
       - Use the public API named in design.md (module path, function names, error types).

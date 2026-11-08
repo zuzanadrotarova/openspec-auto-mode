@@ -287,7 +287,7 @@ function Add-Acceptance([string]$P, [string[]]$Changes) {
     Push-Location $P
     foreach ($c in $Changes) {
         New-Item -ItemType Directory -Force "acceptance/$c" | Out-Null
-        Set-Content "acceptance/$c/check.cmd" "@if exist impl\$c.txt (echo ok $c) else (echo FAIL acceptance $c & exit /b 1)"
+        Set-Content "acceptance/$c/check.cmd" "@rem Scenario: Basic`n@if exist impl\$c.txt (echo ok $c) else (echo FAIL acceptance $c & exit /b 1)"
     }
     git add -A 2>&1 | Out-Null; git commit -q -m 'acceptance tests' 2>&1 | Out-Null
     Pop-Location
@@ -412,12 +412,47 @@ Push-Location $p; New-Change '01-a' 2; New-Change '02-b' 1; Pop-Location
 Write-AcceptanceMd $p '01-a'; Write-AcceptanceMd $p '02-b'
 Add-Acceptance $p @('01-a', '02-b')
 # 01-a ends NONCRITICAL (1 of 2 tasks), so its acceptance test must not depend on impl/01-a.txt
-Set-Content "$p/acceptance/01-a/check.cmd" '@echo ok 01-a'; Commit-All $p '01-a acceptance'
+Set-Content "$p/acceptance/01-a/check.cmd" "@rem Scenario: Basic`n@echo ok 01-a"; Commit-All $p '01-a acceptance'
 $r = Invoke-Runner $p '01-a=noncritical-red;fix-01-a=fixgreen;02-b=success'
 Check ($r.Code -eq 0 -and (Archived $p 'fix-01-a') -and (Archived $p '02-b')) 'fix-01-a and 02-b archived'
 $fixMeta = Get-ChildItem "$p/openspec/changes/archive/*-fix-01-a/.openspec.yaml" | Select-Object -First 1
 Check ($fixMeta -and ((Get-Content $fixMeta.FullName -Raw) -match 'schema: spec-driven\s')) 'fix change uses the built-in schema'
 Check ([System.IO.File]::ReadAllText((Join-Path $Tool 'worker-prompt.md')) -match 'openspec new change fix-<change> --schema spec-driven') 'worker prompt: fixes with --schema spec-driven'
+
+function Set-Spec([string]$P, [string]$C, [string]$Text) {
+    Set-Content "$P/openspec/changes/$C/specs/cap-$($C -replace '^\d+-', '')/spec.md" $Text
+}
+
+Write-Host "T26 scenario coverage: a scenario without an acceptance test refuses the start"
+$p = New-Project 't26' @('01-a:1') $AcceptConfig
+Set-Spec $p '01-a' "## ADDED Requirements`n### Requirement: A works`nThe system SHALL support A.`n#### Scenario: Basic`n- **WHEN** used`n- **THEN** it works`n#### Scenario: Empty input is rejected`n- **WHEN** empty`n- **THEN** error`n"
+Commit-All $p 'two scenarios'
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match '01-a: scenarios without an acceptance test: "Empty input is rejected"') 'uncovered scenario refused, named'
+Check ($r.Out -notmatch '"Basic"') 'covered scenario not reported'
+Check ((Count-Prompts $p '01-a') -eq 0) 'no agent run'
+
+Write-Host "T27 scenario coverage: all scenarios named -> the change runs"
+Add-Content "$p/acceptance/01-a/check.cmd" '@rem Scenario: Empty input is rejected'; Commit-All $p 'cover the second scenario'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'fully covered change finishes'
+
+Write-Host "T28 scenario coverage: REMOVED scenarios ignored, the check can be switched off"
+$p = New-Project 't28' @('01-a:1') $AcceptConfig
+Set-Spec $p '01-a' "## ADDED Requirements`n### Requirement: A works`nThe system SHALL support A.`n#### Scenario: Basic`n- **WHEN** used`n- **THEN** it works`n`n## REMOVED Requirements`n### Requirement: Old A`n**Reason**: replaced`n**Migration**: use A`n#### Scenario: Old behaviour`n- **WHEN** used`n- **THEN** old`n"
+Commit-All $p 'removed scenario'
+Add-Acceptance $p @('01-a')
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and $r.Out -notmatch 'scenarios without an acceptance test') 'scenario under REMOVED not required'
+$p = New-Project 't28b' @('01-a:1') ($AcceptConfig -replace ' }$', ', "scenarioCoverage": false }')
+Add-Acceptance $p @('01-a')
+Set-Content "$p/acceptance/01-a/check.cmd" '@if exist impl\01-a.txt (echo ok) else (exit /b 1)'; Commit-All $p 'unnamed test'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'scenarioCoverage false: unnamed test accepted'
+$p = New-Project 't28c' @('01-a:1') ($AcceptConfig -replace ' }$', ', "scenarioCoverage": "yes" }')
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'scenarioCoverage .* must be true or false') 'non-boolean scenarioCoverage refused'
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }

@@ -194,6 +194,29 @@ function Test-HasAcceptance([string]$Change) {
     (Invoke-Git @('ls-files', '--', "$($script:cfg.acceptanceDir)/$Change/")).Out -ne ''
 }
 
+# Scenario coverage (step 4 B): every scenario of the change's spec deltas (not under REMOVED)
+# must be named literally in one of its committed acceptance test files, e.g.
+# test('Scenario: <name>', ...). Checks that a test exists, not its quality.
+function Get-SpecScenarios([string]$Change) {
+    $specs = Join-Path $Project "openspec/changes/$Change/specs"
+    if (-not (Test-Path $specs)) { return @() }
+    $names = @()
+    foreach ($f in @(Get-ChildItem $specs -Recurse -File -Filter '*.md')) {
+        $removed = $false
+        foreach ($line in [System.IO.File]::ReadAllLines($f.FullName)) {
+            if ($line -match '^##\s+(\S+)') { $removed = ($Matches[1] -eq 'REMOVED') }
+            elseif (-not $removed -and $line -match '^####\s+Scenario:\s*(.+?)\s*$') { $names += $Matches[1] }
+        }
+    }
+    @($names | Select-Object -Unique)
+}
+
+function Get-UncoveredScenarios([string]$Change) {
+    $files = @(((Invoke-Git @('ls-files', '--', "$($script:cfg.acceptanceDir)/$Change/")).Out -split "`n") | Where-Object { $_.Trim() })
+    $text = (@($files | ForEach-Object { [System.IO.File]::ReadAllText((Join-Path $Project $_.Trim())) }) -join "`n")
+    @(Get-SpecScenarios $Change | Where-Object { -not $text.Contains($_) })
+}
+
 # Archived numbered changes with acceptance tests: they must stay green (regression).
 function Get-DoneAcceptance {
     $archive = Join-Path $Project 'openspec/changes/archive'
@@ -254,6 +277,7 @@ function Read-Config {
         acceptanceMode     = 'off'
         acceptanceCommand  = $null
         acceptanceDir      = 'acceptance'
+        scenarioCoverage   = $true
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -265,6 +289,7 @@ function Read-Config {
     if ($null -eq $cfg.maxGroupRepairs) { $cfg.maxGroupRepairs = 2 }
     if ($null -eq $cfg.acceptanceMode) { $cfg.acceptanceMode = 'off' }
     if ($null -eq $cfg.acceptanceDir) { $cfg.acceptanceDir = 'acceptance' }
+    if ($null -eq $cfg.scenarioCoverage) { $cfg.scenarioCoverage = $true }
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
@@ -616,6 +641,7 @@ if (-not $cfg) { $errors += "$ConfigRel missing (run with -Init)" }
 elseif (-not $cfg.testCommand) { $errors += "testCommand is not set in $ConfigRel" }
 elseif ($cfg.fixMode -notin @('immediate', 'stop')) { $errors += "fixMode in $ConfigRel must be 'immediate' or 'stop' (is '$($cfg.fixMode)')" }
 elseif ($cfg.acceptanceMode -notin @('off', 'reviewed')) { $errors += "acceptanceMode in $ConfigRel must be 'off' or 'reviewed' (is '$($cfg.acceptanceMode)')" }
+elseif ($cfg.scenarioCoverage -isnot [bool]) { $errors += "scenarioCoverage in $ConfigRel must be true or false (is '$($cfg.scenarioCoverage)')" }
 elseif ($cfg.acceptanceMode -ne 'off') {
     if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }
     if (-not $cfg.acceptanceDir -or [System.IO.Path]::IsPathRooted($cfg.acceptanceDir) -or $cfg.acceptanceDir -match '(^|/)\.\.?(/|$)' -or $cfg.acceptanceDir -match '[*?]') {
@@ -651,6 +677,12 @@ if ($errors.Count -eq 0) {
         }
         if ($cfg.acceptanceMode -eq 'reviewed' -and -not (Test-HasAcceptance $c.name)) {
             $errors += "change $($c.name) has no acceptance tests ($($cfg.acceptanceDir)/$($c.name)/ with committed files); write them before the start (acceptanceMode=reviewed)"
+        }
+        elseif ($cfg.acceptanceMode -eq 'reviewed' -and $cfg.scenarioCoverage) {
+            $uncovered = @(Get-UncoveredScenarios $c.name)
+            if ($uncovered.Count) {
+                $errors += "change $($c.name): scenarios without an acceptance test: $(($uncovered | ForEach-Object { '"' + $_ + '"' }) -join ', ') (name each scenario in a test under $($cfg.acceptanceDir)/$($c.name)/, e.g. 'Scenario: <name>', or set scenarioCoverage to false)"
+            }
         }
         if ($cfg.groupTesting) {
             # one run per open group plus the final run must fit into maxRunsPerChange

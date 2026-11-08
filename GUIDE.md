@@ -100,6 +100,7 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `acceptanceMode` | `reviewed` = every change needs acceptance tests, written with Claude and checked by you before the start (section 2); `off` = none | `off` |
 | `acceptanceCommand` | how to run the acceptance tests of one change, `{change}` stands for its name | - |
 | `acceptanceDir` | folder of the acceptance tests | `acceptance` |
+| `scenarioCoverage` | every scenario of a change must be named in one of its acceptance tests (e.g. `Scenario: Valid password`), checked before the start | `true` |
 
 ---
 
@@ -247,6 +248,7 @@ This is mostly for Claude, not for you.
 | `group N still red after M repair runs` (STOPPED) | the group broke the tests and the agent could not repair it; look at the named `.tests.txt`, fix interactively, commit, run again |
 | `has N open task groups; … needs at least N+1 runs` | raise `maxRunsPerChange`, merge small groups, or set `groupTesting` to `false` |
 | `has no acceptance tests (acceptance/NN-x/ ...)` | write and commit the acceptance tests of that change (`/openspec-auto acceptance NN-x`), or set `acceptanceMode` to `off` |
+| `NN-x: scenarios without an acceptance test: "..."` | add a test for each named scenario (its name must contain the scenario name), review and commit it; or set `scenarioCoverage` to `false` |
 | `acceptanceCommand ... must contain {change}` / `acceptanceMode ... must be 'off' or 'reviewed'` | fix the value in `openspec/auto-mode.json` |
 | `baseline tests fail: red (acceptance NN-x exit N)` | an archived change no longer passes its acceptance tests; fix it interactively first. If the tests of a change not yet implemented fail inside `testCommand`, it picks up acceptance tests: rename them (`*.accept.js`) or narrow `testCommand` |
 | `agent changed frozen acceptance tests: ...` (FAILED-CHECK) | the agent changed an acceptance test; look at the commit (`git log -p -- acceptance/`), revert it, run again |
