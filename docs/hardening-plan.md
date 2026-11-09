@@ -521,6 +521,12 @@ where tests go.
   before freezing; the user accepted them.
 - After the commit `-DryRun` planned `07-repeat-text` with the acceptance tests of 05 and 06 in the
   baseline; scenario coverage (step 4 B) passed. Cost: one interactive session, no runner run.
+- Runner run: SUCCESS, 2 runs (group 1 green, final), USD 0.34, under a minute, branch
+  `auto/07-repeat-text`. Tests 36/36, acceptance tests of 07 7/7, of 05 and 06 still green;
+  `acceptance/` unchanged. The agent changed only `src/text.js` (`repeatText`), added
+  `tests/repeat-text.test.js` and archived the change. First change that went the whole way:
+  fresh propose session -> user-reviewed frozen tests -> runner.
+- The demo `main` was fast-forwarded to `auto/07-repeat-text` (changes 01-07) with the user's ok.
 
 ## 10. Step 4 B - scenario coverage
 
