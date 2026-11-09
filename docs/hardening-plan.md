@@ -528,6 +528,31 @@ where tests go.
   fresh propose session -> user-reviewed frozen tests -> runner.
 - The demo `main` was fast-forwarded to `auto/07-repeat-text` (changes 01-07) with the user's ok.
 
+### 9.8 Repair run with a real agent (2026-11-09)
+A real agent runs the tests itself before it commits, so red tests at a group end do not happen
+by themselves on the demo; the repair run (step 2) had only been exercised by the fake agent
+(T13, T14). The trial therefore injected a fault.
+- Setup: branch `auto/08-prep` from the demo `main`, change `08-word-helpers` (two groups:
+  `initials`, `reverseWords`, code + tests each; 9 frozen acceptance tests, red on the current
+  code, green on a throw-away implementation). A one-shot `post-commit` hook in the demo's
+  `.git/hooks/` (not versioned, tested on a throw-away clone first): on the first commit whose
+  message starts with `08-word-helpers` it deleted its marker, changed `toUpperCase` to
+  `toLowerCase` in `capitalize` and committed that as `fault injection: break capitalize`.
+- Run: SUCCESS, 4 runs as planned, USD 0.54, under 2 minutes.
+  1. group 1: the agent committed `initials`, the hook broke `capitalize`; runner tests red.
+  2. repair run: the prompt named the group, the scope (`tasks.md`, `src/text.js`,
+     `tests/initials.test.js`) and the last 40 lines of the failing `capitalize`/`titleCase` tests.
+     The agent changed the one line back (`fix capitalize to upper-case first character`),
+     ticked nothing, did not touch tests; runner tests green.
+  3. group 2 green (+ acceptance), 4. final run, archive, tests green.
+- Report: `groups: 1 red->green (1 repair), 2 green`. `acceptance/` unchanged. The hook was
+  removed after the run (only the runner's `pre-push` hook is left).
+- Still not exercised by a real agent: NONCRITICAL + immediate fix (needs the agent's own
+  classification, cannot be provoked fairly).
+- Gap found while planning: acceptance tests of archived changes run at the start and after the
+  archive, not at group ends. A change that breaks them ends in FAILED-CHECK instead of a repair
+  run. Possible small follow-up.
+
 ## 10. Step 4 B - scenario coverage
 
 ### 10.1 Decisions (2026-11-08)
