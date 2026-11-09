@@ -504,7 +504,23 @@ schema and selected it in `openspec/config.yaml` (committed). Change `06-pad-tex
 - Run: SUCCESS, 3 runs (group 1, group 2 + acceptance, final), all tests green, USD 0.47, about
   2 minutes. `acceptance/06-pad-text/` unchanged.
 - Still open: whether a fresh `/opsx:propose` session respects the authorization in the artifact
-  instruction or refuses because of the skill's planning boundary.
+  instruction or refuses because of the skill's planning boundary. Answered in 9.7.
+
+### 9.7 Fresh `/opsx:propose` session (2026-11-09)
+Demo project, branch `auto/07-prep` from `auto/06-pad-text`. The user started a new Claude Code
+session and typed `/opsx:propose 07-repeat-text: ...` with a neutral description that did not say
+where tests go.
+- Result: the session wrote `acceptance/07-repeat-text/repeat-text.accept.js` outside `openspec/`
+  without asking. Nothing else in the project changed (`git diff` empty, `src/` and `tests/`
+  untouched). All 5 artifacts done, schema `spec-driven-acceptance`, `openspec validate --strict`
+  passed. The planning-boundary risk of 9.3 did not happen.
+- Tests: 6 scenario tests, each named `Scenario: <exact name>`, plus 1 extra test; red for the
+  missing function, green on a throw-away implementation the session wrote in its scratchpad.
+  `npm test` stayed green (30/30) because of the `*.accept.js` name. The session listed its own
+  choices for the open parts of the description (error types, input checks) for the user to confirm
+  before freezing; the user accepted them.
+- After the commit `-DryRun` planned `07-repeat-text` with the acceptance tests of 05 and 06 in the
+  baseline; scenario coverage (step 4 B) passed. Cost: one interactive session, no runner run.
 
 ## 10. Step 4 B - scenario coverage
 
