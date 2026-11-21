@@ -1,6 +1,6 @@
 # Push notifications from the runner: spec
 
-Status: spec agreed (section 11); steps 1-3 done on branch `notify` (runner + tests, `-Title` in send-notify.ps1 with a real message received, docs + skill).
+Status: done. Steps 1-3 implemented, step 4 tried on a real project (section 13); merged into `main`.
 Date: 2026-11-21
 
 ## 1. Goal
@@ -140,3 +140,10 @@ given by an environment variable. New cases:
 2. `send-notify.ps1`: optional `-Title` (section 7), then one real test message.
 3. Docs and skill (section 9).
 4. Trial on a real project with a short run of two changes.
+
+## 13. Trial on a real project (2026-11-21)
+
+- Project: a mobile app (details outside this repo), run started with the skill after `install.ps1`.
+- Notifications arrived on the phone during the run, with the project name in the title.
+- The run finished; the only problem reported was the PC running out of memory (not the runner or
+  the notifications).
