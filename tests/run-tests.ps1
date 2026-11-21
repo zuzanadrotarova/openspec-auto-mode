@@ -454,6 +454,65 @@ $p = New-Project 't28c' @('01-a:1') ($AcceptConfig -replace ' }$', ', "scenarioC
 $r = Invoke-Runner $p '01-a=group'
 Check ($r.Code -eq 2 -and $r.Out -match 'scenarioCoverage .* must be true or false') 'non-boolean scenarioCoverage refused'
 
+Write-Host "T29 push notifications"
+$NotifyFake = (Join-Path $PSScriptRoot 'fake-notify.ps1').Replace('\', '\\')
+$NotifyFakeNoTitle = (Join-Path $PSScriptRoot 'fake-notify-notitle.ps1').Replace('\', '\\')
+function Notify-Config([string]$Extra) { $DefaultConfig -replace ' }$', ", $Extra }" }
+function Invoke-NotifyRunner([string]$P, [string]$Plan, [string]$Mode = 'ok') {
+    $log = Join-Path $WorkDir ((Split-Path -Leaf $P) + '.notify.txt')
+    Remove-Item $log -ErrorAction SilentlyContinue
+    $env:FAKE_NOTIFY_LOG = $log; $env:FAKE_NOTIFY_MODE = $Mode
+    $r = Invoke-Runner $P $Plan
+    Remove-Item Env:FAKE_NOTIFY_MODE -ErrorAction SilentlyContinue
+    $lines = @()
+    if (Test-Path $log) { $lines = @([System.IO.File]::ReadAllLines($log, [System.Text.Encoding]::UTF8) | Where-Object { $_ }) }
+    [pscustomobject]@{ Code = $r.Code; Out = $r.Out; Lines = $lines }
+}
+$p = New-Project 't29' @('01-a:1', '02-b:1')
+$r = Invoke-NotifyRunner $p '01-a=success;02-b=success'
+Check ($r.Code -eq 0 -and $r.Lines.Count -eq 0) 'notifyScript not set: no notification'
+$p = New-Project 't29b' @('01-a:1', '02-b:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$r = Invoke-NotifyRunner $p '01-a=success;02-b=success'
+Check ($r.Code -eq 0 -and $r.Lines.Count -eq 4) "start, 2 changes, finish = 4 notifications (got $($r.Lines.Count))"
+Check (@($r.Lines | Where-Object { $_ -notlike 't29b|*' }).Count -eq 0) 'every title is the project folder name'
+Check ($r.Lines[0] -match '^t29b\|0\|.* started: 2 changes, first 01-a$') 'E1 start message'
+Check ($r.Lines[1] -match '^t29b\|0\|.* 01-a done \(1/2\) .* 1 run .* USD .* min$') 'E2 01-a done (1/2)'
+Check ($r.Lines[2] -match '^t29b\|0\|.* 02-b done \(2/2\)') 'E2 02-b done (2/2)'
+Check ($r.Lines[3] -match '^t29b\|1\|.* finished: 2/2 done .*auto-mode-report\.md$') 'E5 finished with priority 1'
+Check ($r.Lines[1].Contains([char]::ConvertFromUtf32(0x2705))) 'emoji arrives intact'
+$p = New-Project 't29c' @('01-a:1', '02-b:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`", `"notifyStopPriority`": 2")
+$r = Invoke-NotifyRunner $p '01-a=blocked;02-b=success'
+Check ($r.Code -eq 1 -and $r.Lines.Count -eq 2) "blocked: start + stop = 2 notifications (got $($r.Lines.Count))"
+Check ($r.Lines[1] -match '^t29c\|2\|.* stopped at 01-a: change 01-a is blocked') 'E6 stop names the change and uses notifyStopPriority'
+$p = New-Project 't29d' @('01-a:2', '02-b:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$r = Invoke-NotifyRunner $p '01-a=noncritical-red;fix-01-a=fixgreen;02-b=success'
+Check ($r.Code -eq 0 -and $r.Lines.Count -eq 5) "noncritical + fix: 5 notifications (got $($r.Lines.Count))"
+Check ($r.Lines[1] -match '01-a done with a noncritical issue \(1/2\); fix-01-a next') 'E3 noncritical, fix next'
+Check ($r.Lines[2] -match 'fix-01-a fixed 01-a') 'E4 fix done'
+Check ($r.Lines[3] -match '02-b done \(2/2\)') 'count ignores the fix change'
+$p = New-Project 't29e' @('01-a:1') (Notify-Config "`"notifyScript`": `"$NotifyFakeNoTitle`"")
+$r = Invoke-NotifyRunner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Lines.Count -eq 3 -and $r.Lines[1] -match '^-\|0\|\[t29e\] .* 01-a done') 'script without -Title: project name prefixes the message'
+$p = New-Project 't29f' @('01-a:1', '02-b:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`", `"notifyProjectName`": `"My App`"")
+$r = Invoke-NotifyRunner $p '01-a=success;02-b=success'
+Check ($r.Code -eq 0 -and @($r.Lines | Where-Object { $_ -like 'My App|*' }).Count -eq 4) 'notifyProjectName used as the title'
+$p = New-Project 't29g' @('01-a:1', '02-b:1', '03-c:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$r = Invoke-NotifyRunner $p '01-a=success;02-b=success;03-c=success' 'fail'
+Check ($r.Code -eq 0 -and (Archived $p '03-c')) 'failing notify script does not stop the run'
+Check ($r.Lines.Count -eq 3) "3 failures in a row, then no more attempts (got $($r.Lines.Count))"
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($rep -match 'notification failed \(exit 1' -and $rep -match 'notifications off for the rest of this run') 'failures listed in the report warnings'
+$p = New-Project 't29h' @('01-a:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`", `"notifyTimeoutSeconds`": 3")
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-NotifyRunner $p '01-a=success' 'sleep'
+$sw.Stop()
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'hanging notify script does not stop the run'
+Check ($sw.Elapsed.TotalSeconds -lt 60 -and (Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md") -match 'notification failed \(timeout after 3 s\)') "hanging notify script killed after the timeout ($([int]$sw.Elapsed.TotalSeconds) s)"
+$p = New-Project 't29i' @('01-a:1') (Notify-Config '"notifyScript": "missing\\notify.ps1"')
+$r = Invoke-NotifyRunner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'notifyScript .* not found' -and $r.Lines.Count -eq 0) 'missing notifyScript refused at the start'
+Remove-Item Env:FAKE_NOTIFY_LOG -ErrorAction SilentlyContinue
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

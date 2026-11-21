@@ -278,6 +278,10 @@ function Read-Config {
         acceptanceCommand  = $null
         acceptanceDir      = 'acceptance'
         scenarioCoverage   = $true
+        notifyScript       = $null
+        notifyProjectName  = $null
+        notifyStopPriority = 1
+        notifyTimeoutSeconds = 30
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -290,6 +294,9 @@ function Read-Config {
     if ($null -eq $cfg.acceptanceMode) { $cfg.acceptanceMode = 'off' }
     if ($null -eq $cfg.acceptanceDir) { $cfg.acceptanceDir = 'acceptance' }
     if ($null -eq $cfg.scenarioCoverage) { $cfg.scenarioCoverage = $true }
+    if ($null -eq $cfg.notifyStopPriority) { $cfg.notifyStopPriority = 1 }
+    if ($null -eq $cfg.notifyTimeoutSeconds) { $cfg.notifyTimeoutSeconds = 30 }
+    if (-not $cfg.notifyProjectName) { $cfg.notifyProjectName = Split-Path -Leaf $Project }
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
@@ -472,6 +479,60 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
     }
 }
 
+# Push notifications (docs/notify-plan.md): the runner calls the user's notifyScript in a separate
+# process. Values go through environment variables (no quoting problems); the Pushover keys stay
+# in that script. A failure is only a warning; after 3 failures in a row notifications are off.
+$script:NotifyPath = $null
+$script:NotifyFailures = 0
+function Send-Notify([string]$Message, [int]$Priority) {
+    if (-not $script:NotifyPath) { return }
+    $child = @'
+$ErrorActionPreference = 'Stop'
+$s = $env:OSA_NOTIFY_SCRIPT
+$a = @{ Message = $env:OSA_NOTIFY_MESSAGE; Priority = [int]$env:OSA_NOTIFY_PRIORITY }
+if ((Get-Command $s).Parameters.ContainsKey('Title')) { $a.Title = $env:OSA_NOTIFY_TITLE }
+else { $a.Message = "[$($env:OSA_NOTIFY_TITLE)] " + $a.Message }
+$global:LASTEXITCODE = 0
+& $s @a
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
+exit 0
+'@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+    $exe = 'powershell'
+    if (-not $IsWin) { $exe = 'pwsh' }
+    $env:OSA_NOTIFY_SCRIPT = $script:NotifyPath
+    $env:OSA_NOTIFY_MESSAGE = $Message
+    $env:OSA_NOTIFY_PRIORITY = [string]$Priority
+    $env:OSA_NOTIFY_TITLE = [string]$script:cfg.notifyProjectName
+    $problem = $null
+    try {
+        $p = Invoke-Process "$exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded" ([double]$script:cfg.notifyTimeoutSeconds / 60) ''
+        if ($p.TimedOut) { $problem = "timeout after $($script:cfg.notifyTimeoutSeconds) s" }
+        elseif ($p.ExitCode -ne 0) {
+            $why = (([string]$p.Stderr + ' ' + [string]$p.Stdout) -replace '\s+', ' ').Trim()
+            if ($why.Length -gt 200) { $why = $why.Substring(0, 200) }
+            $problem = "exit $($p.ExitCode) $why".Trim()
+        }
+    } catch { $problem = $_.Exception.Message }
+    finally {
+        foreach ($n in 'SCRIPT', 'MESSAGE', 'PRIORITY', 'TITLE') { Remove-Item "Env:OSA_NOTIFY_$n" -ErrorAction SilentlyContinue }
+    }
+    if (-not $problem) { $script:NotifyFailures = 0; return }
+    $script:NotifyFailures++
+    $w = "notification failed ($problem)"
+    if ($script:NotifyFailures -ge 3) { $script:NotifyPath = $null; $w += '; 3 failures in a row, notifications off for the rest of this run' }
+    $script:warnings += $w
+    Write-Warn $w
+}
+
+function Get-Emoji([int]$CodePoint) { [char]::ConvertFromUtf32($CodePoint) }
+function Format-Minutes([double]$Minutes) {
+    $m = [int][math]::Round($Minutes)
+    if ($m -lt 60) { return "$m min" }
+    "$([math]::Floor($m / 60)) h $($m % 60) min"
+}
+function Format-Usd([double]$Value) { $Value.ToString('0.00', [System.Globalization.CultureInfo]::InvariantCulture) + ' USD' }
+
 function Get-RelPath([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)
     $root = $Project.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
@@ -648,6 +709,15 @@ elseif ($cfg.acceptanceMode -ne 'off') {
         $errors += "acceptanceDir in $ConfigRel must be a plain relative folder inside the project (is '$($cfg.acceptanceDir)')"
     }
 }
+$NotifyCandidate = $null
+if ($cfg -and $cfg.notifyScript) {
+    $np = [string]$cfg.notifyScript
+    if (-not [System.IO.Path]::IsPathRooted($np)) { $np = Join-Path $Project $np }
+    if (-not (Test-Path -LiteralPath $np -PathType Leaf)) { $errors += "notifyScript in $ConfigRel not found: $np" }
+    else { $NotifyCandidate = (Resolve-Path -LiteralPath $np).Path }
+    if ("$($cfg.notifyStopPriority)" -notmatch '^-?[0-2]$') { $errors += "notifyStopPriority in $ConfigRel must be -2..2 (is '$($cfg.notifyStopPriority)')" }
+    if ("$($cfg.notifyTimeoutSeconds)" -notmatch '^\d+$' -or [int]$cfg.notifyTimeoutSeconds -lt 1) { $errors += "notifyTimeoutSeconds in $ConfigRel must be a positive whole number (is '$($cfg.notifyTimeoutSeconds)')" }
+}
 $baseBranch = Get-CurrentBranch
 if (-not $baseBranch) { $errors += 'HEAD is detached; check out a branch first' }
 if ((Invoke-Git @('config', 'user.email')).Out -eq '') { $errors += 'git user.email is not set' }
@@ -731,6 +801,7 @@ if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered 
 
 $planNames = @(@($resumeFix) + @($numbered | ForEach-Object { $_.name }) | Where-Object { $_ })
 Write-Ok ("plan: " + ($planNames -join ' -> '))
+if ($NotifyCandidate) { Write-Ok "notifications: $NotifyCandidate (project name '$($cfg.notifyProjectName)')" }
 if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -754,6 +825,10 @@ $results = @()
 $branches = @()
 $stopReason = $null
 
+$script:NotifyPath = $NotifyCandidate
+$planCount = @($numbered).Count
+Send-Notify ("{0} auto-mode started: {1} change{2}, first {3}" -f (Get-Emoji 0x25B6), $planNames.Count, $(if ($planNames.Count -ne 1) { 's' }), $planNames[0]) 0
+
 function New-QueueItem([string]$Name, [bool]$IsFix, [string]$Parent, [string]$Branch, [int]$MaxRuns, [string]$Evidence, [string]$EvidenceLabel) {
     [pscustomobject]@{
         Name = $Name; IsFix = $IsFix; Parent = $Parent; Branch = $Branch; MaxRuns = $MaxRuns
@@ -775,6 +850,7 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
     $item = $queue[$qi]
     $change = $item.Name
     $branch = $item.Branch
+    $changeStart = Get-Date
     Write-Step "$(if ($item.IsFix) { 'Fix' } else { 'Change' }) $change"
 
     # 1. branch (kap. 5 bod 1, kap. 5.2); a fix runs on the branch of the change it fixes
@@ -1050,6 +1126,20 @@ Do the completion check and archive (SUCCESS).
         }
     }
     $results += [pscustomobject]@{ Change = $change; Outcome = $outcome; Runs = [math]::Min($run, $item.MaxRuns); Branch = $branch; Cost = $cost; Tests = $testsLabel; Notes = ($notes -join '; ') }
+    if ($outcome -in @('SUCCESS', 'NONCRITICAL')) {
+        $doneCount = @($results | Where-Object { $_.Outcome -in @('SUCCESS', 'NONCRITICAL') -and $_.Change -notlike 'fix-*' }).Count
+        $runCount = [math]::Min($run, $item.MaxRuns)
+        $facts = "{0} run{1} $([char]0x00B7) {2} $([char]0x00B7) {3}" -f $runCount, $(if ($runCount -ne 1) { 's' }), (Format-Usd $cost), (Format-Minutes ((Get-Date) - $changeStart).TotalMinutes)
+        if ($item.IsFix) {
+            Send-Notify ("{0} {1} fixed {2} $([char]0x00B7) {3}" -f (Get-Emoji 0x2705), $change, $item.Parent, $facts) 0
+        } elseif ($outcome -eq 'SUCCESS') {
+            Send-Notify ("{0} {1} done ({2}/{3}) $([char]0x00B7) {4}" -f (Get-Emoji 0x2705), $change, $doneCount, $planCount, $facts) 0
+        } else {
+            $fixName = "fix-$change"
+            $fixNext = ($qi + 1 -lt $queue.Count) -and ($queue[$qi + 1].Name -eq $fixName)
+            Send-Notify ("{0} {1} done with a noncritical issue ({2}/{3}); {4} {5} $([char]0x00B7) {6}" -f (Get-Emoji 0x26A0), $change, $doneCount, $planCount, $fixName, $(if ($fixNext) { 'next' } else { 'waits for you' }), $facts) 0
+        }
+    }
     if ($stopReason -or ($outcome -notin @('SUCCESS', 'NONCRITICAL'))) { break }
 }
 
@@ -1059,6 +1149,19 @@ $endTime = Get-Date
 $processed = @($results | ForEach-Object { $_.Change })
 $notReached = @($numbered | Where-Object { $processed -notcontains $_.name } | ForEach-Object { $_.name })
 $fixes = @(Get-ActiveChanges | Where-Object { $_.name -like 'fix-*' } | ForEach-Object { $_.name })
+
+# last message of the run (sent before the report is written, so a failed send is in its warnings)
+$totalCost = [double](@($results | ForEach-Object { [double]$_.Cost }) | Measure-Object -Sum).Sum
+$runFacts = "{0} $([char]0x00B7) {1}" -f (Format-Usd $totalCost), (Format-Minutes ($endTime - $startTime).TotalMinutes)
+$reportHint = "report: $StateDirName/auto-mode-report.md"
+if ($stopReason) {
+    $why = ($stopReason -replace '\s+', ' ').Trim()
+    if ($why.Length -gt 200) { $why = $why.Substring(0, 197) + '...' }
+    Send-Notify ("{0} auto-mode stopped at {1}: {2} $([char]0x00B7) {3}; {4}" -f (Get-Emoji 0x1F6D1), $change, $why, $runFacts, $reportHint) ([int]$cfg.notifyStopPriority)
+} else {
+    $doneCount = @($results | Where-Object { $_.Outcome -in @('SUCCESS', 'NONCRITICAL') -and $_.Change -notlike 'fix-*' }).Count
+    Send-Notify ("{0} auto-mode finished: {1}/{2} done $([char]0x00B7) {3}; {4}" -f (Get-Emoji 0x1F3C1), $doneCount, $planCount, $runFacts, $reportHint) 1
+}
 
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('# OpenSpec auto-mode report')
@@ -1121,6 +1224,14 @@ Write-Host $report
 if ($stopReason) { exit 1 }
 exit 0
 
+} catch {
+    # an unexpected error after the start message: tell the user it is not running any more
+    if ($script:NotifyPath) {
+        $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        if ($why.Length -gt 200) { $why = $why.Substring(0, 197) + '...' }
+        try { Send-Notify ("{0} auto-mode crashed: {1}" -f (Get-Emoji 0x1F4A5), $why) ([int]$cfg.notifyStopPriority) } catch { }
+    }
+    throw
 } finally {
     Remove-Item Env:OPENSPEC_AUTO_MODE -ErrorAction SilentlyContinue
     Pop-Location

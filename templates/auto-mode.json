@@ -19,5 +19,6 @@
   "maxGroupRepairs": 2,
   "acceptanceMode": "off",
   "acceptanceCommand": null,
-  "acceptanceDir": "acceptance"
+  "acceptanceDir": "acceptance",
+  "notifyScript": null
 }

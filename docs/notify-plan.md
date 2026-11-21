@@ -1,6 +1,6 @@
 # Push notifications from the runner: spec
 
-Status: spec agreed (open questions decided, section 11), nothing implemented.
+Status: spec agreed (section 11); step 1 (runner + tests) implemented on branch `notify`.
 Date: 2026-11-21
 
 ## 1. Goal
@@ -27,6 +27,7 @@ different projects.
 | `notifyScript` | `null` | Path to a PowerShell script taking `-Message <string>` and `-Priority <int>` (optional `-Title <string>`). `null` = notifications off. |
 | `notifyProjectName` | `null` | Name shown in notifications. `null` = name of the project folder (`Split-Path -Leaf $Project`). |
 | `notifyStopPriority` | `1` | Pushover priority for a stop/crash (`1` = high, `2` = emergency, repeats until acknowledged). |
+| `notifyTimeoutSeconds` | `30` | How long one send may take before the script is killed. |
 
 Template `templates/auto-mode.json` gets `"notifyScript": null`. A relative path is resolved against
 the project root. The start check (and `-DryRun`) fails with exit 2 if `notifyScript` is set but the
@@ -68,11 +69,12 @@ Notes:
 ## 6. Delivery and failure handling
 
 - New helper `Send-Notify([string]$Message, [int]$Priority)` in the helpers section.
-- The script is started as a child process (`powershell -NoProfile -ExecutionPolicy Bypass -File
-  <script> -Message … -Priority … [-Title …]`) through the existing `Invoke-Process`, timeout
-  ~0.5 min. A separate process means the script cannot change runner state (variables,
+- The script is started as a child process (`powershell -NoProfile -ExecutionPolicy Bypass
+  -EncodedCommand …`) through the existing `Invoke-Process`, timeout `notifyTimeoutSeconds`.
+  A separate process means the script cannot change runner state (variables,
   `$ErrorActionPreference`, current directory), and a hanging network call is killed.
-- Arguments are passed with `ConvertTo-CmdArg` (diacritics, quotes, `|` in change names).
+- Message, priority, title and script path are passed through environment variables
+  (`OSA_NOTIFY_*`), never on a command line, so quotes, `%`, `|` and diacritics cannot break it.
 - Non-zero exit, timeout or exception → `$warnings += "notification failed: …"`, the run continues.
   After 3 failures in a row the runner stops trying for the rest of the run (one warning about it),
   so a dead network does not add 30 s to every change.
@@ -88,6 +90,10 @@ Add an optional parameter, backward compatible:
 
 and use `$Title` instead of the fixed `"Claude caka"` when encoding the title. Existing calls
 without `-Title` behave exactly as now.
+
+Also: the script prints `CHYBA` but exits 0 when the Pushover request fails (it exits 1 only for
+missing keys). Add `exit 1` at the end of its `catch` block, otherwise the runner cannot see a
+failed send.
 
 ## 8. Tests (`tests/run-tests.ps1`)
 
