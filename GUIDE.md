@@ -101,6 +101,10 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `acceptanceCommand` | how to run the acceptance tests of one change, `{change}` stands for its name | - |
 | `acceptanceDir` | folder of the acceptance tests | `acceptance` |
 | `scenarioCoverage` | every scenario of a change must be named in one of its acceptance tests (e.g. `Scenario: Valid password`), checked before the start | `true` |
+| `notifyScript` | your script that sends a notification to your phone (section 3) | off |
+| `notifyProjectName` | project name shown in the notifications | project folder name |
+| `notifyStopPriority` | priority of the "stopped" message (Pushover: `2` repeats until you confirm it) | 1 |
+| `notifyTimeoutSeconds` | how long one notification may take | 30 |
 
 ---
 
@@ -152,6 +156,8 @@ Claude verifies that everything is ready: clean git, numbered changes, each with
 Auto-mode runs in the background, possibly for hours. Claude tells you the order of the changes and sends a summary at the end. Meanwhile:
 - do not touch the project (no file edits, no branch switching),
 - ask about progress any time ("how is it going?").
+
+**Notifications on your phone (optional):** tell Claude "turn on notifications in auto-mode" and give it the path of your notify script (e.g. a Pushover script, `C:\claude-notifier\send-notify.ps1`). You then get a message when auto-mode starts, after every finished change (`✅ 01-login done (1/3) · 2 runs · 0.40 USD · 12 min`) and at the end (`🏁 finished` or `🛑 stopped at …`). The title is the project name, so you can tell several projects running at once apart. As long as no end message came, it is still working. If a notification cannot be sent, auto-mode carries on and lists it under Warnings in the report. The script must accept `-Message` and `-Priority`, ideally `-Title`, and end with an error code when sending failed.
 
 ---
 
@@ -250,6 +256,8 @@ This is mostly for Claude, not for you.
 | `has no acceptance tests (acceptance/NN-x/ ...)` | write and commit the acceptance tests of that change (`/openspec-auto acceptance NN-x`), or set `acceptanceMode` to `off` |
 | `NN-x: scenarios without an acceptance test: "..."` | add a test for each named scenario (its name must contain the scenario name), review and commit it; or set `scenarioCoverage` to `false` |
 | `acceptanceCommand ... must contain {change}` / `acceptanceMode ... must be 'off' or 'reviewed'` | fix the value in `openspec/auto-mode.json` |
+| `notifyScript in openspec/auto-mode.json not found: ...` | fix the path, or set `notifyScript` to `null` |
+| `notification failed (...)` (Warnings in the report) | the run was not affected; check the notify script by hand (e.g. its keys) |
 | `baseline tests fail: red (acceptance NN-x exit N)` | an archived change no longer passes its acceptance tests; fix it interactively first. If the tests of a change not yet implemented fail inside `testCommand`, it picks up acceptance tests: rename them (`*.accept.js`) or narrow `testCommand` |
 | `agent changed frozen acceptance tests: ...` (FAILED-CHECK) | the agent changed an acceptance test; look at the commit (`git log -p -- acceptance/`), revert it, run again |
 

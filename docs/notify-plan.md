@@ -1,6 +1,6 @@
 # Push notifications from the runner: spec
 
-Status: spec agreed (section 11); step 1 (runner + tests) implemented on branch `notify`.
+Status: spec agreed (section 11); steps 1-3 done on branch `notify` (runner + tests, `-Title` in send-notify.ps1 with a real message received, docs + skill).
 Date: 2026-11-21
 
 ## 1. Goal

@@ -45,9 +45,10 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
    - If the project has no tests or no code yet, say so and ask what the test command will be.
    - A script in the project root needs an explicit path (`.\test.cmd`); the tests must pass and must not leave untracked files (add test outputs such as coverage to `.gitignore`).
 5. Offer acceptance tests (recommended when the project has tests): set `acceptanceMode: "reviewed"`, `acceptanceCommand` (e.g. `node --test "acceptance/{change}/*.accept.js"`) and `acceptanceDir`, then run the runner with `-SetupAcceptanceSchema`. It adds an `acceptance` artifact to the project's OpenSpec workflow (proposal, specs, design, **acceptance**, tasks), so `/opsx:propose` writes the acceptance tests with the user as part of every change. Say that this uses OpenSpec's custom schemas, which are experimental; after an OpenSpec update, run `-SetupAcceptanceSchema` again.
-6. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
-7. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
-8. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
+6. Offer push notifications: ask whether the user wants a message on the phone when a change is done and when the run ends, and which notify script to use (a PowerShell script taking `-Message`, `-Priority` and optionally `-Title`, e.g. `C:\claude-notifier\send-notify.ps1`; check that the file exists, never read or print its keys or `.env`). Set `notifyScript` to its absolute path; set `notifyProjectName` only if the folder name is not a good name. Without an answer leave `notifyScript` at `null`.
+7. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
+8. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
+9. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
 
 ## check – readiness
 
@@ -71,7 +72,7 @@ Used when `openspec/auto-mode.json` has `acceptanceMode: "reviewed"`, or when th
 
 1. Run `check` first. If it fails, stop and explain, do not start.
 2. Start the runner **without** `-DryRun` with the PowerShell tool and `run_in_background: true`. It can run for hours. Do not wait for it in the foreground and do not poll; you are notified when it finishes.
-3. Tell the user it is running: the plan (changes in order), that every change, and every batch of tasks within a large change, runs in a new process with an empty context, and that they will get a summary at the end.
+3. Tell the user it is running: the plan (changes in order), that every change, and every batch of tasks within a large change, runs in a new process with an empty context, and that they will get a summary at the end (and, if `notifyScript` is set, phone notifications after every change and at the end).
 4. While it runs, do not touch the project: no file edits, no git commands that change the working tree or branches, no OpenSpec commands that write. If the user asks for progress, read only the console output of the background task.
 5. When it finishes, continue with `report`.
 

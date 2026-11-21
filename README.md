@@ -99,6 +99,10 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `acceptanceCommand` | runs the acceptance tests of one change; `{change}` is replaced by its name, e.g. `node --test "acceptance/{change}/*.accept.js"` | - |
 | `acceptanceDir` | folder of the acceptance tests (frozen for the agent) | `acceptance` |
 | `scenarioCoverage` | with `acceptanceMode: reviewed`: every `#### Scenario:` of a change's spec deltas (not under REMOVED) must be named literally in its acceptance test files, otherwise the start is refused | `true` |
+| `notifyScript` | PowerShell script that sends a push notification (see Notifications below); the start is refused if it does not exist | off |
+| `notifyProjectName` | project name in the notifications | project folder name |
+| `notifyStopPriority` | priority of the stop/crash message (Pushover: `1` high, `2` repeats until acknowledged) | 1 |
+| `notifyTimeoutSeconds` | time limit of one notification | 30 |
 
 Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
 
@@ -133,6 +137,25 @@ Two ways to write them:
 - If the agent thinks an acceptance test is wrong, it stops with `BLOCKED.md`; you decide.
 - `testCommand` must not pick them up, otherwise the tests of changes not yet implemented make the start red. With `node --test`, which finds `**/*.test.js`, name them `*.accept.js`. Run them directly (`node --test ...`), not through a `package.json` script: the agent can edit `package.json`, but not `openspec/auto-mode.json`.
 - What they cannot prevent: an implementation fitted to the test inputs, or changes to helper files the tests import from outside `acceptance/`. Keep acceptance tests self-contained and use more than one example per scenario.
+
+### Notifications (optional, `notifyScript`)
+
+The script can tell your phone how the run goes, so you do not have to watch `openspec/changes/`. Set `notifyScript` to a PowerShell script of your own that sends the message (Pushover, Telegram, e-mail…). The script calls it:
+
+| When | Message (example) | Priority |
+|---|---|---|
+| start | `▶ auto-mode started: 3 changes, first 01-login` | 0 |
+| change done (archived, script's tests green) | `✅ 01-login done (1/3) · 2 runs · 0.40 USD · 12 min` | 0 |
+| change NONCRITICAL | `⚠ 02-export done with a noncritical issue (2/3); fix-02-export next` | 0 |
+| fix change done | `✅ fix-02-export fixed 02-export · …` | 0 |
+| run finished | `🏁 auto-mode finished: 3/3 done · 1.10 USD · 48 min; report: …` | 1 |
+| run stopped (BLOCKED, FAILED-CHECK, STOPPED) or crashed | `🛑 auto-mode stopped at 02-export: <reason> · …` | `notifyStopPriority` |
+
+The title of every message is the project name (`notifyProjectName`, default: the project folder name), so runs in several projects at the same time can be told apart. Silence after the start message without a finished/stopped message means it is still working.
+
+Your script must accept `-Message <string>` and `-Priority <int>`, optionally `-Title <string>` (without it, the project name is put in front of the message as `[name]`), and exit with a non-zero code when sending failed. It runs in a separate process with a timeout (`notifyTimeoutSeconds`); keys and tokens stay in your script, the auto-mode script never sees them. A failed send is only a warning in the report; after 3 failures in a row the script stops trying for the rest of the run. Only change names, counts, cost and time are sent, never code or test output. For Pushover, such a script reads the API token and user key from a `.env` file next to it and posts `token`, `user`, `title`, `message` and `priority` to `https://api.pushover.net/1/messages.json` ([Pushover API](https://pushover.net/api)).
+
+`notifyScript` is an absolute path on your PC (relative = from the project root), so it lives in `openspec/auto-mode.json` of each project that should notify. The agent cannot edit that file.
 
 ## Usage
 
