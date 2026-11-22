@@ -708,6 +708,53 @@ $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'preventSleep .* must be true or false') 'invalid memory settings refused'
 $env:OSA_TEST_FREE_MB = '16000'; Remove-Item Env:OSA_TEST_PROCESSES
 
+# ---------------------------------------------------------------- memory pressure, step 3
+function Get-LaunchedPid([string]$Out) { if ($Out -match 'own minimized window \(PID (\d+)\)') { return [int]$Matches[1] }; $null }
+
+Write-Host "T40 -Background: own window outside the caller's process tree, same environment"
+$p = New-Project 't40' @('01-a:1')
+$envOut = Join-Path $WorkDir 't40.env.txt'
+Remove-Item $envOut -ErrorAction SilentlyContinue
+$env:OSA_TEST_ENV_MARK = 'only-in-the-launching-shell'; $env:FAKE_ENV_OUT = $envOut
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-Runner $p '01-a=envcheck' @('-Background')
+$sw.Stop()
+Remove-Item Env:OSA_TEST_ENV_MARK
+$cpid = Get-LaunchedPid $r.Out
+Check ($r.Code -eq 0 -and $cpid -and $sw.Elapsed.TotalSeconds -lt 40) "launcher returns with the PID ($([int]$sw.Elapsed.TotalSeconds) s)"
+Check ($r.Out -match 'start checks passed' -and $r.Out -match 'console: \.openspec-auto/runs/\S+/console\.txt') 'launcher waits for the start checks and names the console log'
+$alive = $cpid -and (Get-Process -Id $cpid -ErrorAction SilentlyContinue)
+$parentId = $null
+if ($alive) { $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$cpid").ParentProcessId }
+$parentAlive = $parentId -and (Get-Process -Id $parentId -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -lt (Get-Process -Id $cpid).StartTime })
+Check ($alive -and -not $parentAlive) 'the run lives on without a living parent'
+if ($cpid) { Wait-Process -Id $cpid -Timeout 180 -ErrorAction SilentlyContinue }
+Remove-Item Env:FAKE_ENV_OUT
+$last = Read-State $p 'last-run.json'
+Check ($last.state -eq 'finished' -and (Archived $p '01-a')) 'the run finished, last-run.json finished'
+Check ((Test-Path $envOut) -and (Get-Content $envOut) -eq 'mark=only-in-the-launching-shell') 'the run saw the launching shell''s environment'
+$console = Get-ChildItem "$p/.openspec-auto/runs/*/console.txt" | Select-Object -First 1
+Check ($console -and (Get-Content -Raw $console.FullName) -match 'job object') 'console.txt has the job object line'
+
+Write-Host "T41 -Background with a failing start: exit 2 with the reason, E8"
+$p = New-Project 't41' @('fix-x:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$nlog = Join-Path $WorkDir 't41.notify.txt'
+Remove-Item $nlog -ErrorAction SilentlyContinue
+$env:FAKE_NOTIFY_LOG = $nlog; $env:FAKE_NOTIFY_MODE = 'ok'
+$r = Invoke-Runner $p '' @('-Background')
+for ($i = 0; $i -lt 40 -and -not (Test-Path $nlog); $i++) { Start-Sleep -Milliseconds 500 }
+Remove-Item Env:FAKE_NOTIFY_LOG, Env:FAKE_NOTIFY_MODE -ErrorAction SilentlyContinue
+Check ($r.Code -eq 2 -and $r.Out -match 'ended at once \(failed-start\): no active numbered changes') 'launcher exit 2 with the reason'
+Check ((Read-State $p 'last-run.json').state -eq 'failed-start') 'last-run.json failed-start'
+$nl = @(); if (Test-Path $nlog) { $nl = @([System.IO.File]::ReadAllLines($nlog, [System.Text.Encoding]::UTF8) | Where-Object { $_ }) }
+Check ($nl.Count -eq 1 -and $nl[0] -match '^t41\|1\|.* could not start: no active numbered changes') 'E8 notification'
+
+Write-Host "T42 -Background while a run is living: exit 2, nothing started"
+$p = New-Project 't42' @('01-a:1')
+Write-State $p @{ pid = $PID; processStart = (Get-Start (Get-Process -Id $PID)); startedAt = (Get-Date).ToString('o') }
+$r = Invoke-Runner $p '01-a=success' @('-Background')
+Check ($r.Code -eq 2 -and $r.Out -match 'already running' -and -not (Test-Path "$p/.openspec-auto/runs")) 'refused before launching'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

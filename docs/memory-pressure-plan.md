@@ -54,27 +54,28 @@ New switch `-Background` in `openspec-auto.ps1`. With it the runner does not run
 1. It starts a new, independent copy of itself (same `-Project`, `-ClaudeCommand`, without
    `-Background`) in a **minimized window**, then prints the PID and the paths of the console log
    and the status file, and exits 0.
-2. The copy is created through WMI (`Invoke-CimMethod Win32_Process Create` with
-   `ShowWindow = 7`, minimized without focus). Its parent is the WMI service, not the Claude Code
-   shell, and it is outside the shell's job object, so neither the reaper nor closing Claude Code
-   kills it. `Start-Process` is not enough on its own: a process started from a shell inside a job
-   stays in that job. Step 3 checks this with a real kill (section 13).
-3. **Environment.** A WMI process gets the user's environment from the registry, not the shell's:
-   `JAVA_HOME`, a `PATH` extended in the session, `CLAUDE_*` and similar would be missing. The
-   launcher therefore passes its whole current environment (`Win32_ProcessStartup
-   .EnvironmentVariables`) and the project root as `CurrentDirectory`. The copy then behaves like a
-   run started directly; test 13 checks that it finds `claude`, `openspec` and the test command.
-   If `EnvironmentVariables` turns out not to be applied reliably (test 13 shows it), the fallback
-   is an environment file: the launcher writes the environment to
-   `.openspec-auto/launch-env.<launcher pid>.bin`, encrypted with DPAPI for the current user
-   (`ConvertFrom-SecureString`, readable only by this Windows account on this PC), and passes its
-   path to the copy as a parameter (`-EnvFile <path>`; the copy has a different PID, so it cannot
-   guess the name). The copy reads it as the very first step, deletes it at once (also when reading fails), and never writes any value
-   to a log or the console. The file can hold secrets (e.g. `ANTHROPIC_API_KEY`, if set); normally
-   `claude` signs in through `~/.claude` and no key is in the environment.
-4. **Fallback.** If the WMI call fails (policy, antivirus rule "block process creations from WMI"),
-   the launcher uses `Start-Process` with the same environment and prints a warning that this run is
-   not protected from Claude Code's memory reaper.
+2. The copy is started with `Start-Process … -WindowStyle Minimized` (new console window), and the
+   launcher exits right away. The copy's parent is then a dead process, so it is not part of Claude
+   Code's process tree: a tree kill (which follows parent PIDs, like `taskkill /T`) does not reach
+   it, and closing the terminal does not close its own console. Environment and working directory
+   are inherited as for any child (`JAVA_HOME`, a `PATH` extended in the session, `CLAUDE_*`).
+   **Changed in step 3 (2026-11-22):** the first plan was a WMI launch (`Win32_Process Create`).
+   A probe of it was blocked by the antivirus (behaviour detection: process creation through
+   WMI is a typical malware technique), so every real start would have been blocked. Without WMI
+   the environment needs no copying, so the DPAPI environment file is dropped too.
+3. **Job object.** A probe showed that processes started from Claude Code are in a job object with
+   only `BREAKAWAY_OK | SILENT_BREAKAWAY_OK` (`0x1800`), not `KILL_ON_JOB_CLOSE`. `Start-Process`
+   does not leave that job, so the copy stays in it. That is harmless as long as the job does not
+   kill on close; should a later Claude Code version set it, ending Claude Code would end the run
+   (risk 41). The copy therefore logs at every start whether it is in a job and with which flags,
+   and warns if the job kills on close. Fallback, if the real checks (section 13) show the copy
+   dies: a one-time scheduled task (`schtasks`), whose parent is the Task Scheduler service; it
+   needs the environment passed separately and may itself trigger the antivirus (creating
+   scheduled tasks is a typical persistence technique).
+4. Before launching, the launcher refuses (exit 2) when `running.json` names a living run. It then
+   waits up to ~20 s until the copy has written `running.json` and prints the PID and the paths of
+   `running.json`, `console.txt` and `last-run.json`; if the copy has already ended, it prints the
+   state and reason from `last-run.json` and exits 2.
 5. Start checks (including the baseline tests) run in the copy, as today. The skill runs `check`
    before `run` anyway, so an error is normally seen before the launch. An error that appears only
    in the copy goes to the console log, to `last-run.json` (`state: "failed-start"`) and, if
@@ -314,9 +315,8 @@ without being listed.
 
 ## 12. Tests (`tests/run-tests.ps1`)
 
-Available memory, the process list and the WMI launch can be faked through environment variables
-read only by the tests (`OSA_TEST_FREE_MB`, `OSA_TEST_PROCESSES`, `OSA_TEST_NO_WMI`), like the fake
-claude and notify scripts.
+Available memory and the process list can be faked through environment variables read only by
+the tests (`OSA_TEST_FREE_MB`, `OSA_TEST_PROCESSES`), like the fake claude and notify scripts.
 
 1. `running.json` with a dead PID + dirty tree → file list printed, stash with the message, run
    continues, warning in the report, E1 mentions it; the stash contains the leftover files;
@@ -344,19 +344,20 @@ claude and notify scripts.
     The prompt contains the pattern list.
 12. `OSA_TEST_FREE_MB=3000` → warning with the process list in the report; E1 contains the number
     but no process name; `minFreeMemoryGB: 0` → no warning.
-13. `-Background` → returns at once with PID; the copy finds `claude` (fake), `openspec` and the
-    test command with an environment variable set only in the launching shell, writes
-    `running.json` and `console.txt`, finishes the fake run; `last-run.json` shows `finished`.
-14. `-Background` with a failing start check → `last-run.json` `failed-start`, notification E8.
-15. `OSA_TEST_NO_WMI=1` → fallback launch with the warning.
-16. Environment-file fallback (only if it is needed after test 13): the file is encrypted (does not
-    contain the test value in plain text), is gone right after the copy starts, also when the copy
-    fails to read it, and the test value appears in no log, `console.txt` or report.
+13. `-Background` → returns within seconds with the PID; the copy is not a child of a living
+    process, sees an environment variable set only in the launching shell, writes `running.json`
+    and `console.txt` (with the job line), finishes the fake run; `last-run.json` shows `finished`.
+14. `-Background` with a failing start check → `last-run.json` `failed-start`, notification E8,
+    launcher exit 2 with the reason.
+15. `-Background` while a run is living → exit 2 at once, nothing launched.
+16. (dropped with the WMI launch)
 
 ## 13. Real checks (not automatable, all mandatory)
 
-- **Kill by Claude Code:** start a short fake run with `-Background` from Claude Code, then end
-  the launching shell and close Claude Code → the runner window keeps running and finishes.
+- **End of Claude Code, three ways** (each with a fake run started by `-Background` from Claude
+  Code; the runner window must keep running and finish): close the terminal window; "End process
+  tree" on Claude Code in Task Manager; kill only the Claude Code process. Afterwards
+  `console.txt` shows the job line.
 - **Closing the window** (all processes of the console get the signal) and **`Stop-Process`** on the
   runner (only the runner is killed): after each, no `claude` / test process of the run is left
   (Task Manager), and the next start reports the interrupted run.
@@ -368,8 +369,8 @@ claude and notify scripts.
 | # | Risk | Severity | Mitigation |
 |---|---|---|---|
 | 1 | Worker keeps running after the runner ends (Windows does not end children with the parent) and works in parallel with the next run | high | Job object with kill-on-close (4.2); `childPid` checked at start (5.3); tests 4, 7; real check (13). |
-| 2 | WMI process lacks the shell's environment (`JAVA_HOME`, `PATH`, `CLAUDE_*`) and behaves differently from `check` | high | Pass the whole environment and `CurrentDirectory` (4.1); test 13. |
-| 3 | WMI launch blocked by policy / antivirus (it looks like malware behaviour) | medium | Fallback to `Start-Process` with a warning (4.1); test 15; real check shows which one works. |
+| 2 | The detached copy behaves differently from `check` | low | `Start-Process` inherits environment and directory (4.1); test 13. |
+| 3 | Antivirus blocks the launch | high → low | Happened with WMI (antivirus behaviour detection); WMI dropped, plain `Start-Process` instead (4.1). |
 | 4 | The window is not visible, so it cannot be closed | medium | The skill stops it by PID; real check. |
 | 5 | A start error that appears only in the copy is seen late | medium | `last-run.json` `failed-start`, notification E8, skill checks after ~10 s (4.4); test 14. |
 | 6 | The waiter is killed by the reaper; Claude Code does not learn that the run ended | low | Notifications and status files stay; `report` reads the files. |
@@ -404,9 +405,11 @@ claude and notify scripts.
 | 35 | An old installed skill with the new runner works the old way (no protection) | low | Tell the user to run `install.ps1` after step 3. |
 | 36 | Bugs cause needless paid runs; the trial is paid | low–medium | Steps 1–4 tested with the fake worker (free). |
 | 37 | A commit the worker made earlier in a LOW-MEMORY run (or a CONTINUE in the middle of a group) is red, so the next baseline fails | low | Worker rule "try to leave the group green"; LOW-MEMORY itself does not commit (7); baseline red with a memory pattern gives the memory message (6). |
-| 38 | The environment-file fallback puts secrets on disk | medium | Only if needed; DPAPI-encrypted for the user, deleted at once, never logged (4.1); test 16. |
+| 38 | (environment file dropped with the WMI launch) | – | – |
 | 39 | The job ends daemons, adb and an emulator started inside the run; Android Studio loses adb for a moment | low | Intended for memory; GUIDE: start the emulator before the run (10). |
 | 40 | Timeout rule measured after the kill would never fire | medium | Measure before `taskkill` (6); test 9 built to catch the wrong order. |
+| 41 | The copy stays in Claude Code's job object; a later Claude Code version with kill-on-close would end the run silently | medium | Job line with flags in `console.txt` at every start, warning on kill-on-close (4.1); scheduled task as fallback. |
+| 42 | The scheduled-task fallback is also flagged by the antivirus | medium | Known before it is needed; only built if the real checks require it. |
 
 ## 15. Decisions (2026-11-22)
 
@@ -416,8 +419,9 @@ claude and notify scripts.
 4. Out-of-memory in a worker run: new result `LOW-MEMORY`, not BLOCKED; the worker does not commit,
    the runner stashes the leftovers right away (section 7).
 5. Available memory from `GlobalMemoryStatusEx`, measured before a timeout kill (sections 6, 9).
-6. Environment for the WMI copy: `EnvironmentVariables`; DPAPI environment file only as fallback
-   (section 4.1).
+6. ~~Environment for the WMI copy~~ replaced in step 3: launch with `Start-Process` (minimized,
+   launcher exits) instead of WMI, which the antivirus blocked; no environment file; scheduled task only as
+   fallback (section 4.1).
 7. A runner crash (unexpected error) with uncommitted files keeps `running.json`, so the next start
    treats it as interrupted and stashes the leftovers; with a clean tree it is removed (after
    step 1).
@@ -427,7 +431,7 @@ claude and notify scripts.
 1. `running.json` / `last-run.json`, interrupted-run detection, stash, double-start guard,
    Job object (sections 4.2, 4.3, 5) + tests 1–7.
 2. A1 in the runner and the worker, A2, B (sections 6–9) + tests 8–12.
-3. `-Background` launch with environment and fallback, and the skill changes (sections 4.1, 4.4)
-   + tests 13–15 (16 if the fallback is needed), then the real checks (section 13, without the trial).
+3. `-Background` launch (`Start-Process`, job line), and the skill changes (sections 4.1, 4.4)
+   + tests 13–15, then the real checks (section 13, without the trial).
 4. Docs: GUIDE / README sections, GUIDE appendix rows (section 10).
 5. Trial on a real mobile project (paid).

@@ -142,6 +142,16 @@ switch ($mode) {
         Write-Output ($o | ConvertTo-Json -Compress)
         exit 0
     }
+    'envcheck' {
+        # proves the detached copy got the launching shell's environment, and stays alive a while
+        if ($env:FAKE_ENV_OUT) { Set-Content $env:FAKE_ENV_OUT "mark=$env:OSA_TEST_ENV_MARK" }
+        Start-Sleep 8; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
+    }
+    'long' {
+        # for the manual checks (docs/memory-pressure-plan.md 13): a long run, FAKE_SLEEP_SECONDS
+        $secs = 240; if ($env:FAKE_SLEEP_SECONDS) { $secs = [int]$env:FAKE_SLEEP_SECONDS }
+        Start-Sleep $secs; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
+    }
     'slow' { Start-Sleep 20; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'noop' { Result 'CONTINUE' }
     'crash' { exit 3 }

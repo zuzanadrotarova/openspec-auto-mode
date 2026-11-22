@@ -36,6 +36,14 @@
 .PARAMETER DryRun
     Runs the start checks and prints the plan without running anything.
 
+.PARAMETER Background
+    Starts the run in its own minimized window outside the calling shell's process tree and
+    returns within seconds (docs/memory-pressure-plan.md 4.1). Progress and result are in
+    .openspec-auto/running.json, last-run.json and runs/<stamp>/console.txt.
+
+.PARAMETER Detached
+    Internal: set on the copy started by -Background.
+
 .PARAMETER ClaudeCommand
     Command used to start Claude Code. Default: claude (overridable for tests).
 #>
@@ -45,6 +53,8 @@ param(
     [switch]$Init,
     [switch]$SetupAcceptanceSchema,
     [switch]$DryRun,
+    [switch]$Background,
+    [switch]$Detached,
     [string]$ClaudeCommand = 'claude'
 )
 
@@ -719,6 +729,20 @@ public static class OsaJob {
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
     // ES_CONTINUOUS | ES_SYSTEM_REQUIRED while on; ES_CONTINUOUS alone clears it. 0 = failed.
     public static uint KeepAwake(bool on) { return SetThreadExecutionState(on ? 0x80000001u : 0x80000000u); }
+
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out Extended info, uint length, IntPtr returned);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    // job object the runner itself runs in (not the one it creates for its children):
+    // -1 = none, -2 / -3 = could not be read, otherwise its limit flags
+    public static long OwnJobFlags() {
+        bool inJob;
+        if (!IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out inJob)) return -2;
+        if (!inJob) return -1;
+        Extended info;
+        if (!QueryInformationJobObject(IntPtr.Zero, 9, out info, (uint)Marshal.SizeOf(typeof(Extended)), IntPtr.Zero)) return -3;
+        return info.BasicLimits.LimitFlags;
+    }
 }
 '@
         }
@@ -877,7 +901,7 @@ function Enter-RunState([string]$Path, [hashtable]$State, $Stale) {
     $script:RunGuard = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
     $script:RunStatePath = $Path
     $script:RunState = [ordered]@{}
-    foreach ($k in @('pid', 'processStart', 'childPid', 'childStart', 'runDir', 'startedAt', 'change', 'run', 'consoleLog')) { $script:RunState[$k] = $State[$k] }
+    foreach ($k in @('pid', 'processStart', 'phase', 'childPid', 'childStart', 'runDir', 'startedAt', 'change', 'run', 'consoleLog')) { $script:RunState[$k] = $State[$k] }
     Write-RunState
     return $null
 }
@@ -940,6 +964,51 @@ if ((Invoke-Git @('rev-parse', '--is-inside-work-tree')).Out -ne 'true') {
 }
 $top = [System.IO.Path]::GetFullPath((Invoke-Git @('rev-parse', '--show-toplevel')).Out)
 if ($top.TrimEnd('\', '/') -ne $Project.TrimEnd('\', '/')) { throw "Run from the repository root ($top)." }
+
+if ($Background) {
+    # launcher (4.1): a copy in its own minimized window; this process ends at once, so the copy
+    # has no living parent and is not part of the calling shell's process tree
+    if ($Init -or $SetupAcceptanceSchema -or $DryRun -or $Detached) { throw '-Background cannot be combined with -Init, -SetupAcceptanceSchema, -DryRun or -Detached' }
+    $statePath = Join-Path $Project "$StateDirName/running.json"
+    $lastPath = Join-Path $Project "$StateDirName/last-run.json"
+    if (Test-Path -LiteralPath $statePath) {
+        $prev = Read-RunRecord $statePath
+        if (Test-ProcessAlive $prev.pid $prev.processStart) { Write-Bad "auto-mode is already running in this project (PID $($prev.pid))"; exit 2 }
+    }
+    $lastBefore = $null
+    if (Test-Path -LiteralPath $lastPath) { $lastBefore = (Get-Item -LiteralPath $lastPath).LastWriteTimeUtc }
+    $exe = (Get-Process -Id $PID).Path
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Project', "`"$Project`"", '-ClaudeCommand', "`"$ClaudeCommand`"", '-Detached')
+    $copy = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $Project -WindowStyle Minimized -PassThru
+    $null = $copy.Handle   # keeps the exit code readable
+    Write-Step "auto-mode started in its own minimized window (PID $($copy.Id))"
+    # wait until the start checks (incl. baseline tests) passed, the copy ended, or 20 s are over
+    $state = $null
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline -and -not $copy.HasExited) {
+        if (Test-Path -LiteralPath $statePath) {
+            $s = Read-RunRecord $statePath
+            if ([string]$s.pid -eq [string]$copy.Id) { $state = $s; if ($s.phase -eq 'running') { break } }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($copy.HasExited) {
+        if ((Test-Path -LiteralPath $lastPath) -and (Get-Item -LiteralPath $lastPath).LastWriteTimeUtc -ne $lastBefore) {
+            $l = Read-RunRecord $lastPath
+            Write-Bad "the run ended at once ($($l.state)): $($l.reason)"
+            Write-Host "    console: $($l.runDir)/console.txt"
+        } else {
+            Write-Bad "the run ended at once (exit code $($copy.ExitCode)); see the newest $StateDirName/runs/*/console.txt"
+        }
+        exit 2
+    }
+    if ($state -and $state.phase -eq 'running') { Write-Ok 'start checks passed, the run is going' }
+    else { Write-Warn 'still starting (start checks, baseline tests); look at running.json and last-run.json in a moment' }
+    Write-Host "    status:  $StateDirName/running.json (deleted at the end)"
+    if ($state) { Write-Host "    console: $($state.consoleLog)" }
+    Write-Host "    result:  $StateDirName/last-run.json and $StateDirName/auto-mode-report.md"
+    exit 0
+}
 
 if ($Init) {
     Write-Step 'Init'
@@ -1021,6 +1090,17 @@ if (-not $DryRun) {
 Initialize-Job
 
 Write-Step "OpenSpec auto-mode in $Project"
+if ($Detached) { try { $Host.UI.RawUI.WindowTitle = "openspec-auto: $(Split-Path -Leaf $Project)" } catch { } }
+# the job object the runner itself is in (4.1): one that kills on close would end the run with it
+if ('OsaJob' -as [type]) {
+    $jf = [OsaJob]::OwnJobFlags()
+    if ($jf -eq -1) { Write-Ok 'runner is not in a job object' }
+    elseif ($jf -lt 0) { Write-Ok "job object of the runner could not be read ($jf)" }
+    elseif ($jf -band 0x2000) {
+        $w = "the runner is in a job object that kills its processes when it closes (flags 0x$('{0:X}' -f $jf)); the run ends when the program that started it ends"
+        $warnings += $w; Write-Warn $w
+    } else { Write-Ok "runner is in a job object without kill-on-close (flags 0x$('{0:X}' -f $jf))" }
+}
 $errors = @()
 if (-not (Get-Command $OpenSpecExe -ErrorAction SilentlyContinue)) { $errors += 'openspec CLI not found' }
 $cfg = Read-Config
@@ -1080,7 +1160,7 @@ if (Test-Path -LiteralPath $runningPath) {
 }
 if (-not $DryRun) {
     $claim = Enter-RunState $runningPath @{
-        pid = $PID; processStart = (Get-ProcessStart (Get-Process -Id $PID)); runDir = (Get-RelPath $runDir)
+        pid = $PID; processStart = (Get-ProcessStart (Get-Process -Id $PID)); phase = 'starting'; runDir = (Get-RelPath $runDir)
         startedAt = (Get-Date).ToString('o'); consoleLog = (Get-RelPath $consoleLog)
     } $interrupted
     if ($claim) { Write-Bad $claim; Exit-Runner 2 $claim }
@@ -1202,6 +1282,7 @@ if ([double]$cfg.minFreeMemoryGB -gt 0 -and $null -ne $availStart) {
     } else { Write-Ok "memory available: $(Format-GB $availStart)" }
 }
 if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
+Set-RunState @{ phase = 'running' }
 
 $settingsPath = Join-Path $runDir 'worker-settings.json'
 $agentsPath = Join-Path $runDir 'worker-agents.json'
@@ -1708,6 +1789,13 @@ Exit-Runner 0 $null
         if (-not $script:Crashed) {
             $code = $script:EndCode
             $state = @{ 0 = 'finished'; 1 = 'stopped'; 2 = 'failed-start' }[[int]$code]
+        }
+        # E8: a start that fails in the detached copy is seen by nobody (4.1)
+        if ($Detached -and -not $script:NotifyPath -and $NotifyCandidate -and $state -in @('failed-start', 'crashed')) {
+            $why = ([string]$script:EndReason -replace '\s+', ' ').Trim()
+            if ($why.Length -gt 200) { $why = $why.Substring(0, 197) + '...' }
+            $script:NotifyPath = $NotifyCandidate
+            try { Send-Notify ("{0} auto-mode could not start: {1}" -f (Get-Emoji 0x1F6D1), $why) ([int]$cfg.notifyStopPriority) } catch { }
         }
         $last = [ordered]@{
             exitCode = $code; state = $state; endedAt = (Get-Date).ToString('o')
