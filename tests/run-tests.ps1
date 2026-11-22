@@ -9,6 +9,8 @@ $Fake = Join-Path $PSScriptRoot 'fake-claude.cmd'
 $os = 'openspec'
 if (Get-Command 'openspec.cmd' -ErrorAction SilentlyContinue) { $os = 'openspec.cmd' }
 $script:Failed = 0
+# fixed available memory, so the memory warning does not depend on this PC (T39 changes it)
+$env:OSA_TEST_FREE_MB = '16000'
 
 function Check([bool]$Cond, [string]$Msg) {
     if ($Cond) { Write-Host "    ok   $Msg" -ForegroundColor Green }
@@ -52,7 +54,12 @@ function New-Project([string]$Name, [string[]]$Changes, [string]$Config = $Defau
         New-Change $parts[0] ([int]$parts[1]) $groups
     }
     Set-Content 'openspec/auto-mode.json' $Config
-    Set-Content 'run-tests.cmd' '@if exist broken.txt (echo FAIL broken.txt & exit /b 1) else (echo ok)'
+    Set-Content 'run-tests.cmd' @(
+        '@if exist oom.txt (echo Exception in thread main java.lang.OutOfMemoryError: Java heap space & exit /b 1)'
+        '@if exist oom-green.txt (echo test of java.lang.OutOfMemoryError handling: ok & exit /b 0)'
+        '@if exist slow.txt (powershell -NoProfile -Command "if ($env:OSA_TEST_FREE_MB_FILE) { Set-Content -LiteralPath $env:OSA_TEST_FREE_MB_FILE ([string]$PID + '' 3000'') }; Start-Sleep 120" & exit /b 1)'
+        '@if exist broken.txt (echo FAIL broken.txt & exit /b 1) else (echo ok)'
+    )
     git add -A 2>&1 | Out-Null; git commit -q -m init 2>&1 | Out-Null
     git remote add origin $remote; git push -q origin main 2>&1 | Out-Null
     Pop-Location
@@ -626,6 +633,80 @@ Check ($r.Code -ne 0 -and $last.state -eq 'crashed' -and $last.reason -match 'te
 Check (-not (Test-Path "$p/.openspec-auto/running.json")) 'crash: running.json removed'
 $console = Get-ChildItem "$p/.openspec-auto/runs/*/console.txt" | Select-Object -First 1
 Check ($console -and (Get-Content -Raw $console.FullName) -match 'OpenSpec auto-mode in') 'console.txt holds the runner output'
+$p = New-Project 't35c' @('01-a:1')
+$env:OSA_TEST_THROW = 'after-worker'
+$r = Invoke-Runner $p '01-a=dirty'
+Remove-Item Env:OSA_TEST_THROW
+Check ($r.Code -ne 0 -and (Read-State $p 'last-run.json').state -eq 'crashed' -and (Test-Path "$p/.openspec-auto/running.json")) 'crash with uncommitted files: running.json kept'
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -match 'was interrupted' -and (GitIn $p stash list --format=%s) -match 'leftovers of interrupted run') 'next start stashes the leftovers of the crash and finishes'
+
+# ---------------------------------------------------------------- memory pressure, step 2
+function Set-Break([string]$File) { if ($File) { $env:FAKE_BREAK_FILE = $File } else { Remove-Item Env:FAKE_BREAK_FILE -ErrorAction SilentlyContinue } }
+
+Write-Host "T36 out-of-memory in the runner's tests: no repair, STOPPED; baseline with it refuses the start"
+$p = New-Project 't36' @('01-a:4:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+Set-Break 'oom.txt'
+$r = Invoke-NotifyRunner $p '01-a=group-red'
+Check ($r.Code -eq 1 -and $r.Out -match '\| 01-a \| STOPPED' -and $r.Out -match 'group 1 ran out of memory \(Exception in thread main java\.lang\.OutOfMemoryError') 'red group with OutOfMemoryError: STOPPED with the line'
+Check ((Count-Prompts $p '01-a') -eq 1) 'no repair run'
+Check ($r.Lines.Count -ge 2 -and $r.Lines[-1] -match 'stopped at 01-a: low memory \(15\.6 GB available\)') 'E6 says low memory'
+Check ((Read-RunPrompt $p '01-a.run01.prompt.txt') -match 'Memory error patterns .*java\.lang\.OutOfMemoryError') 'worker prompt carries the pattern list'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'baseline tests ran out of memory \(Exception in thread main java\.lang\.OutOfMemoryError') 'baseline with a memory error: exit 2 with the memory message'
+$p = New-Project 't36b' @('01-a:4:2')
+Set-Break 'oom-green.txt'
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'green tests with a memory line count as green'
+$p = New-Project 't36c' @('01-a:4:2') ($DefaultConfig -replace ' }$', ', "memoryErrorPatterns": [] }')
+Set-Break 'oom.txt'
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Count-Prompts $p '01-a') -eq 4) 'memoryErrorPatterns [] : normal repair'
+Set-Break $null
+
+Write-Host "T37 test timeout: out of memory only with low memory at the moment of the timeout"
+$TimeoutConfig = $DefaultConfig -replace ' }$', ', "testTimeoutMinutes": 0.1 }'
+$p = New-Project 't37' @('01-a:4:2') $TimeoutConfig
+Set-Break 'slow.txt'
+$memFile = Join-Path $WorkDir 't37.mem'
+Remove-Item $memFile -ErrorAction SilentlyContinue
+$env:OSA_TEST_FREE_MB_FILE = $memFile
+$r = Invoke-Runner $p '01-a=group-red'
+Remove-Item Env:OSA_TEST_FREE_MB_FILE
+Check ($r.Code -eq 1 -and $r.Out -match 'ran out of memory \(timeout with 2\.9 GB available\)') 'timeout with low memory (measured before the kill): STOPPED'
+Check ((Count-Prompts $p '01-a') -eq 1) 'no repair run'
+$p = New-Project 't37b' @('01-a:4:2') $TimeoutConfig
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Count-Prompts $p '01-a') -eq 4) 'timeout with enough memory: normal red timeout, repaired'
+Check ($r.Out -match 'timeout after 0\.1 min' -and $r.Out -notmatch 'ran out of memory') 'reported as a normal timeout'
+Set-Break $null
+
+Write-Host "T38 worker reports LOW-MEMORY: STOPPED, leftovers stashed, next start continues"
+$p = New-Project 't38' @('01-a:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$r = Invoke-NotifyRunner $p '01-a=lowmem'
+Check ($r.Code -eq 1 -and $r.Out -match '\| 01-a \| STOPPED' -and $r.Out -match 'worker ran out of memory: Exception in thread main java\.lang\.OutOfMemoryError') 'STOPPED with the worker''s line'
+Check (-not (Test-Path "$p/openspec/changes/01-a/BLOCKED.md") -and -not (Active $p 'fix-01-a')) 'no BLOCKED.md, no fix change'
+Check ((Clean $p) -and (GitIn $p stash list --format=%s) -match 'openspec-auto: leftovers of LOW-MEMORY in 01-a run 1') 'leftovers in a stash, tree clean'
+Check ($r.Lines.Count -ge 2 -and $r.Lines[-1] -match 'stopped at 01-a: low memory \(15\.6 GB available\)') 'E6 says low memory'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and $r.Out -match 'baseline tests green' -and (Archived $p '01-a')) 'next start: green baseline, change finished'
+
+Write-Host "T39 memory warning at the start"
+$p = New-Project 't39' @('01-a:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$env:OSA_TEST_FREE_MB = '3000'; $env:OSA_TEST_PROCESSES = 'java=3400;java=200;qemu-system=2100;browser=2700;code=100'
+$r = Invoke-Runner $p '' @('-DryRun')
+Check ($r.Code -eq 0 -and $r.Out -match 'only 2\.9 GB memory available') 'dry run warns too'
+$r = Invoke-NotifyRunner $p '01-a=success'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and $rep -match 'only 2\.9 GB memory available \(minFreeMemoryGB 8\); biggest processes: java 3\.5 GB \(2\), browser 2\.6 GB, qemu-system 2\.1 GB, code 0\.1 GB') 'report: warning with the process list'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'only 2\.9 GB memory available$' -and $r.Lines[0] -notmatch 'java|browser|qemu') 'E1: the number, no process names'
+$p = New-Project 't39b' @('01-a:1') ($DefaultConfig -replace ' }$', ', "minFreeMemoryGB": 0 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -notmatch 'memory available \(minFreeMemoryGB') 'minFreeMemoryGB 0: no warning'
+$p = New-Project 't39c' @('01-a:1') ($DefaultConfig -replace ' }$', ', "minFreeMemoryGB": "lots", "preventSleep": "yes" }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'preventSleep .* must be true or false') 'invalid memory settings refused'
+$env:OSA_TEST_FREE_MB = '16000'; Remove-Item Env:OSA_TEST_PROCESSES
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }

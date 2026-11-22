@@ -1,7 +1,7 @@
 # Robust runs under memory pressure: spec
 
-Status: reviewed twice (risks, open questions and second review settled 2026-11-22); step 1
-implemented 2026-11-22 (tests T30–T35), steps 2–5 open.
+Status: reviewed twice (risks, open questions and second review settled 2026-11-22); steps 1
+and 2 implemented 2026-11-22 (tests T30–T39), steps 3–5 open.
 Date: 2026-11-22
 
 ## 1. Problem (trial of 2026-11-21)
@@ -326,7 +326,8 @@ claude and notify scripts.
 4. `running.json` with a living runner PID and matching start time → exit 2 "already running";
    with a living `childPid` → exit 2 "worker still running"; with `-DryRun` only a warning.
 5. Two starts at the same moment → one runs, the other exits 2 (`CreateNew`).
-6. Normal end, stop, crash → `running.json` removed, `last-run.json` with the right state.
+6. Normal end, stop, crash → `running.json` removed, `last-run.json` with the right state. A crash
+   with uncommitted files keeps `running.json` (decision 7), so the next start stashes them.
 7. Job object: the fake worker starts a long-sleeping grandchild; `Stop-Process` on the runner →
    the grandchild is gone too.
 8. Red group tests with `java.lang.OutOfMemoryError` → STOPPED, no repair run (fake claude called
@@ -417,6 +418,9 @@ claude and notify scripts.
 5. Available memory from `GlobalMemoryStatusEx`, measured before a timeout kill (sections 6, 9).
 6. Environment for the WMI copy: `EnvironmentVariables`; DPAPI environment file only as fallback
    (section 4.1).
+7. A runner crash (unexpected error) with uncommitted files keeps `running.json`, so the next start
+   treats it as interrupted and stashes the leftovers; with a clean tree it is removed (after
+   step 1).
 
 ## 16. Implementation steps (each needs an explicit ok)
 

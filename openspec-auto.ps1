@@ -58,6 +58,15 @@ $AcceptSchemaName = 'spec-driven-acceptance'
 $HookMarker = '# openspec-auto-mode pre-push guard'
 $IsWin = ($env:OS -eq 'Windows_NT')
 $Utf8 = New-Object System.Text.UTF8Encoding $false
+# memoryErrorPatterns default (docs/memory-pressure-plan.md 6): plain substrings, case-insensitive
+$DefaultMemoryPatterns = @(
+    'java.lang.OutOfMemoryError',
+    'GC overhead limit exceeded',
+    'Gradle build daemon disappeared unexpectedly',
+    'The daemon has terminated unexpectedly',
+    'There is insufficient memory for the Java Runtime Environment',
+    'Could not reserve enough space'
+)
 
 # ---------------------------------------------------------------- helpers
 
@@ -286,6 +295,9 @@ function Read-Config {
         notifyProjectName  = $null
         notifyStopPriority = 1
         notifyTimeoutSeconds = 30
+        memoryErrorPatterns = $DefaultMemoryPatterns
+        preventSleep       = $true
+        minFreeMemoryGB    = 8
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -301,6 +313,10 @@ function Read-Config {
     if ($null -eq $cfg.notifyStopPriority) { $cfg.notifyStopPriority = 1 }
     if ($null -eq $cfg.notifyTimeoutSeconds) { $cfg.notifyTimeoutSeconds = 30 }
     if (-not $cfg.notifyProjectName) { $cfg.notifyProjectName = Split-Path -Leaf $Project }
+    if ($null -eq $cfg.memoryErrorPatterns) { $cfg.memoryErrorPatterns = $DefaultMemoryPatterns }
+    if ($null -eq $cfg.preventSleep) { $cfg.preventSleep = $true }
+    if ($null -eq $cfg.minFreeMemoryGB) { $cfg.minFreeMemoryGB = 8 }
+    $cfg.memoryErrorPatterns = @($cfg.memoryErrorPatterns | Where-Object { $null -ne $_ -and "$_" -ne '' })
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
@@ -435,9 +451,12 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
     $proc.StandardInput.Close()
 
     $timedOut = $false
+    $availAtTimeout = $null
     try {
         if (-not $proc.WaitForExit([int]($TimeoutMinutes * 60 * 1000))) {
             $timedOut = $true
+            # measured before the kill: afterwards the killed processes have freed their memory
+            $availAtTimeout = Get-AvailableMB
             if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
             $proc.WaitForExit(15000) | Out-Null
         }
@@ -455,6 +474,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
     if ($proc.HasExited) { $exitCode = $proc.ExitCode }
     [pscustomobject]@{
         ExitCode = $exitCode; TimedOut = $timedOut; Stdout = $stdout; Stderr = $stderr
+        AvailableMBAtTimeout = $availAtTimeout
         Minutes = [math]::Round(((Get-Date) - $started).TotalMinutes, 1)
     }
 }
@@ -467,7 +487,7 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
     foreach ($c in @($AcceptFor | Where-Object { $_ })) {
         $cmds += [pscustomobject]@{ Name = "acceptance $c "; Line = (Get-AcceptanceCommand $c) }
     }
-    $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0
+    $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0; $memory = $null
     foreach ($c in $cmds) {
         $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) ''
         $minutes += $p.Minutes
@@ -485,11 +505,19 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
                 if ($_.Length -gt 300) { $_.Substring(0, 300) } else { $_ }
             }) -join "`n")
             if ($c.Name) { $tail = "[$($c.Line)]`n$tail" }
+            # out of memory (docs/memory-pressure-plan.md 6): a memory error line, or a timeout
+            # while available memory was below minFreeMemoryGB
+            $memLine = Find-MemoryLine $text
+            $minMB = [double]$Cfg.minFreeMemoryGB * 1024
+            if ($memLine) { $memory = $memLine }
+            elseif ($p.TimedOut -and $minMB -gt 0 -and $null -ne $p.AvailableMBAtTimeout -and $p.AvailableMBAtTimeout -lt $minMB) {
+                $memory = "timeout with $(Format-GB $p.AvailableMBAtTimeout) available"
+            }
         }
     }
     Write-TextFile $LogPath $log
     [pscustomobject]@{
-        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label
+        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label; Memory = $memory
         Tail = $tail; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = [math]::Round($minutes, 1)
     }
 }
@@ -579,13 +607,18 @@ Acceptance test command: $(Get-AcceptanceCommand $target)
 
 "@
     }
+    $memText = ''
+    if (@($Cfg.memoryErrorPatterns).Count) {
+        $quoted = @(@($Cfg.memoryErrorPatterns) | ForEach-Object { '`' + $_ + '`' }) -join ', '
+        $memText = "Memory error patterns (see your rule on running out of memory): $quoted`n"
+    }
     $prompt = @"
 Change: $($Item.Name)
 Kind: $kind
 Run: $Run of max $($Item.MaxRuns) for this change
 Task budget for this run: $($Cfg.tasksPerRun)
 Test command: $($Cfg.testCommand)
-$acceptText$UnitText$evidence
+$memText$acceptText$UnitText$evidence
 Allowed shell commands (one per Bash call, from the project root; any arguments):
 $shell
 
@@ -626,7 +659,7 @@ Process this change according to your OpenSpec auto-mode instructions.
             $info.Turns = $j.num_turns; $info.Cost = $j.total_cost_usd; $info.Result = [string]$j.result
         }
     } catch { $info.Result = $stdout }
-    if ($info.Result -match 'AUTO-MODE-RESULT:\s*([A-Z]+)') { $info.Claimed = $Matches[1] }
+    if ($info.Result -match 'AUTO-MODE-RESULT:\s*([A-Z]+(-[A-Z]+)*)') { $info.Claimed = $Matches[1] }
     $info
 }
 
@@ -669,9 +702,33 @@ public static class OsaJob {
     public static void Assign(IntPtr job, IntPtr process) {
         if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
     }
+
+    [StructLayout(LayoutKind.Sequential)] class MemStatus {
+        public uint Length = (uint)Marshal.SizeOf(typeof(MemStatus)); public uint MemoryLoad;
+        public ulong TotalPhys; public ulong AvailPhys; public ulong TotalPageFile; public ulong AvailPageFile;
+        public ulong TotalVirtual; public ulong AvailVirtual; public ulong AvailExtendedVirtual;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GlobalMemoryStatusEx([In, Out] MemStatus status);
+    // available physical memory incl. the standby cache Windows can free at once; -1 on error
+    public static double AvailableMB() {
+        MemStatus m = new MemStatus();
+        if (!GlobalMemoryStatusEx(m)) return -1;
+        return m.AvailPhys / 1048576.0;
+    }
+
+    [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    // ES_CONTINUOUS | ES_SYSTEM_REQUIRED while on; ES_CONTINUOUS alone clears it. 0 = failed.
+    public static uint KeepAwake(bool on) { return SetThreadExecutionState(on ? 0x80000001u : 0x80000000u); }
 }
 '@
         }
+    } catch {
+        $w = "native helpers not available ($($_.Exception.Message)); no job object, memory checks or sleep prevention"
+        $script:warnings += $w
+        Write-Warn $w
+        return
+    }
+    try {
         $script:JobHandle = [OsaJob]::Create()
     } catch {
         $w = "child processes are not bound to the runner (job object: $($_.Exception.Message)); after a killed runner check that no claude process is left"
@@ -690,6 +747,59 @@ function Add-ToJob([System.Diagnostics.Process]$Proc) {
         $script:warnings += $w
         Write-Warn $w
     }
+}
+
+# Available physical memory in MB, or $null when unknown (docs/memory-pressure-plan.md 9).
+# Test hooks: OSA_TEST_FREE_MB_FILE holds "<pid> <mb>", valid only while that process lives;
+# otherwise OSA_TEST_FREE_MB.
+function Get-AvailableMB {
+    $f = $env:OSA_TEST_FREE_MB_FILE
+    if ($f -and (Test-Path -LiteralPath $f)) {
+        $parts = @(([System.IO.File]::ReadAllText($f).Trim()) -split '\s+')
+        if ($parts.Count -eq 2 -and (Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue)) { return [double]$parts[1] }
+    }
+    if ($env:OSA_TEST_FREE_MB) { return [double]$env:OSA_TEST_FREE_MB }
+    if (-not ('OsaJob' -as [type])) { return $null }
+    $mb = [OsaJob]::AvailableMB()
+    if ($mb -lt 0) { return $null }
+    $mb
+}
+
+function Format-GB($MB) {
+    if ($null -eq $MB) { return '? GB' }
+    ([double]$MB / 1024).ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture) + ' GB'
+}
+
+# Biggest processes by working set, grouped by name: "java 3.4 GB (2), browser 2.7 GB, ...".
+# Only for the console and the local report, never for notifications.
+# Test hook: OSA_TEST_PROCESSES = "name=MB;name=MB".
+function Get-BigProcesses([int]$Top = 5) {
+    if ($env:OSA_TEST_PROCESSES) {
+        $list = @(($env:OSA_TEST_PROCESSES -split ';') | Where-Object { $_ -match '^(.+)=(\d+)$' } |
+            ForEach-Object { [pscustomobject]@{ Name = $Matches[1]; MB = [double]$Matches[2] } })
+    } else {
+        $list = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Name = $_.ProcessName; MB = $_.WorkingSet64 / 1MB } })
+    }
+    $groups = @($list | Group-Object Name | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; MB = ($_.Group | Measure-Object MB -Sum).Sum; Count = $_.Count }
+    } | Sort-Object MB -Descending | Select-Object -First $Top)
+    @($groups | ForEach-Object { "$($_.Name) $(Format-GB $_.MB)$(if ($_.Count -gt 1) { " ($($_.Count))" })" }) -join ', '
+}
+
+# First output line containing one of memoryErrorPatterns, or $null.
+function Find-MemoryLine([string]$Text) {
+    $patterns = @($script:cfg.memoryErrorPatterns)
+    if (-not $patterns.Count -or -not $Text) { return $null }
+    foreach ($line in (($Text -replace "`r", '') -split "`n")) {
+        foreach ($p in $patterns) {
+            if ($line.IndexOf([string]$p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $l = $line.Trim()
+                if ($l.Length -gt 200) { $l = $l.Substring(0, 200) }
+                return $l
+            }
+        }
+    }
+    $null
 }
 
 function Get-ProcessStart($Proc) {
@@ -810,6 +920,8 @@ $script:LastRunPath = $null       # set when this start should leave last-run.js
 $script:EndCode = $null
 $script:EndReason = $null
 $script:Crashed = $false
+$script:MemoryStop = $null
+$script:KeptAwake = $false
 function Exit-Runner([int]$Code, [string]$Reason) {
     $script:EndCode = $Code
     $script:EndReason = $Reason
@@ -917,6 +1029,9 @@ elseif (-not $cfg.testCommand) { $errors += "testCommand is not set in $ConfigRe
 elseif ($cfg.fixMode -notin @('immediate', 'stop')) { $errors += "fixMode in $ConfigRel must be 'immediate' or 'stop' (is '$($cfg.fixMode)')" }
 elseif ($cfg.acceptanceMode -notin @('off', 'reviewed')) { $errors += "acceptanceMode in $ConfigRel must be 'off' or 'reviewed' (is '$($cfg.acceptanceMode)')" }
 elseif ($cfg.scenarioCoverage -isnot [bool]) { $errors += "scenarioCoverage in $ConfigRel must be true or false (is '$($cfg.scenarioCoverage)')" }
+elseif ($cfg.preventSleep -isnot [bool]) { $errors += "preventSleep in $ConfigRel must be true or false (is '$($cfg.preventSleep)')" }
+elseif ("$($cfg.minFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "minFreeMemoryGB in $ConfigRel must be a number >= 0 (is '$($cfg.minFreeMemoryGB)')" }
+elseif (@($cfg.memoryErrorPatterns | Where-Object { $_ -isnot [string] }).Count) { $errors += "memoryErrorPatterns in $ConfigRel must be a list of strings" }
 elseif ($cfg.acceptanceMode -ne 'off') {
     if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }
     if (-not $cfg.acceptanceDir -or [System.IO.Path]::IsPathRooted($cfg.acceptanceDir) -or $cfg.acceptanceDir -match '(^|/)\.\.?(/|$)' -or $cfg.acceptanceDir -match '[*?]') {
@@ -1054,6 +1169,11 @@ if ($baseline.Dirty) {
     Write-Bad "testCommand leaves the working tree dirty:`n$($baseline.Dirty)`n    add these files to .gitignore (or clean them up) and run again"
     Exit-Runner 2 'testCommand leaves the working tree dirty'
 }
+if (-not $baseline.Passed -and $baseline.Memory) {
+    $why = "baseline tests ran out of memory ($($baseline.Memory)); close other programs and run again"
+    Write-Bad "$why. Output: $StateDirName/baseline-tests.txt"
+    Exit-Runner 2 $why
+}
 if (-not $baseline.Passed) {
     if ($fixCandidate -and $cfg.fixMode -eq 'immediate') {
         $resumeFix = $fixCandidate
@@ -1070,6 +1190,17 @@ if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered 
 $planNames = @(@($resumeFix) + @($numbered | ForEach-Object { $_.name }) | Where-Object { $_ })
 Write-Ok ("plan: " + ($planNames -join ' -> '))
 if ($NotifyCandidate) { Write-Ok "notifications: $NotifyCandidate (project name '$($cfg.notifyProjectName)')" }
+
+# memory warning (docs/memory-pressure-plan.md 9): a hint only, the tests decide
+$memoryWarning = $null
+$availStart = Get-AvailableMB
+if ([double]$cfg.minFreeMemoryGB -gt 0 -and $null -ne $availStart) {
+    if ($availStart -lt [double]$cfg.minFreeMemoryGB * 1024) {
+        $memoryWarning = "only $(Format-GB $availStart) memory available"
+        $w = "$memoryWarning (minFreeMemoryGB $($cfg.minFreeMemoryGB)); biggest processes: $(Get-BigProcesses)"
+        $warnings += $w; Write-Warn $w
+    } else { Write-Ok "memory available: $(Format-GB $availStart)" }
+}
 if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
 
 $settingsPath = Join-Path $runDir 'worker-settings.json'
@@ -1091,8 +1222,14 @@ $stopReason = $null
 
 $script:NotifyPath = $NotifyCandidate
 $planCount = @($numbered).Count
+if ($cfg.preventSleep -and ('OsaJob' -as [type])) {
+    # held by this (main) thread for the whole loop; Windows drops it when the thread ends
+    if ([OsaJob]::KeepAwake($true) -ne 0) { $script:KeptAwake = $true; Write-Ok 'Windows is kept awake during the run (preventSleep)' }
+    else { $w = 'could not keep Windows awake (SetThreadExecutionState failed)'; $warnings += $w; Write-Warn $w }
+}
 $startExtra = ''
-if ($stashInfo) { $startExtra = " $([char]0x00B7) leftovers of the interrupted run stashed ($($stashInfo.Ref), $($stashInfo.Count) file$(if ($stashInfo.Count -ne 1) { 's' }))" }
+if ($memoryWarning) { $startExtra += " $([char]0x00B7) $([char]0x26A0) $memoryWarning" }
+if ($stashInfo) { $startExtra += " $([char]0x00B7) leftovers of the interrupted run stashed ($($stashInfo.Ref), $($stashInfo.Count) file$(if ($stashInfo.Count -ne 1) { 's' }))" }
 Send-Notify (("{0} auto-mode started: {1} change{2}, first {3}" -f (Get-Emoji 0x25B6), $planNames.Count, $(if ($planNames.Count -ne 1) { 's' }), $planNames[0]) + $startExtra) 0
 
 function New-QueueItem([string]$Name, [bool]$IsFix, [string]$Parent, [string]$Branch, [int]$MaxRuns, [string]$Evidence, [string]$EvidenceLabel) {
@@ -1210,11 +1347,48 @@ Do the completion check and archive (SUCCESS).
         # 2. new process = empty context (kap. 5.1)
         $unitLabel = ''
         if ($mode -eq 'group') { $unitLabel = ", group $unitGroup" } elseif ($mode -eq 'repair') { $unitLabel = ", repair of group $unitGroup" } elseif ($mode -eq 'final') { $unitLabel = ', final' }
+        Write-Host "    memory available: $(Format-GB (Get-AvailableMB))"
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
         $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath $unitText
         if ($w.Cost) { $cost += [double]$w.Cost }
+        if ($env:OSA_TEST_THROW -eq 'after-worker') { throw 'test crash after the worker (OSA_TEST_THROW)' }
         Write-Host (" exit {0}, {1} min, claims {2}" -f $w.ExitCode, $w.Minutes, $(if ($w.Claimed) { $w.Claimed } else { '-' }))
+
+        # 2b. the worker ran out of memory (docs/memory-pressure-plan.md 7): no commit expected,
+        # leftovers go into a stash, the change stops (not BLOCKED, so the next start continues)
+        if ($w.Claimed -eq 'LOW-MEMORY' -and -not $w.TimedOut -and $w.ExitCode -eq 0) {
+            $lmProblems = @()
+            $cur = Get-CurrentBranch
+            if ($cur -ne $branch) { $lmProblems += "agent left branch $branch (now on $cur)" }
+            if ((Get-RemoteRefs) -ne $refsBefore) { $lmProblems += 'remote-tracking refs changed during the run (possible push)' }
+            if (-not $lmProblems.Count) {
+                $memLine = Find-MemoryLine $w.Result
+                if (-not $memLine) {
+                    $memLine = (($w.Result -replace "`r", '') -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch 'AUTO-MODE-RESULT' } | Select-Object -First 1)
+                    if (-not $memLine) { $memLine = '(no line given)' }
+                    $memLine = ([string]$memLine).Trim()
+                    if ($memLine.Length -gt 200) { $memLine = $memLine.Substring(0, 200) }
+                }
+                $avail = Format-GB (Get-AvailableMB)
+                $memNote = "worker ran out of memory: $memLine; available now $avail"
+                if (Get-DirtyStatus) {
+                    try {
+                        $s = Save-Leftovers "openspec-auto: leftovers of LOW-MEMORY in $change run $run"
+                        $memNote += "; leftovers stashed on branch $($s.Branch) ($($s.Ref), $($s.Count) files)"
+                    } catch { $memNote += "; stashing the leftovers failed: $($_.Exception.Message -replace '\s+', ' ')" }
+                }
+                Write-Bad $memNote
+                $outcome = 'STOPPED'; $notes += $memNote
+                $stopReason = "change ${change}: $memNote; close other programs and run again"
+                $script:MemoryStop = "low memory ($avail available)"
+                break
+            }
+            foreach ($p in $lmProblems) { Write-Bad $p }
+            $outcome = 'FAILED-CHECK'; $notes += $lmProblems
+            $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+            break
+        }
 
         # 3. write-check by the runner (kap. 6.1 C) - must pass before the next process starts
         $problems = @()
@@ -1279,6 +1453,7 @@ Do the completion check and archive (SUCCESS).
 
         # 5. test gate: once the change is archived, the runner runs testCommand itself
         $tests = $null
+        $memStop = $null
         if ($problems.Count -eq 0 -and $kind -in @('SUCCESS', 'NONCRITICAL')) {
             Write-Host '    tests ...' -NoNewline
             # the change is archived now, so its acceptance tests are part of the regression set
@@ -1288,6 +1463,9 @@ Do the completion check and archive (SUCCESS).
             $claimText = '-'
             if ($w.Claimed) { $claimText = $w.Claimed }
             if ($tests.Dirty) { $problems += "testCommand left the working tree dirty:`n$($tests.Dirty)" }
+            elseif (-not $tests.Passed -and $tests.Memory) {
+                $memStop = "tests ran out of memory ($($tests.Memory)); close other programs and run again; output: $(Get-RelPath $tests.Log)"
+            }
             elseif ($kind -eq 'SUCCESS' -and -not $tests.Passed) {
                 $problems += "tests fail after $change was archived ($($tests.Label), agent claimed $claimText); output: $(Get-RelPath $tests.Log)"
             }
@@ -1326,6 +1504,10 @@ Do the completion check and archive (SUCCESS).
                             $groupHistory[$gid] += 'green'
                             $repairGroup = $null; $repairCount = 0; $groupStartHead = Get-Head
                             Write-Ok "group $gid green"
+                        } elseif ($gt.Memory) {
+                            # no repair run: the tests could not run, the code is not to blame
+                            $groupHistory[$gid] += 'out of memory'
+                            $memStop = "tests after group $gid ran out of memory ($($gt.Memory)); close other programs and run again; output: $(Get-RelPath $gt.Log)"
                         } else {
                             $groupHistory[$gid] += 'red'
                             if ($mode -eq 'repair') { $repairCount++ }
@@ -1349,6 +1531,11 @@ Do the completion check and archive (SUCCESS).
             foreach ($p in $problems) { Write-Bad $p }
             $outcome = 'FAILED-CHECK'; $notes += $problems
             $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+        } elseif ($memStop) {
+            Write-Bad $memStop
+            $outcome = 'STOPPED'; $notes += $memStop
+            $stopReason = "change ${change}: $memStop"
+            $script:MemoryStop = "low memory ($(Format-GB (Get-AvailableMB)) available)"
         } elseif ($groupStop) {
             Write-Bad $groupStop
             $outcome = 'STOPPED'; $notes += $groupStop
@@ -1425,6 +1612,7 @@ $runFacts = "{0} $([char]0x00B7) {1}" -f (Format-Usd $totalCost), (Format-Minute
 $reportHint = "report: $StateDirName/auto-mode-report.md"
 if ($stopReason) {
     $why = ($stopReason -replace '\s+', ' ').Trim()
+    if ($script:MemoryStop) { $why = $script:MemoryStop }
     if ($why.Length -gt 200) { $why = $why.Substring(0, 197) + '...' }
     Send-Notify ("{0} auto-mode stopped at {1}: {2} $([char]0x00B7) {3}; {4}" -f (Get-Emoji 0x1F6D1), $change, $why, $runFacts, $reportHint) ([int]$cfg.notifyStopPriority)
 } else {
@@ -1526,8 +1714,14 @@ Exit-Runner 0 $null
             runDir = (Get-RelPath $runDir); reason = $script:EndReason
         }
         try { Write-TextFile $script:LastRunPath ($last | ConvertTo-Json) } catch { }
-        Exit-RunState
+        # a crash with uncommitted files keeps running.json: the next start sees an interrupted
+        # run and stashes the leftovers instead of refusing a dirty tree
+        $keep = $false
+        if ($script:Crashed) { try { $keep = [bool](Get-DirtyStatus) } catch { } }
+        if ($keep) { try { $script:RunGuard.Dispose() } catch { } }
+        else { Exit-RunState }
     }
+    if ($script:KeptAwake) { try { [void][OsaJob]::KeepAwake($false) } catch { } }
     if ($script:Transcript) { try { Stop-Transcript | Out-Null } catch { } }
     Pop-Location
 }

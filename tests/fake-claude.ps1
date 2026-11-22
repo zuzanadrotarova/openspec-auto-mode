@@ -55,7 +55,7 @@ function Group-Worker([string]$RedGroup, [bool]$Repairs) {
     $u = Unit
     if ($u -eq 'final') { Archive; Result 'SUCCESS' }
     if ($u -like 'repair:*') {
-        if ($Repairs) { Remove-Item 'broken.txt' -ErrorAction SilentlyContinue; if ($script:LateImpl) { Mark-Impl -Force }; Commit "$change repair" }
+        if ($Repairs) { Remove-Item $BreakFile -ErrorAction SilentlyContinue; if ($script:LateImpl) { Mark-Impl -Force }; Commit "$change repair" }
         Result 'CONTINUE'
     }
     if ($u -like 'group:*') {
@@ -74,7 +74,12 @@ function Result([string]$Kind) {
     exit 0
 }
 
-function Break-Tests { Set-Content 'broken.txt' 'the project test script fails while this file exists' }
+# FAKE_BREAK_FILE picks how the project tests break (see run-tests.cmd in tests/run-tests.ps1):
+# broken.txt = red, oom.txt = red with an out-of-memory line, oom-green.txt = green with such a
+# line, slow.txt = hang until the test timeout.
+$BreakFile = 'broken.txt'
+if ($env:FAKE_BREAK_FILE) { $BreakFile = $env:FAKE_BREAK_FILE }
+function Break-Tests { Set-Content $BreakFile 'the project test script reacts to this file' }
 function New-Fix {
     & $os new change "fix-$change" --schema spec-driven 2>&1 | Out-Null
     Add-Content "openspec/changes/fix-$change/.openspec.yaml" 'skip_specs: true'
@@ -127,6 +132,15 @@ switch ($mode) {
         $g = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 600') -WindowStyle Hidden -PassThru
         if ($env:FAKE_PID_FILE) { Set-Content $env:FAKE_PID_FILE "$PID $($g.Id)" }
         Start-Sleep 600; exit 6
+    }
+    'lowmem' {
+        # a build ran out of memory: uncommitted half-done work that makes the tests red, no commit
+        Tick 1
+        Set-Content 'broken.txt' 'half-done work'
+        $o = @{ type = 'result'; subtype = 'success'; is_error = $false; num_turns = 3; total_cost_usd = 0.01
+            result = "AUTO-MODE-RESULT: LOW-MEMORY`nException in thread main java.lang.OutOfMemoryError: Java heap space" }
+        Write-Output ($o | ConvertTo-Json -Compress)
+        exit 0
     }
     'slow' { Start-Sleep 20; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'noop' { Result 'CONTINUE' }

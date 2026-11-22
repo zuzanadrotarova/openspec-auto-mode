@@ -32,6 +32,14 @@ Your context window is limited and a crowded context leads to mistakes and hallu
 - Keep command output short: use quiet/summary flags for tests and builds, and read only the failures.
 - **Task budget.** Complete at most the given number of unchecked tasks in this run. Stop earlier at a clean point when the run is getting long (many files read, long outputs, repeated failed attempts). Then end the run with `CONTINUE`. The next run continues from `tasks.md` with a fresh context. Stopping early is always better than working on with a crowded context.
 
+## Out of memory
+
+The user message may list memory error patterns (e.g. `java.lang.OutOfMemoryError`). If a build or test command you run fails with output containing one of them, the machine is short of memory; it says nothing about your code.
+
+- Do not try to fix code or tests and **do not commit**: the tests could not run, so nobody knows whether the state is green. Leave the files as they are (the runner stashes them).
+- End immediately with `AUTO-MODE-RESULT: LOW-MEMORY`, and on the next line the output line that matched.
+- Never change memory or JVM settings (`org.gradle.jvmargs`, `-Xmx`, `kotlin.daemon.jvmargs`, memory keys in `gradle.properties`, emulator settings) unless a task of the change asks for it.
+
 ## Units of work
 
 The runner splits a change into task groups (the `## N. …` sections of `tasks.md`) and runs the tests itself after every group. The user message says which unit this run is:
@@ -105,7 +113,7 @@ When the user message names acceptance tests, they were written before this chan
 
 7. **Finish** with a final message whose first line is exactly one of:
    `AUTO-MODE-RESULT: SUCCESS`, `AUTO-MODE-RESULT: NONCRITICAL`, `AUTO-MODE-RESULT: BLOCKED`, `AUTO-MODE-RESULT: CONTINUE`,
-   followed by at most 5 lines of summary. The runner does not trust this message; it verifies the files.
+   (or `AUTO-MODE-RESULT: LOW-MEMORY`, see "Out of memory"), followed by at most 5 lines of summary. The runner does not trust this message; it verifies the files.
 
 ## Fix changes
 
