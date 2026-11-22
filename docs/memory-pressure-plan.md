@@ -1,7 +1,7 @@
 # Robust runs under memory pressure: spec
 
-Status: draft, reviewed twice (risks, open questions and second review settled 2026-11-22), nothing
-implemented.
+Status: reviewed twice (risks, open questions and second review settled 2026-11-22); step 1
+implemented 2026-11-22 (tests T30–T35), steps 2–5 open.
 Date: 2026-11-22
 
 ## 1. Problem (trial of 2026-11-21)
@@ -147,8 +147,11 @@ If the previous run was interrupted **and** the working tree is dirty:
 
 1. The runner prints the list of files (`git status --porcelain`) to the console and the report.
 2. ```
-   git stash push --include-untracked -m "openspec-auto: leftovers of interrupted run <stamp> (<change> run <n>)" -- . ":!.openspec-auto"
+   git stash push --include-untracked -m "openspec-auto: leftovers of interrupted run <stamp> (<change> run <n>)"
    ```
+   Without a pathspec (found in step 1): `-- . ":!.openspec-auto"` makes `git stash` save the
+   stash and then fail halfway, leaving the files staged, because the pathspec names an ignored
+   folder. Success is judged by a new `refs/stash` entry and a clean tree, not by the exit code.
 
 - Automatic, without asking (decision 2, section 15): a run without supervision has nobody to ask,
   and nothing is lost.
@@ -156,9 +159,10 @@ If the previous run was interrupted **and** the working tree is dirty:
   interrupted run is still an error (it is the user's work), exactly as now.
 - Ignored files are not touched (no `--all`).
 - `.openspec-auto/` is already in `.git/info/exclude` (written at every start before the clean-tree
-  check), so it is never part of `git status` or a stash. The pathspec `:!.openspec-auto` is a
-  safety net for a project whose `.gitignore` re-includes it (`.gitignore` wins over
-  `info/exclude`); the clean-tree check uses the same pathspec.
+  check), so it is never part of `git status` or a stash. Safety net for a project whose
+  `.gitignore` re-includes it (`.gitignore` wins over `info/exclude`): the clean-tree check uses
+  the pathspec `:!.openspec-auto`, and the stash is refused (exit 2) when
+  `git check-ignore .openspec-auto/running.json` says the folder is not ignored.
 - The stash is made on whatever branch is checked out (normally `auto/<change>`); the message and
   the report name that branch. The run then resumes as today and redoes the unfinished group.
 - The message goes into the console, the report warnings and the E1 notification

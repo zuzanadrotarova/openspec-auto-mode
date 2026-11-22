@@ -245,8 +245,12 @@ function Get-CurrentBranch {
 
 function Get-Head { (Invoke-Git @('rev-parse', 'HEAD')).Out }
 
-function Get-DirtyStatus {
-    $r = Invoke-Git @('status', '--porcelain')
+# The state folder is excluded through .git/info/exclude; the pathspec is a safety net for a
+# .gitignore that re-includes it (docs/memory-pressure-plan.md 5.2).
+function Get-DirtyStatus([switch]$AllFiles) {
+    $a = @('status', '--porcelain')
+    if ($AllFiles) { $a += '-uall' }
+    $r = Invoke-Git ($a + @('--', '.', ":!$StateDirName"))
     if ($r.Code -ne 0) { return "git status failed: $($r.Out)" }
     $r.Out
 }
@@ -306,11 +310,19 @@ function Add-GitExclude {
     $gitDir = (Invoke-Git @('rev-parse', '--absolute-git-dir')).Out
     $exclude = Join-Path $gitDir 'info/exclude'
     $line = "/$StateDirName/"
-    $content = ''
-    if (Test-Path $exclude) { $content = [System.IO.File]::ReadAllText($exclude) }
-    if ($content -notmatch [regex]::Escape($line)) {
-        if ($content -and -not $content.EndsWith("`n")) { $content += "`n" }
-        Write-TextFile $exclude ($content + $line + "`n")
+    # retried: two starts at the same moment may write the file at once
+    for ($i = 1; ; $i++) {
+        try {
+            $content = ''
+            if (Test-Path $exclude) { $content = [System.IO.File]::ReadAllText($exclude) }
+            if ($content -match [regex]::Escape($line)) { return }
+            if ($content -and -not $content.EndsWith("`n")) { $content += "`n" }
+            Write-TextFile $exclude ($content + $line + "`n")
+            return
+        } catch {
+            if ($i -ge 5) { throw }
+            Start-Sleep -Milliseconds (200 * $i)
+        }
     }
 }
 
@@ -415,6 +427,8 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
 
     $started = Get-Date
     $proc = [System.Diagnostics.Process]::Start($psi)
+    Add-ToJob $proc
+    Set-RunChild $proc
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
     if ($StdIn) { $proc.StandardInput.Write($StdIn) }
@@ -431,6 +445,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
         if (-not $proc.HasExited) {
             if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
         }
+        Set-RunChild $null
     }
     $null = $outTask.Wait(15000); $null = $errTask.Wait(15000)
     $stdout = ''; $stderr = ''
@@ -615,6 +630,192 @@ Process this change according to your OpenSpec auto-mode instructions.
     $info
 }
 
+# ---------------------------------------------------------------- run state (docs/memory-pressure-plan.md 4.2, 4.3, 5)
+
+# Job object with KILL_ON_JOB_CLOSE: every child (worker, tests, notify) and its own children end
+# when the runner process ends in any way, so no worker keeps editing after a killed runner.
+$script:JobHandle = [IntPtr]::Zero
+$script:JobWarned = $false
+function Initialize-Job {
+    if (-not $IsWin) { return }
+    try {
+        if (-not ('OsaJob' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class OsaJob {
+    [StructLayout(LayoutKind.Sequential)] struct Basic {
+        public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Io { public ulong R, W, O, RB, WB, OB; }
+    [StructLayout(LayoutKind.Sequential)] struct Extended {
+        public Basic BasicLimits; public Io IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref Extended info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    public static IntPtr Create() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception();
+        Extended info = new Extended();
+        info.BasicLimits.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if (!SetInformationJobObject(job, 9, ref info, (uint)Marshal.SizeOf(typeof(Extended)))) throw new Win32Exception();
+        return job;
+    }
+    public static void Assign(IntPtr job, IntPtr process) {
+        if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
+    }
+}
+'@
+        }
+        $script:JobHandle = [OsaJob]::Create()
+    } catch {
+        $w = "child processes are not bound to the runner (job object: $($_.Exception.Message)); after a killed runner check that no claude process is left"
+        $script:warnings += $w
+        Write-Warn $w
+    }
+}
+
+function Add-ToJob([System.Diagnostics.Process]$Proc) {
+    if ($script:JobHandle -eq [IntPtr]::Zero) { return }
+    try { [OsaJob]::Assign($script:JobHandle, $Proc.Handle) }
+    catch {
+        if ($Proc.HasExited -or $script:JobWarned) { return }
+        $script:JobWarned = $true
+        $w = "a child process could not be bound to the runner (job object: $($_.Exception.Message))"
+        $script:warnings += $w
+        Write-Warn $w
+    }
+}
+
+function Get-ProcessStart($Proc) {
+    try { return $Proc.StartTime.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
+
+# A process counts as alive only when the PID exists and its start time matches (PIDs are reused).
+function Test-ProcessAlive($Id, $Start) {
+    if (-not $Id) { return $false }
+    $p = Get-Process -Id ([int]$Id) -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    if (-not $Start) { return $true }
+    try { $actual = $p.StartTime.ToUniversalTime() } catch { return $false }
+    if ($Start -is [datetime]) { $expected = $Start.ToUniversalTime() }
+    else {
+        $expected = [datetime]::Parse([string]$Start, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    }
+    [math]::Abs(($actual - $expected).TotalSeconds) -lt 2
+}
+
+# running.json: exists while a run is going; holds what was running when a run died.
+$script:RunStatePath = $null      # set once this runner owns running.json
+$script:RunState = $null
+$script:RunGuard = $null          # open handle without delete sharing: nobody can rename the file away
+function Write-RunState {
+    if (-not $script:RunStatePath) { return }
+    try { Write-TextFile $script:RunStatePath ($script:RunState | ConvertTo-Json) } catch { }
+}
+function Set-RunState([hashtable]$Values) {
+    if (-not $script:RunStatePath) { return }
+    foreach ($k in $Values.Keys) { $script:RunState[$k] = $Values[$k] }
+    Write-RunState
+}
+function Set-RunChild($Proc) {
+    if (-not $script:RunStatePath) { return }
+    if ($Proc) { Set-RunState @{ childPid = $Proc.Id; childStart = (Get-ProcessStart $Proc) } }
+    else { Set-RunState @{ childPid = $null; childStart = $null } }
+}
+
+function Read-RunRecord([string]$Path) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $text = [System.IO.File]::ReadAllText($Path)
+            if ($text.Trim()) { return ($text | ConvertFrom-Json) }
+        } catch { }
+        Start-Sleep -Milliseconds 300
+    }
+    [pscustomobject]@{ pid = $null; processStart = $null; childPid = $null; childStart = $null; runDir = $null; change = $null; run = $null; startedAt = $null }
+}
+
+# Claims running.json for this runner. Returns $null or the reason why another start holds it.
+function Enter-RunState([string]$Path, [hashtable]$State, $Stale) {
+    if ($Stale -and (Test-Path -LiteralPath $Path)) {
+        # move the record of the interrupted run into its own log folder
+        $now = Read-RunRecord $Path
+        if ([string]$now.pid -eq [string]$Stale.pid -and [string]$now.processStart -eq [string]$Stale.processStart) {
+            $dest = Join-Path (Split-Path -Parent $Path) 'running.stale.json'
+            if ($Stale.runDir) {
+                $d = Join-Path $Project ([string]$Stale.runDir)
+                if (Test-Path -LiteralPath $d) { $dest = Join-Path $d 'running.interrupted.json' }
+            }
+            try { Move-Item -LiteralPath $Path -Destination $dest -Force } catch { }
+        }
+    }
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $fs.Close()
+    } catch {
+        $other = Read-RunRecord $Path
+        $since = ''
+        if ($other.startedAt) { try { $since = ', since ' + ([datetime]$other.startedAt).ToString('HH:mm') } catch { } }
+        return "auto-mode is already running in this project (PID $($other.pid)$since)"
+    }
+    $script:RunGuard = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $script:RunStatePath = $Path
+    $script:RunState = [ordered]@{}
+    foreach ($k in @('pid', 'processStart', 'childPid', 'childStart', 'runDir', 'startedAt', 'change', 'run', 'consoleLog')) { $script:RunState[$k] = $State[$k] }
+    Write-RunState
+    return $null
+}
+
+function Exit-RunState {
+    if (-not $script:RunStatePath) { return }
+    try { $script:RunGuard.Dispose() } catch { }
+    Remove-Item -LiteralPath $script:RunStatePath -Force -ErrorAction SilentlyContinue
+    $script:RunStatePath = $null
+}
+
+# Leftovers of a run that ended without committing go into a stash, never reset or cleaned.
+function Save-Leftovers([string]$Message) {
+    $files = @(((Get-DirtyStatus -AllFiles) -split "`n") | Where-Object { $_.Trim() })
+    $branchName = Get-CurrentBranch
+    Write-Warn "uncommitted files ($($files.Count)) on branch ${branchName}:"
+    foreach ($f in $files) { Write-Host "      $f" }
+    # No pathspec: an exclude pathspec naming the ignored state folder makes git stash fail halfway
+    # (stash saved, files left staged). --include-untracked never takes ignored files, so the state
+    # folder stays out as long as it is ignored; otherwise refuse instead of stashing it.
+    if ((Invoke-Git @('check-ignore', '-q', "$StateDirName/running.json")).Code -ne 0) {
+        throw "$StateDirName/ is not ignored by git (a .gitignore re-includes it?); leftovers not stashed. Remove that rule and run again."
+    }
+    $before = (Invoke-Git @('rev-parse', '-q', '--verify', 'refs/stash')).Out
+    $r = Invoke-Git @('stash', 'push', '--include-untracked', '-m', $Message)
+    $after = (Invoke-Git @('rev-parse', '-q', '--verify', 'refs/stash')).Out
+    if (-not $after -or $after -eq $before) { throw "git stash failed:`n$($r.Out)" }
+    $left = Get-DirtyStatus
+    if ($left) { throw "git stash left files in the working tree:`n$left`n$($r.Out)" }
+    [pscustomobject]@{ Ref = 'stash@{0}'; Count = $files.Count; Files = $files; Branch = $branchName }
+}
+
+function Get-LeftoverStashes {
+    $r = Invoke-Git @('stash', 'list', '--format=%gd %s')
+    if ($r.Code -ne 0 -or -not $r.Out) { return @() }
+    @(($r.Out -split "`n") | Where-Object { $_ -match 'openspec-auto: leftovers' })
+}
+
+$script:LastRunPath = $null       # set when this start should leave last-run.json
+$script:EndCode = $null
+$script:EndReason = $null
+$script:Crashed = $false
+function Exit-Runner([int]$Code, [string]$Reason) {
+    $script:EndCode = $Code
+    $script:EndReason = $Reason
+    exit $Code
+}
+
 # ---------------------------------------------------------------- start
 
 if (-not (Test-Path $Project)) { throw "Project path not found: $Project" }
@@ -694,6 +895,19 @@ if ($SetupAcceptanceSchema) {
 
 # ---------------------------------------------------------------- start checks (kap. 5.2)
 
+$warnings = @()
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+for ($n = 2; Test-Path (Join-Path $Project "$StateDirName/runs/$stamp"); $n++) { $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss') + "-$n" }
+$runDir = Join-Path $Project "$StateDirName/runs/$stamp"
+$consoleLog = Join-Path $runDir 'console.txt'
+$runningPath = Join-Path $Project "$StateDirName/running.json"
+$script:Transcript = $false
+if (-not $DryRun) {
+    New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+    try { Start-Transcript -LiteralPath $consoleLog | Out-Null; $script:Transcript = $true } catch { }
+}
+Initialize-Job
+
 Write-Step "OpenSpec auto-mode in $Project"
 $errors = @()
 if (-not (Get-Command $OpenSpecExe -ErrorAction SilentlyContinue)) { $errors += 'openspec CLI not found' }
@@ -722,8 +936,57 @@ $baseBranch = Get-CurrentBranch
 if (-not $baseBranch) { $errors += 'HEAD is detached; check out a branch first' }
 if ((Invoke-Git @('config', 'user.email')).Out -eq '') { $errors += 'git user.email is not set' }
 Add-GitExclude
+
+# running.json of an earlier start (5.1, 5.3): still running, or interrupted
+$interrupted = $null
+$runActive = $false
+if (Test-Path -LiteralPath $runningPath) {
+    $prev = Read-RunRecord $runningPath
+    $busy = $null
+    if (Test-ProcessAlive $prev.pid $prev.processStart) {
+        $since = ''
+        if ($prev.startedAt) { try { $since = ', since ' + ([datetime]$prev.startedAt).ToString('HH:mm') } catch { } }
+        $busy = "auto-mode is already running in this project (PID $($prev.pid)$since)"
+    } elseif (Test-ProcessAlive $prev.childPid $prev.childStart) {
+        $busy = "a worker of the previous run is still running (PID $($prev.childPid)); end it first"
+    }
+    if ($busy -and $DryRun) { $runActive = $true; $warnings += $busy; Write-Warn $busy }
+    elseif ($busy) { Write-Bad $busy; Exit-Runner 2 $busy }
+    else {
+        $interrupted = $prev
+        $prevStamp = '?'
+        if ($prev.runDir) { $prevStamp = Split-Path -Leaf ([string]$prev.runDir) }
+        $where = 'before the first change'
+        if ($prev.change) { $where = "during $($prev.change) run $($prev.run)" }
+        $interrupted | Add-Member -NotePropertyName Label -NotePropertyValue "$prevStamp ($(if ($prev.change) { "$($prev.change) run $($prev.run)" } else { 'start' }))" -Force
+        $w = "previous run $prevStamp was interrupted $where"
+        $warnings += $w; Write-Warn $w
+    }
+}
+if (-not $DryRun) {
+    $claim = Enter-RunState $runningPath @{
+        pid = $PID; processStart = (Get-ProcessStart (Get-Process -Id $PID)); runDir = (Get-RelPath $runDir)
+        startedAt = (Get-Date).ToString('o'); consoleLog = (Get-RelPath $consoleLog)
+    } $interrupted
+    if ($claim) { Write-Bad $claim; Exit-Runner 2 $claim }
+    # only the start that owns running.json leaves last-run.json
+    $script:LastRunPath = Join-Path $Project "$StateDirName/last-run.json"
+}
+
+$stashInfo = $null
 $dirty = Get-DirtyStatus
-if ($dirty) { $errors += "working tree is not clean:`n$dirty" }
+if ($dirty) {
+    if ($runActive) { Write-Warn 'working tree is not clean (the running run is working in it)' }
+    elseif ($interrupted -and $DryRun) {
+        $w = "leftovers of the interrupted run are stashed at the start (git stash):`n$dirty"
+        $warnings += $w; Write-Warn $w
+    } elseif ($interrupted) {
+        try { $stashInfo = Save-Leftovers "openspec-auto: leftovers of interrupted run $($interrupted.Label)" }
+        catch { Write-Bad $_.Exception.Message; Exit-Runner 2 $_.Exception.Message }
+        $w = "leftovers of the interrupted run stashed on branch $($stashInfo.Branch) ($($stashInfo.Ref), $($stashInfo.Count) files: $($stashInfo.Files -join ', ')); see them with git stash show -p $($stashInfo.Ref)"
+        $warnings += $w; Write-Warn $w
+    } else { $errors += "working tree is not clean:`n$dirty" }
+}
 
 $numbered = @()
 $fixCandidate = $null
@@ -765,7 +1028,7 @@ if ($errors.Count -eq 0) {
 }
 if ($errors.Count -gt 0) {
     foreach ($e in $errors) { Write-Bad $e }
-    exit 2
+    Exit-Runner 2 ($errors -join '; ')
 }
 
 $resumed = ($baseBranch -like 'auto/*') -or ((Invoke-Git @('branch', '--list', 'auto/*')).Out -ne '')
@@ -775,7 +1038,12 @@ Write-Ok "base branch: $baseBranch$(if ($resumed) { ' (resuming)' })"
 Write-Host '    baseline tests ...' -NoNewline
 $baselineLog = Join-Path $Project "$StateDirName/baseline-tests.txt"
 $baselineAccept = @(Get-DoneAcceptance)
-$baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
+if ($runActive) {
+    # dry run while a run is going: do not run the tests in the tree the worker is using
+    $baseline = [pscustomobject]@{ Passed = $true; Label = 'skipped (a run is in progress)'; Minutes = 0; Dirty = ''; Tail = ''; Log = $baselineLog }
+} else {
+    $baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
+}
 Write-Host (" {0}, {1} min" -f $baseline.Label, $baseline.Minutes)
 if ($baselineAccept.Count) { Write-Ok "acceptance tests of archived changes included: $($baselineAccept -join ', ')" }
 $resumeFix = $null
@@ -784,7 +1052,7 @@ if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
 }
 if ($baseline.Dirty) {
     Write-Bad "testCommand leaves the working tree dirty:`n$($baseline.Dirty)`n    add these files to .gitignore (or clean them up) and run again"
-    exit 2
+    Exit-Runner 2 'testCommand leaves the working tree dirty'
 }
 if (-not $baseline.Passed) {
     if ($fixCandidate -and $cfg.fixMode -eq 'immediate') {
@@ -792,28 +1060,24 @@ if (-not $baseline.Passed) {
         Write-Warn "baseline tests fail; resuming $resumeFix first"
     } else {
         Write-Bad "baseline tests fail: $($baseline.Label); auto-mode needs a green start. Output: $StateDirName/baseline-tests.txt"
-        exit 2
+        Exit-Runner 2 "baseline tests fail: $($baseline.Label)"
     }
 } else {
     Write-Ok 'baseline tests green'
 }
-if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered changes (NN-name) to process'; exit 2 }
+if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered changes (NN-name) to process'; Exit-Runner 2 'no active numbered changes (NN-name) to process' }
 
 $planNames = @(@($resumeFix) + @($numbered | ForEach-Object { $_.name }) | Where-Object { $_ })
 Write-Ok ("plan: " + ($planNames -join ' -> '))
 if ($NotifyCandidate) { Write-Ok "notifications: $NotifyCandidate (project name '$($cfg.notifyProjectName)')" }
 if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$runDir = Join-Path $Project "$StateDirName/runs/$stamp"
-New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 $settingsPath = Join-Path $runDir 'worker-settings.json'
 $agentsPath = Join-Path $runDir 'worker-agents.json'
 $acceptChanges = @(@($baselineAccept) + @($numbered | ForEach-Object { $_.name } | Where-Object { Test-HasAcceptance $_ }))
 New-WorkerSettings $cfg $settingsPath $acceptChanges
 New-WorkerAgents $agentsPath
 
-$warnings = @()
 $hookWarning = Install-PrePushHook
 if ($hookWarning) { $warnings += $hookWarning; Write-Warn $hookWarning } else { Write-Ok 'pre-push guard installed' }
 $env:OPENSPEC_AUTO_MODE = '1'
@@ -827,7 +1091,9 @@ $stopReason = $null
 
 $script:NotifyPath = $NotifyCandidate
 $planCount = @($numbered).Count
-Send-Notify ("{0} auto-mode started: {1} change{2}, first {3}" -f (Get-Emoji 0x25B6), $planNames.Count, $(if ($planNames.Count -ne 1) { 's' }), $planNames[0]) 0
+$startExtra = ''
+if ($stashInfo) { $startExtra = " $([char]0x00B7) leftovers of the interrupted run stashed ($($stashInfo.Ref), $($stashInfo.Count) file$(if ($stashInfo.Count -ne 1) { 's' }))" }
+Send-Notify (("{0} auto-mode started: {1} change{2}, first {3}" -f (Get-Emoji 0x25B6), $planNames.Count, $(if ($planNames.Count -ne 1) { 's' }), $planNames[0]) + $startExtra) 0
 
 function New-QueueItem([string]$Name, [bool]$IsFix, [string]$Parent, [string]$Branch, [int]$MaxRuns, [string]$Evidence, [string]$EvidenceLabel) {
     [pscustomobject]@{
@@ -851,6 +1117,8 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
     $change = $item.Name
     $branch = $item.Branch
     $changeStart = Get-Date
+    if ($env:OSA_TEST_THROW -eq 'loop') { throw 'test crash (OSA_TEST_THROW)' }
+    Set-RunState @{ change = $change; run = 0 }
     Write-Step "$(if ($item.IsFix) { 'Fix' } else { 'Change' }) $change"
 
     # 1. branch (kap. 5 bod 1, kap. 5.2); a fix runs on the branch of the change it fixes
@@ -892,6 +1160,7 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
 
     while (-not $outcome) {
         $run++
+        Set-RunState @{ run = $run }
         if ($run -gt $item.MaxRuns) {
             $outcome = 'STOPPED'
             if ($item.IsFix) { $notes += "tests still fail after $($item.MaxRuns) runs (maxRunsPerFix); the fix plan is probably wrong" }
@@ -1211,7 +1480,16 @@ if ($warnings.Count) {
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('## Warnings')
     [void]$sb.AppendLine()
-    foreach ($w in $warnings) { [void]$sb.AppendLine("- $w") }
+    foreach ($w in $warnings) { [void]$sb.AppendLine("- $($w -replace "`r?`n", ' ')") }
+}
+$leftoverStashes = @(Get-LeftoverStashes)
+if ($leftoverStashes.Count) {
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('## Stashed leftovers')
+    [void]$sb.AppendLine()
+    foreach ($s in $leftoverStashes) { [void]$sb.AppendLine("- ``$s``") }
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('Look at one with `git stash show -p stash@{n}`, drop it with `git stash drop stash@{n}`. Auto-mode never drops a stash.')
 }
 [void]$sb.AppendLine()
 [void]$sb.AppendLine("Logs: ``$StateDirName/runs/$stamp/``")
@@ -1221,10 +1499,12 @@ Write-TextFile (Join-Path $Project "$StateDirName/auto-mode-report.md") $report
 Write-TextFile (Join-Path $runDir 'auto-mode-report.md') $report
 Write-Host ''
 Write-Host $report
-if ($stopReason) { exit 1 }
-exit 0
+if ($stopReason) { Exit-Runner 1 $stopReason }
+Exit-Runner 0 $null
 
 } catch {
+    $script:Crashed = $true
+    $script:EndReason = $_.Exception.Message
     # an unexpected error after the start message: tell the user it is not running any more
     if ($script:NotifyPath) {
         $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
@@ -1234,5 +1514,20 @@ exit 0
     throw
 } finally {
     Remove-Item Env:OPENSPEC_AUTO_MODE -ErrorAction SilentlyContinue
+    # Ctrl+C (no end code, no crash) keeps running.json, so the next start sees the interruption
+    if ($script:LastRunPath -and ($script:Crashed -or $null -ne $script:EndCode)) {
+        $state = 'crashed'; $code = 1
+        if (-not $script:Crashed) {
+            $code = $script:EndCode
+            $state = @{ 0 = 'finished'; 1 = 'stopped'; 2 = 'failed-start' }[[int]$code]
+        }
+        $last = [ordered]@{
+            exitCode = $code; state = $state; endedAt = (Get-Date).ToString('o')
+            runDir = (Get-RelPath $runDir); reason = $script:EndReason
+        }
+        try { Write-TextFile $script:LastRunPath ($last | ConvertTo-Json) } catch { }
+        Exit-RunState
+    }
+    if ($script:Transcript) { try { Stop-Transcript | Out-Null } catch { } }
     Pop-Location
 }

@@ -120,6 +120,15 @@ switch ($mode) {
         Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
     }
     'dirty' { Tick 999; Result 'SUCCESS' }
+    'hang' {
+        # leaves uncommitted work, starts a long-sleeping grandchild and hangs (killed by the test)
+        Tick 1
+        Set-Content 'leftover.txt' 'work in progress'
+        $g = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 600') -WindowStyle Hidden -PassThru
+        if ($env:FAKE_PID_FILE) { Set-Content $env:FAKE_PID_FILE "$PID $($g.Id)" }
+        Start-Sleep 600; exit 6
+    }
+    'slow' { Start-Sleep 20; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'noop' { Result 'CONTINUE' }
     'crash' { exit 3 }
     default { Write-Output "unknown mode for $change"; exit 4 }

@@ -59,9 +59,9 @@ function New-Project([string]$Name, [string[]]$Changes, [string]$Config = $Defau
     $p
 }
 
-function Invoke-Runner([string]$P, [string]$Plan) {
+function Invoke-Runner([string]$P, [string]$Plan, [string[]]$More = @()) {
     $env:FAKE_PLAN = $Plan
-    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner -Project $P -ClaudeCommand $Fake 2>&1 | ForEach-Object { "$_" }
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner -Project $P -ClaudeCommand $Fake @More 2>&1 | ForEach-Object { "$_" }
     $code = $LASTEXITCODE
     Set-Content (Join-Path $WorkDir ((Split-Path -Leaf $P) + '.log')) $out
     [pscustomobject]@{ Code = $code; Out = ($out -join "`n") }
@@ -151,7 +151,7 @@ Check ($r.Out -match '02-b is not ready.*missing artifacts: design') 'missing de
 Check ($r.Out -match '03-c is not ready.*validate failed') 'invalid spec delta reported'
 Check ($r.Out -match '04-d is not ready.*no tasks') 'empty tasks.md reported'
 Check ($r.Out -notmatch '01-a is not ready') 'complete change not reported'
-Check (-not (Test-Path "$p/.openspec-auto/runs")) 'no agent run started'
+Check (-not (Test-Path "$p/.openspec-auto/runs/*/*.prompt.txt")) 'no agent run started'
 
 function Read-RunPrompt([string]$P, [string]$File) {
     $f = Get-ChildItem "$P/.openspec-auto/runs/*/$File" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -173,7 +173,7 @@ $p = New-Project 't9' @('01-a:1')
 Push-Location $p; Set-Content broken.txt 'x'; git add -A 2>&1 | Out-Null; git commit -q -m red 2>&1 | Out-Null; Pop-Location
 $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'baseline tests fail') 'red baseline refused (exit 2)'
-Check (-not (Test-Path "$p/.openspec-auto/runs")) 'no agent run started'
+Check (-not (Test-Path "$p/.openspec-auto/runs/*/*.prompt.txt")) 'no agent run started'
 Check (Test-Path "$p/.openspec-auto/baseline-tests.txt") 'baseline output saved'
 $p = New-Project 't9b' @('01-a:1') '{ "testCommand": "echo x> junk.out", "timeoutMinutes": 2 }'
 $r = Invoke-Runner $p '01-a=success'
@@ -512,6 +512,120 @@ $p = New-Project 't29i' @('01-a:1') (Notify-Config '"notifyScript": "missing\\no
 $r = Invoke-NotifyRunner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'notifyScript .* not found' -and $r.Lines.Count -eq 0) 'missing notifyScript refused at the start'
 Remove-Item Env:FAKE_NOTIFY_LOG -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------- memory pressure, step 1
+function Read-State([string]$P, [string]$Name) {
+    $f = "$P/.openspec-auto/$Name"
+    if (-not (Test-Path $f)) { return $null }
+    [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+}
+function Write-State([string]$P, [hashtable]$Values) {
+    New-Item -ItemType Directory -Force "$P/.openspec-auto" | Out-Null
+    [System.IO.File]::WriteAllText("$P/.openspec-auto/running.json", ([pscustomobject]$Values | ConvertTo-Json))
+}
+function Get-Start($Proc) { $Proc.StartTime.ToUniversalTime().ToString('o') }
+# PIDs on Windows are multiples of 4, so this one never exists
+$DeadPid = 999999
+
+Write-Host "T30 killed runner: its children end (job object), the next start stashes the leftovers"
+$p = New-Project 't30' @('01-a:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$pidFile = Join-Path $WorkDir 't30.pids'
+Remove-Item $pidFile -ErrorAction SilentlyContinue
+$env:FAKE_PID_FILE = $pidFile; $env:FAKE_PLAN = '01-a=hang'
+$runnerProc = Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Runner`"", '-Project', "`"$p`"", '-ClaudeCommand', "`"$Fake`"") -WindowStyle Hidden -PassThru
+for ($i = 0; $i -lt 120 -and -not (Test-Path $pidFile); $i++) { Start-Sleep -Milliseconds 500 }
+Remove-Item Env:FAKE_PID_FILE
+$st = Read-State $p 'running.json'
+Check ($st -and $st.pid -eq $runnerProc.Id -and $st.change -eq '01-a' -and $st.run -eq 1) 'running.json names the runner, the change and the run'
+Check ($st -and $st.childPid -and (Get-Process -Id $st.childPid -ErrorAction SilentlyContinue)) 'running.json names the living child process'
+Check ($st -and $st.consoleLog -and (Test-Path (Join-Path $p $st.consoleLog))) 'console.txt is written'
+$ids = @(); if (Test-Path $pidFile) { $ids = @((Get-Content $pidFile) -split ' ' | Where-Object { $_ }) }
+Check ($ids.Count -eq 2) 'fake worker started a grandchild'
+Stop-Process -Id $runnerProc.Id -Force
+Start-Sleep 3
+Check ($ids.Count -eq 2 -and -not (Get-Process -Id $ids[0] -ErrorAction SilentlyContinue)) 'worker ended with the killed runner'
+Check ($ids.Count -eq 2 -and -not (Get-Process -Id $ids[1] -ErrorAction SilentlyContinue)) 'grandchild ended with the killed runner'
+foreach ($id in $ids) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+Check ((Test-Path "$p/.openspec-auto/running.json") -and -not (Clean $p)) 'running.json and the leftovers stay after the kill'
+$r = Invoke-NotifyRunner $p '01-a=success'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'next start finishes the change'
+Check ($r.Out -match 'previous run \S+ was interrupted during 01-a run 1') 'interruption reported'
+Check ($r.Out -match 'leftover\.txt') 'leftover files listed'
+Check ((GitIn $p stash list --format=%s) -match 'openspec-auto: leftovers of interrupted run \S+ \(01-a run 1\)') 'stash with the message'
+$names = GitIn $p stash show --include-untracked --name-only 'stash@{0}'
+Check ($names -match 'leftover\.txt' -and $names -match 'tasks\.md') 'stash holds the leftover files'
+Check ($names -notmatch '\.openspec-auto') 'stash holds nothing of .openspec-auto/'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($rep -match 'was interrupted during 01-a' -and $rep -match '## Stashed leftovers') 'report: warning and stash list'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'started: 1 change, first 01-a .* leftovers of the interrupted run stashed \(stash@\{0\}, \d+ files\)$') 'E1 mentions the stash'
+$last = Read-State $p 'last-run.json'
+Check (-not (Test-Path "$p/.openspec-auto/running.json") -and $last.state -eq 'finished' -and $last.exitCode -eq 0) 'normal end: running.json removed, last-run.json finished'
+
+Write-Host "T31 interrupted run with a clean tree: warning only"
+$p = New-Project 't31' @('01-a:1')
+Write-State $p @{ pid = $DeadPid; processStart = '2026-01-01T00:00:00.0000000Z'; runDir = '.openspec-auto/runs/20260101-000000'; change = '01-a'; run = 2 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -match 'previous run 20260101-000000 was interrupted during 01-a run 2') 'interruption reported, run continues'
+Check ((GitIn $p stash list) -eq '') 'no stash'
+Check ((Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md") -match 'was interrupted') 'warning in the report'
+
+Write-Host "T32 dirty tree without an interrupted run: refused as before"
+$p = New-Project 't32' @('01-a:1')
+Set-Content "$p/mine.txt" 'my own work'
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'working tree is not clean') 'start refused'
+Check ((GitIn $p stash list) -eq '' -and (Test-Path "$p/mine.txt")) 'no stash, file untouched'
+Check ((Read-State $p 'last-run.json').state -eq 'failed-start' -and -not (Test-Path "$p/.openspec-auto/running.json")) 'last-run.json failed-start, no running.json'
+
+Write-Host "T33 a living runner or worker refuses the start"
+$p = New-Project 't33' @('01-a:1')
+$me = Get-Process -Id $PID
+Write-State $p @{ pid = $PID; processStart = (Get-Start $me); startedAt = (Get-Date).ToString('o'); change = '01-a'; run = 1 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match "already running in this project \(PID $PID, since") 'living runner: exit 2'
+Check ((Read-State $p 'running.json').pid -eq $PID -and -not (Test-Path "$p/.openspec-auto/last-run.json")) 'running.json of the living run untouched, no last-run.json'
+$r = Invoke-Runner $p '01-a=success' @('-DryRun')
+Check ($r.Code -eq 0 -and $r.Out -match 'already running' -and $r.Out -match 'skipped \(a run is in progress\)') 'dry run: warning only, no baseline tests'
+$sleeper = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 120') -WindowStyle Hidden -PassThru
+Write-State $p @{ pid = $DeadPid; processStart = '2026-01-01T00:00:00.0000000Z'; childPid = $sleeper.Id; childStart = (Get-Start $sleeper); change = '01-a'; run = 1 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match "a worker of the previous run is still running \(PID $($sleeper.Id)\)") 'living worker: exit 2'
+Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
+Write-State $p @{ pid = $PID; processStart = '2020-01-01T00:00:00.0000000Z'; change = '01-a'; run = 1 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -match 'was interrupted') 'reused PID (other start time) counts as interrupted'
+
+Write-Host "T34 two starts at the same moment: one runs, the other exits 2"
+$p = New-Project 't34' @('01-a:1')
+$env:FAKE_PLAN = '01-a=slow'
+$procs = foreach ($n in 1, 2) {
+    $log = Join-Path $WorkDir "t34.$n.log"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', "/d /c powershell -NoProfile -ExecutionPolicy Bypass -File `"$Runner`" -Project `"$p`" -ClaudeCommand `"$Fake`" > `"$log`" 2>&1"
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    [pscustomobject]@{ Proc = [System.Diagnostics.Process]::Start($psi); Log = $log }
+}
+foreach ($x in $procs) { [void]$x.Proc.WaitForExit(240000) }
+$codes = @($procs | ForEach-Object { $_.Proc.ExitCode } | Sort-Object)
+$loser = $procs | Where-Object { $_.Proc.ExitCode -eq 2 } | Select-Object -First 1
+Check (($codes -join ',') -eq '0,2') "exit codes 0 and 2 (got $($codes -join ','))"
+Check ($loser -and (Get-Content -Raw $loser.Log) -match 'already running') 'the second start says auto-mode is already running'
+Check ((Archived $p '01-a') -and (Count-Prompts $p '01-a') -eq 1) 'the change ran once'
+
+Write-Host "T35 last-run.json after stop and crash"
+$p = New-Project 't35' @('01-a:1', '02-b:1')
+$r = Invoke-Runner $p '01-a=blocked;02-b=success'
+$last = Read-State $p 'last-run.json'
+Check ($r.Code -eq 1 -and $last.state -eq 'stopped' -and $last.exitCode -eq 1 -and $last.reason -match 'blocked') 'stop: last-run.json stopped with the reason'
+Check (-not (Test-Path "$p/.openspec-auto/running.json")) 'stop: running.json removed'
+$p = New-Project 't35b' @('01-a:1')
+$env:OSA_TEST_THROW = 'loop'
+$r = Invoke-Runner $p '01-a=success'
+Remove-Item Env:OSA_TEST_THROW
+$last = Read-State $p 'last-run.json'
+Check ($r.Code -ne 0 -and $last.state -eq 'crashed' -and $last.reason -match 'test crash') 'crash: last-run.json crashed with the message'
+Check (-not (Test-Path "$p/.openspec-auto/running.json")) 'crash: running.json removed'
+$console = Get-ChildItem "$p/.openspec-auto/runs/*/console.txt" | Select-Object -First 1
+Check ($console -and (Get-Content -Raw $console.FullName) -match 'OpenSpec auto-mode in') 'console.txt holds the runner output'
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
