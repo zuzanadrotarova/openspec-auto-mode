@@ -201,7 +201,7 @@ Every run is a full Claude Code session on your account: with a Claude subscript
 
 ## Safety
 
-- The agent runs in `dontAsk` mode: it may only do what is on the allowlist (file tools, `openspec`, local git without branch operations, `testCommand` and `allowedCommands`).
+- The agent runs in `dontAsk` mode: it may only do what is on the allowlist (file tools, `openspec`, local git without branch operations, `testCommand` and `allowedCommands`). Skills are denied: global ones such as OpenSpec's `verify` are for interactive use only.
 - Push is blocked by three layers: deny rules, a `pre-push` hook active when `OPENSPEC_AUTO_MODE=1`, and a check of remote refs after every run.
 - The agent must not modify `.git/`, `.claude/`, `.openspec-auto/`, `openspec/auto-mode.json` or, with `acceptanceMode`, the acceptance folder (also checked with `git diff` after every run).
 - `claude -p` skips the folder trust dialog. Only run it in projects you trust.

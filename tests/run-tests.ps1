@@ -758,3 +758,4 @@ Check ($r.Code -eq 2 -and $r.Out -match 'already running' -and -not (Test-Path "
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green
+exit 0

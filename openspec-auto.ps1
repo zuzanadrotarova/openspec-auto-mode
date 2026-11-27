@@ -413,7 +413,9 @@ function New-WorkerSettings($Cfg, [string]$Path, [string[]]$AcceptChanges) {
         'Edit(./.git/**)', 'Write(./.git/**)', 'Edit(./.claude/**)', 'Write(./.claude/**)',
         "Edit(./$StateDirName/**)", "Write(./$StateDirName/**)",
         "Edit(./$ConfigRel)", "Write(./$ConfigRel)",
-        'WebFetch', 'WebSearch', 'PowerShell'
+        'WebFetch', 'WebSearch', 'PowerShell',
+        # global skills (e.g. OpenSpec's verify) are for interactive use; the worker uses the openspec CLI
+        'Skill'
     )
     # frozen acceptance tests; the runner's git diff check after every run is the real guard
     if ($Cfg.acceptanceMode -ne 'off') { $deny += @("Edit(./$($Cfg.acceptanceDir)/**)", "Write(./$($Cfg.acceptanceDir)/**)") }
