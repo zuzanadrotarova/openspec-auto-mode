@@ -103,6 +103,9 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `notifyProjectName` | project name in the notifications | project folder name |
 | `notifyStopPriority` | priority of the stop/crash message (Pushover: `1` high, `2` repeats until acknowledged) | 1 |
 | `notifyTimeoutSeconds` | time limit of one notification | 30 |
+| `minFreeMemoryGB` | warn at the start when less physical memory is available (with the 5 biggest processes, local only); also the limit for "a test timeout means out of memory"; `0` = off | 8 |
+| `preventSleep` | keep Windows awake during the run (`SetThreadExecutionState`); the screen may still turn off | `true` |
+| `memoryErrorPatterns` | substrings (case-insensitive) that mark a red test run, the runner's or the worker's, as out of memory; `[]` = off | `java.lang.OutOfMemoryError`, `GC overhead limit exceeded`, Gradle/Kotlin daemon died, JVM could not reserve memory |
 
 Recommended: `.gitattributes` with `* text=auto eol=lf` (otherwise line-ending conversions can make `git status` falsely dirty).
 
@@ -168,7 +171,17 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -DryRun                      # checks and plan only
 powershell -ExecutionPolicy Bypass -File ...openspec-auto.ps1 -SetupAcceptanceSchema       # acceptance artifact in the OpenSpec workflow
 powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\other\project
+powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Background                  # own window, outside the caller's process tree
 ```
+
+### Background runs and memory
+
+- **`-Background`** (used by the skill): the runner starts a copy of itself in a new minimized window and exits, so the copy has no living parent. Ending or closing the program that started it (Claude Code, the terminal) does not end the run. The launcher waits up to ~20 s for the copy to report `running`, prints its PID and the paths of `running.json`, `console.txt` and `last-run.json`, and exits 2 with the reason when the start failed (also notification `🛑 auto-mode could not start: …`). At every start the runner logs whether it is inside a job object and warns if that job kills its processes on close.
+- **Run state:** `.openspec-auto/running.json` while a run goes (PID and start time, current change, run and child process), `.openspec-auto/last-run.json` at the end (`finished` / `stopped` / `crashed` / `failed-start`), console output in `runs/<time>/console.txt`. A second start in the same project is refused while the first one lives.
+- **Child processes:** everything the runner starts (worker, tests, notify script) is in a job object with kill-on-close, so stopping the runner (`Stop-Process`, closing its window) also stops the worker. Daemons started inside the run (Gradle, Kotlin, adb, an emulator) end with it.
+- **Interrupted run:** the next start sees a `running.json` whose process is gone, says so, and if the tree is dirty, stashes the leftovers (`git stash push --include-untracked`, message `openspec-auto: leftovers of interrupted run …`), lists the files, and redoes the unfinished group. A dirty tree without an interrupted run is still an error. The runner never drops a stash; the report lists the remaining `openspec-auto:` stashes.
+- **Out of memory:** a red test run counts as out of memory when its output matches `memoryErrorPatterns`, or it timed out while less than `minFreeMemoryGB` was available. The worker ends with `AUTO-MODE-RESULT: LOW-MEMORY` when its own build or tests hit a memory error, without committing. Either way: no repair run, no `fix-` change, the change ends as `STOPPED` (`… ran out of memory …`), worker leftovers are stashed, and the run can simply be started again. The worker may not change memory or JVM settings unless a task asks for it.
+- Heavy projects (Gradle, Android): see GUIDE section 5.7.
 
 ## Results
 
@@ -178,7 +191,7 @@ powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Project C:\other
 | NONCRITICAL | archived + a `fix-NN-name` change describing the bug is created. Tests green (bug not visible to tests): the fix waits for you → next change. Tests red: the script processes the fix right away on the same branch (at most `maxRunsPerFix` runs, done = tests green) → next change, or **stop** if the fix does not pass |
 | BLOCKED | architectural problem, `openspec/changes/NN-name/BLOCKED.md`, not archived → **stop** |
 | FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress, tests fail after archiving) → **stop** |
-| STOPPED | a limit was reached (`maxRunsPerChange`, `maxRunsPerFix`, a group still red after `maxGroupRepairs` repair runs) → **stop** |
+| STOPPED | a limit was reached (`maxRunsPerChange`, `maxRunsPerFix`, a group still red after `maxGroupRepairs` repair runs), or the tests or the worker ran out of memory → **stop** |
 
 The notes column shows the test result of every task group, e.g. `groups: 1 green, 2 red->green (1 repair)`.
 
@@ -188,7 +201,10 @@ Nothing is pushed or merged. You review and merge the `auto/NN-…` branches you
 
 ## After a stop
 
-The script keeps no state of its own; re-running is the same command.
+Apart from `running.json` / `last-run.json` (section above), the script keeps no state of its own; re-running is the same command.
+
+- **Interrupted or out of memory:** just run again; leftovers are stashed automatically. Look at them with `git stash show -p stash@{0}`, drop them with `git stash drop stash@{0}`.
+- **`permission denied: <command>`** in a run log: the agent was not allowed to run a command the build or tests need (e.g. `node tools/gen.js`); add it to `allowedCommands`.
 
 - **BLOCKED:** stay on `auto/NN-name`, resolve the problem (e.g. `/opsx:update NN-name`, install a package, edit `design.md`), delete `BLOCKED.md`, commit, run again. While `BLOCKED.md` exists, the script refuses to start.
 - **FAILED-CHECK:** check the report and the run log, fix the state (commit or revert), run again from the current branch. The tests must be green again before the next start.
@@ -218,6 +234,8 @@ Every run is a full Claude Code session on your account: with a Claude subscript
 | `tests/run-tests.ps1`, `tests/fake-claude.ps1` | tests of the loop logic with a fake agent (no API calls) |
 | `GUIDE.md` | step-by-step guide |
 | `docs/hardening-plan.md` | design notes: why the script verifies the agent, decisions, and the roadmap |
+| `docs/memory-pressure-plan.md` | design notes: background runs, interrupted runs, out of memory |
+| `docs/notify-plan.md` | design notes: notifications |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1

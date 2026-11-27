@@ -105,6 +105,9 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `notifyProjectName` | project name shown in the notifications | project folder name |
 | `notifyStopPriority` | priority of the "stopped" message (Pushover: `2` repeats until you confirm it) | 1 |
 | `notifyTimeoutSeconds` | how long one notification may take | 30 |
+| `minFreeMemoryGB` | warn at the start when less memory is available; `0` = off (section 5.6) | 8 |
+| `preventSleep` | keep the PC awake during the run | `true` |
+| `memoryErrorPatterns` | error texts that mean "out of memory" (e.g. `java.lang.OutOfMemoryError`); `[]` = off | a built-in list |
 
 ---
 
@@ -157,6 +160,12 @@ Auto-mode runs in the background, possibly for hours. Claude tells you the order
 - do not touch the project (no file edits, no branch switching),
 - ask about progress any time ("how is it going?").
 
+**It runs in its own window, independent of Claude Code.** You see a new minimized PowerShell window in the taskbar: that is auto-mode. It keeps going even if Claude Code or the Warp window closes (or is closed by a lack of memory). Later, open Claude Code in the project again (`claude --continue` in the terminal continues the last conversation) and ask "how is it going?" or "how did auto-mode go?". While it runs, the PC does not go to sleep (the screen may still turn off; closing a laptop lid can still put it to sleep).
+
+**To stop it:** close that window, or tell Claude "stop auto-mode". The agent working at that moment stops too. The next `/openspec-auto run` continues where it stopped (section 5.5).
+
+If less than 8 GB of memory is free at the start, Claude warns you and names the programs using the most memory. It still starts; closing what you do not need (e.g. browser windows) makes a stop less likely.
+
 **Notifications on your phone (optional):** tell Claude "turn on notifications in auto-mode" and give it the path of your notify script (e.g. a Pushover script, `C:\claude-notifier\send-notify.ps1`). You then get a message when auto-mode starts, after every finished change (`✅ 01-login done (1/3) · 2 runs · 0.40 USD · 12 min`) and at the end (`🏁 finished` or `🛑 stopped at …`). The title is the project name, so you can tell several projects running at once apart. As long as no end message came, it is still working. If a notification cannot be sent, auto-mode carries on and lists it under Warnings in the report. The script must accept `-Message` and `-Priority`, ideally `-Title`, and end with an error code when sending failed.
 
 ---
@@ -171,6 +180,7 @@ You get a summary at the end. `/openspec-auto report` repeats it any time later.
 | **NONCRITICAL** | Done, but something does not work. A `fix-NN-name` change describing the bug was created. If the tests fail, auto-mode fixed it right away with a fresh agent (the `fix-` row in the summary, same branch); if the tests pass, the fix waits for you. | Review the fix, or do the waiting `fix-` change (section 5.3). |
 | **BLOCKED** | Architectural problem, auto-mode stopped. | Decide and resolve (section 5.1). |
 | **FAILED-CHECK / STOPPED** | The check after a run failed (nothing written, crash, timeout, no progress, push attempt, tests fail although the agent reported success, the fix did not make the tests pass). Auto-mode stopped. | Claude explains the cause and proposes a fix (section 5.2). |
+| **STOPPED: out of memory** | The tests or the agent ran out of memory. Nothing is broken; unfinished work was set aside. | Close programs, run again (section 5.6). |
 | **not processed** | The loop never reached the change. | It is processed on the next start. |
 
 ### Merge
@@ -202,6 +212,31 @@ Auto-mode processes a `fix-` change on its own only right after the change it be
 
 Propose changes with higher numbers (`03-…`, `04-…`), commit them and run `/openspec-auto run`.
 
+### 5.5 Interrupted run (window closed, PC restarted, crash)
+
+Just run `/openspec-auto run` again. Do not edit the project before that. Auto-mode notices that the previous run was interrupted and sets the half-done files aside with `git stash` (nothing is deleted). It lists the files, says so in the report and in the start notification, and redoes the unfinished task group from the last commit.
+
+You usually do not need the set-aside files. To look at them or get rid of them, tell Claude "show me the stashed leftovers" or "drop the stashed leftovers". By hand: `git stash list` (entries named `openspec-auto: leftovers of …`), `git stash show -p stash@{0}` to look, `git stash drop stash@{0}` to delete. Auto-mode never deletes a stash itself; the report lists the ones that are still there.
+
+If you start auto-mode while it is already running in that project, it refuses (`auto-mode is already running in this project`).
+
+### 5.6 Out of memory
+
+When the tests or the agent run out of memory, auto-mode does not try to "repair" the code (there is nothing wrong with it). It stops with `STOPPED` and the reason `ran out of memory`, sets the unfinished files aside (section 5.5) and sends the 🛑 notification. Close programs you do not need (browsers, Android Studio, an emulator) and run `/openspec-auto run` again.
+
+### 5.7 Heavy projects (Gradle, Android, emulators)
+
+Builds with Gradle, Kotlin and Android emulators need a lot of memory; with less than about 8 GB free a run can stop.
+
+- During the run, close Android Studio and browser windows you do not need.
+- In the project's `gradle.properties` (a project change, commit it on purpose):
+  - `org.gradle.jvmargs=-Xmx3g` (raise it if the build runs out of memory),
+  - `kotlin.compiler.execution.strategy=in-process` (no separate Kotlin daemon),
+  - optionally `org.gradle.daemon=false`: nothing stays in memory between test runs, but every build is slower, so raise `testTimeoutMinutes`.
+- Give the emulator less RAM, or use tests that do not need it. If the changes need the emulator, start it **before** the run: helper programs started inside the run (Gradle and Kotlin daemons, adb, an emulator) end with it. Otherwise close it.
+- `gradlew --stop` frees memory, but it stops all Gradle daemons of that version, also those of Android Studio and of auto-mode runs in other projects, and the next build starts slower. Auto-mode does not run it for you.
+- Test outputs (build folders, reports) belong in `.gitignore`, otherwise they end up among the set-aside files after an interruption.
+
 ---
 
 ## 6. Safety
@@ -226,7 +261,8 @@ A small change on the `sonnet` model costs about USD 0.15. The summary shows the
 
 This is mostly for Claude, not for you.
 
-- **Runner:** `openspec-auto.ps1` with the switches `-Init`, `-SetupAcceptanceSchema`, `-DryRun`, `-Project <path>`.
+- **Runner:** `openspec-auto.ps1` with the switches `-Init`, `-SetupAcceptanceSchema`, `-DryRun`, `-Background`, `-Project <path>`. The skill starts it with `-Background`: a copy of the runner in its own minimized window, outside Claude Code's process tree.
+- **Run state:** `.openspec-auto/running.json` (exists while a run goes: PID, current change and run), `.openspec-auto/last-run.json` (how the last run ended: `finished`, `stopped`, `crashed`, `failed-start`), console output in `.openspec-auto/runs/<time>/console.txt`.
 - **Skill:** `/openspec-auto` lives in `~/.claude/skills/openspec-auto/SKILL.md`; its source is `claude-skill/` in this repository. `install.ps1` installs it and fills in the runner path. After changing the source or moving the repository, run `install.ps1` again.
 - **Report and logs:** `.openspec-auto/` in the project (not in git).
 - **Runner start-up messages and fixes:**
@@ -260,5 +296,16 @@ This is mostly for Claude, not for you.
 | `notification failed (...)` (Warnings in the report) | the run was not affected; check the notify script by hand (e.g. its keys) |
 | `baseline tests fail: red (acceptance NN-x exit N)` | an archived change no longer passes its acceptance tests; fix it interactively first. If the tests of a change not yet implemented fail inside `testCommand`, it picks up acceptance tests: rename them (`*.accept.js`) or narrow `testCommand` |
 | `agent changed frozen acceptance tests: ...` (FAILED-CHECK) | the agent changed an acceptance test; look at the commit (`git log -p -- acceptance/`), revert it, run again |
+| `permission denied: <command>` (in the run log, often BLOCKED or no progress) | the agent may not run that command; add it to `allowedCommands` (e.g. `node tools/gen.js`), commit, run again |
+| `auto-mode is already running in this project (PID n …)` | a run is going; wait, or stop it (close its window) |
+| `a worker of the previous run is still running (PID n); end it first` | end that `claude` process (`Stop-Process -Id n`), then run again |
+| `previous run … was interrupted …` (Warnings) | information only; the leftovers were stashed (section 5.5) |
+| `.openspec-auto/ is not ignored by git …` | a `.gitignore` rule re-includes the folder; remove it, run again |
+| `git stash failed` / `git stash left files in the working tree` | look at the git output; commit or stash the files by hand, run again |
+| `baseline tests ran out of memory (...)` / `tests … ran out of memory` / `worker ran out of memory` (STOPPED) | section 5.6 |
+| `only x.x GB memory available (minFreeMemoryGB 8); biggest processes: …` (warning) | close programs you do not need; the run starts anyway |
+| `the runner is in a job object that kills its processes when it closes` (warning) | a newer Claude Code ends the run when Claude Code ends; keep Claude Code open during the run and report it |
+| `could not start: …` (🛑 notification, `last-run.json` `failed-start`) | the start check failed inside the background window; the reason is in `console.txt` and in the message |
+| `preventSleep … must be true or false` / `minFreeMemoryGB … must be a number >= 0` | fix the value in `openspec/auto-mode.json` |
 
 - **Tool tests** (no API calls): `tests/run-tests.ps1`.
