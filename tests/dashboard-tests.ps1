@@ -109,6 +109,20 @@ Check $found 'the session is in the history after the delay'
 'not json' | & powershell -NoProfile -ExecutionPolicy Bypass -File $Dashboard -Hook
 Check ($LASTEXITCODE -eq 0 -and (Get-Content -Raw (Join-Path $env:OSA_HISTORY_DIR 'history\dashboard-errors.log')) -match 'hook:') 'broken hook input: exit 0, error only in the log'
 
+Write-Host 'D4 projects without transcripts (only memory left) are listed too'
+$old = Join-Path $WorkDir 'projects\old_project.v2'
+New-Item -ItemType Directory -Force $old | Out-Null
+$enc = $old -replace '[^A-Za-z0-9]', '-'
+New-Item -ItemType Directory -Force (Join-Path $claude "$enc\memory") | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $claude 'C--Users-nobody-gone-project\memory') | Out-Null
+$r = Invoke-Dashboard @('-Import')
+$known = Read-Jsonl 'projects.jsonl'
+$k1 = $known | Where-Object { $_.key -eq $enc }
+$k2 = $known | Where-Object { $_.key -eq 'C--Users-nobody-gone-project' }
+Check ($r.Code -eq 0 -and $k1.project -eq $old -and $k1.projectName -eq 'old_project.v2' -and $k1.exists -and $k1.transcripts -eq 0) 'folder found again on disk, real name with _ and .'
+Check ($k2 -and -not $k2.exists -and $k2.projectName -eq 'nobody-gone-project') 'missing folder: name = the part after the last existing parent folder'
+Check ([System.IO.File]::ReadAllText((Join-Path $env:OSA_HISTORY_DIR 'dashboard.html')) -match 'old_project\.v2') 'known projects are on the page'
+
 Remove-Item Env:OSA_HISTORY_DIR, Env:OSA_CLAUDE_PROJECTS
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }

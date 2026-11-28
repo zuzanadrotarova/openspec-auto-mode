@@ -180,14 +180,23 @@ button.link { background: none; border: 0; color: var(--accent); cursor: pointer
   function proj(name, path) { var k = name; P[k] = P[k] || { name: name, path: path, auto: 0, spec: 0, other: 0, mixed: 0, unknown: 0, runs: [], sessions: [] }; return P[k]; }
   runs.forEach(function (r) { var p = proj(r.projectName, r.project); p.auto += r.cost || 0; p.runs.push(r); });
   sessions.forEach(function (s) { var p = proj(s.projectName, s.project); p[catOf(s)] += s.cost || 0; if (!s.costKnown) p.unknown++; p.sessions.push(s); });
-  var plist = Object.keys(P).map(function (k) { var p = P[k]; p.total = p.auto + p.spec + p.other + p.mixed; return p; }).sort(function (a, b) { return b.total - a.total; });
-  var th = '<tr><th>Project</th>' + CATS.map(function (c) { return '<th class="num">' + c.name + '</th>'; }).join('') + '<th class="num">total</th><th class="num">prep : auto</th><th class="num">cost unknown</th></tr>';
+  // projects Claude Code knows (also those whose conversations it already deleted)
+  (D.projects || []).forEach(function (k) { var p = proj(k.projectName, k.project); p.known = k; if (!p.path) p.path = k.project; });
+  function lastUsed(p) { var t = p.known && p.known.lastUsed || '';
+    p.runs.forEach(function (r) { if ((r.end || '') > t) t = r.end; }); p.sessions.forEach(function (s) { if ((s.end || '') > t) t = s.end; }); return t; }
+  var plist = Object.keys(P).map(function (k) { var p = P[k]; p.total = p.auto + p.spec + p.other + p.mixed; p.last = lastUsed(p); p.noData = !p.runs.length && !p.sessions.length; return p; })
+    .sort(function (a, b) { return (b.total - a.total) || (a.last < b.last ? 1 : -1); });
+  function nameCell(p) { var h = esc(p.name);
+    if (p.noData) h += ' <span class="tag" title="Claude Code deleted the older conversations of this project; costs from now on are kept">older data deleted</span>';
+    if (p.known && !p.known.exists) h += ' <span class="tag">folder not found</span>';
+    return h; }
+  var th = '<tr><th>Project</th>' + CATS.map(function (c) { return '<th class="num">' + c.name + '</th>'; }).join('') + '<th class="num">total</th><th class="num">prep : auto</th><th class="num">cost unknown</th><th>last used</th></tr>';
   var selected = null;
   function drawProjects() {
     document.getElementById('projects').innerHTML = th + plist.map(function (p, i) {
       var ratio = p.auto > 0 ? (p.spec / p.auto).toFixed(2) : '–';
-      return '<tr class="click' + (selected === p.name ? ' sel' : '') + '" data-i="' + i + '"><td>' + esc(p.name) + '</td>' + CATS.map(function (c) { return '<td class="num">' + (p[c.key] ? usd(p[c.key]) : '–') + '</td>'; }).join('') +
-        '<td class="num"><b>' + usd(p.total) + '</b></td><td class="num">' + ratio + '</td><td class="num">' + (p.unknown || '') + '</td></tr>';
+      return '<tr class="click' + (selected === p.name ? ' sel' : '') + '" data-i="' + i + '"><td>' + nameCell(p) + '</td>' + CATS.map(function (c) { return '<td class="num">' + (p[c.key] ? usd(p[c.key]) : '–') + '</td>'; }).join('') +
+        '<td class="num"><b>' + usd(p.total) + '</b></td><td class="num">' + ratio + '</td><td class="num">' + (p.unknown || '') + '</td><td>' + esc(day(p.last)) + '</td></tr>';
     }).join('');
     document.querySelectorAll('#projects tr.click').forEach(function (tr) { tr.addEventListener('click', function () { var p = plist[+tr.getAttribute('data-i')]; selected = selected === p.name ? null : p.name; drawProjects(); drawDetail(selected ? p : null); }); });
   }
@@ -200,7 +209,9 @@ button.link { background: none; border: 0; color: var(--accent); cursor: pointer
       if (/^error_max_/.test(r.subtype || '')) c.limits++;
       if (r.outcome && r.end >= c.last) { c.outcome = r.outcome; c.last = r.end; } });
     var cl = Object.keys(ch).map(function (k) { return ch[k]; }).sort(function (a, b) { return a.name < b.name ? -1 : 1; });
-    var h = '<h2>' + esc(p.name) + '</h2><div class="sub">' + esc(p.path || '') + '</div><h3>Changes (auto-mode)</h3><div class="panel">';
+    var h = '<h2>' + esc(p.name) + '</h2><div class="sub">' + esc(p.path || '') + '</div>';
+    if (p.noData) h += '<p class="sub">Claude Code already deleted the older conversations of this project (it used to keep them 30 days), so their cost is not known. Work from now on is recorded here.</p>';
+    h += '<h3>Changes (auto-mode)</h3><div class="panel">';
     if (!cl.length) h += '<div class="empty">No auto-mode runs.</div>';
     else {
       h += '<table><tr><th>Change</th><th>Result</th><th class="num">runs</th><th class="num">cost</th><th class="num">minutes</th><th class="num">turns</th><th class="num">limit stops</th><th></th></tr>';

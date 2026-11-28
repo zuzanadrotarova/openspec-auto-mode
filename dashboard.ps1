@@ -28,6 +28,7 @@ if ($env:OSA_HISTORY_DIR) { $HomeDir = $env:OSA_HISTORY_DIR }
 $HistoryDir = Join-Path $HomeDir 'history'
 $RunsFile = Join-Path $HistoryDir 'runs.jsonl'
 $SessionsFile = Join-Path $HistoryDir 'sessions.jsonl'
+$ProjectsFile = Join-Path $HistoryDir 'projects.jsonl'
 $PagePath = Join-Path $HomeDir 'dashboard.html'
 $ConfigPath = Join-Path $HomeDir 'dashboard-config.json'
 $ClaudeProjects = Join-Path $env:USERPROFILE '.claude\projects'
@@ -173,6 +174,50 @@ function Get-TopTranscripts {
     @(Get-ChildItem $ClaudeProjects -Directory | ForEach-Object { Get-ChildItem $_.FullName -Filter *.jsonl -File })
 }
 
+# ---------------------------------------------------------------- known projects
+# Every folder in ~/.claude/projects is a project Claude Code worked in, also when its transcripts
+# are already deleted (only memory left). The folder name is the project path with every character
+# except letters and digits replaced by '-'; the real folder is found again on disk.
+function ConvertTo-Encoded([string]$Path) { $Path -replace '[^A-Za-z0-9]', '-' }
+
+function Resolve-EncodedPath([string]$Encoded) {
+    if ($Encoded -notmatch '^([A-Za-z])--') { return $null }
+    $dir = "$($Matches[1]):\"
+    $script:LastPartial = $null
+    for ($depth = 0; $depth -lt 12; $depth++) {
+        if ((ConvertTo-Encoded $dir.TrimEnd('\')) -eq $Encoded -or (ConvertTo-Encoded $dir) -eq $Encoded) { return $dir.TrimEnd('\') }
+        $next = $null
+        try {
+            foreach ($c in [System.IO.Directory]::EnumerateDirectories($dir)) {
+                $e = ConvertTo-Encoded $c
+                if ($e -eq $Encoded) { return $c }
+                if ($Encoded.StartsWith("$e-") -and (-not $next -or $c.Length -gt $next.Length)) { $next = $c }
+            }
+        } catch { return $null }
+        if (-not $next) { $script:LastPartial = $dir; return $null }
+        $dir = $next
+    }
+    $null
+}
+
+function Read-KnownProjects($Known) {
+    if (-not (Test-Path $ClaudeProjects)) { return }
+    foreach ($d in Get-ChildItem $ClaudeProjects -Directory) {
+        $path = Resolve-EncodedPath $d.Name
+        $old = $null; if ($Known.Contains($d.Name)) { $old = $Known[$d.Name] }
+        if (-not $path -and $old -and $old.project) { $path = [string]$old.project }   # folder gone since
+        $name = if ($path) { Split-Path -Leaf $path }
+            elseif ($script:LastPartial) { $d.Name.Substring((ConvertTo-Encoded $script:LastPartial.TrimEnd('\')).Length).Trim('-') }
+            else { $d.Name }
+        $Known[$d.Name] = [ordered]@{
+            key = $d.Name; project = $path; projectName = $name
+            transcripts = @(Get-ChildItem $d.FullName -Filter *.jsonl -File).Count
+            exists = [bool]($path -and (Test-Path -LiteralPath $path))
+            lastUsed = $d.LastWriteTime.ToString('s')
+        }
+    }
+}
+
 # ---------------------------------------------------------------- auto-mode runs
 function Find-StateDir([string]$Dir) {
     $d = $Dir
@@ -236,13 +281,14 @@ function Read-ProjectRuns([string]$ProjectDir, $Runs) {
 }
 
 # ---------------------------------------------------------------- page
-function Build-Page($Runs, $Sessions) {
+function Build-Page($Runs, $Sessions, $Known) {
     $template = Join-Path $PSScriptRoot 'dashboard-template.html'
     $html = [System.IO.File]::ReadAllText($template)
     $data = [ordered]@{
         built = (Get-Date).ToString('s')
         runs = @($Runs.Values)
         sessions = @($Sessions.Values)
+        projects = @($Known.Values)
     }
     # PowerShell 5.1 escapes < > & ' in strings, so the JSON is safe inside a <script> element
     $json = ConvertTo-Json -InputObject $data -Depth 8 -Compress
@@ -260,6 +306,7 @@ try {
     $all = -not ($Project -or $SessionFile)
     $runs = Read-History $RunsFile
     $sessions = Read-History $SessionsFile
+    $known = Read-History $ProjectsFile
     $projects = New-Object System.Collections.Generic.HashSet[string]
 
     if ($SessionFile) {
@@ -278,6 +325,10 @@ try {
             } catch { Say "  skipped $($f.Name): $($_.Exception.Message)" }
         }
         foreach ($r in $runs.Values) { if ($r.project -and (Test-Path -LiteralPath $r.project)) { [void]$projects.Add([string]$r.project) } }
+        Read-KnownProjects $known
+        Say "projects: $($known.Count) known to Claude Code"
+        # auto-mode of a known project whose transcripts are gone
+        foreach ($k in $known.Values) { if ($k.project -and $k.exists) { $d = Find-StateDir ([string]$k.project); if ($d) { [void]$projects.Add($d) } } }
     }
     if ($Project) { [void]$projects.Add((Resolve-Path -LiteralPath $Project).Path) }
     foreach ($p in $projects) {
@@ -287,7 +338,8 @@ try {
 
     Write-History $RunsFile $runs
     Write-History $SessionsFile $sessions
-    Build-Page $runs $sessions
+    Write-History $ProjectsFile $known
+    Build-Page $runs $sessions $known
     Say "history: $($runs.Count) runs, $($sessions.Count) sessions in $HistoryDir"
     Say "page:    $PagePath"
     if ($all -and -not $Import) { Start-Process $PagePath }
