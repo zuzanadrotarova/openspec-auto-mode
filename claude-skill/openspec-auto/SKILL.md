@@ -44,11 +44,25 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
    - `allowedCommands`: build and lint commands the project actually has (e.g. `npm run build`, `npm run lint`). Remove template entries the project does not have. Also add scripts the tests or the build call themselves: look into `package.json` scripts and folders such as `tools/` and `scripts/` (e.g. `node tools/gen.js`); a command missing here is denied to the agent (`permission denied`).
    - If the project has no tests or no code yet, say so and ask what the test command will be.
    - A script in the project root needs an explicit path (`.\test.cmd`); the tests must pass and must not leave untracked files (add test outputs such as coverage to `.gitignore`).
-5. Offer acceptance tests (recommended when the project has tests): set `acceptanceMode: "reviewed"`, `acceptanceCommand` (e.g. `node --test "acceptance/{change}/*.accept.js"`) and `acceptanceDir`, then run the runner with `-SetupAcceptanceSchema`. It adds an `acceptance` artifact to the project's OpenSpec workflow (proposal, specs, design, **acceptance**, tasks), so `/opsx:propose` writes the acceptance tests with the user as part of every change. Say that this uses OpenSpec's custom schemas, which are experimental; after an OpenSpec update, run `-SetupAcceptanceSchema` again.
-6. Offer push notifications: ask whether the user wants a message on the phone when a change is done and when the run ends, and which notify script to use (a PowerShell script taking `-Message`, `-Priority` and optionally `-Title`, e.g. `C:\claude-notifier\send-notify.ps1`; check that the file exists, never read or print its keys or `.env`). Set `notifyScript` to its absolute path; set `notifyProjectName` only if the folder name is not a good name. Without an answer leave `notifyScript` at `null`.
-7. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
-8. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
-9. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
+5. Memory settings: detect the stack from the files in the project root and its subfolders and propose the matching entries. Show the proposal as a short table and write only what the user confirms.
+
+   | Found | `memoryCleanupCommands` | `keepProcesses` | Memory limit in the project (optional) |
+   |---|---|---|---|
+   | `gradlew` / `build.gradle(.kts)` | `.\gradlew --stop` (stops all Gradle daemons of that version, also Android Studio's) | – | `gradle.properties`: `org.gradle.jvmargs=-Xmx3g`, `kotlin.daemon.jvmargs=-Xmx2g`, `org.gradle.workers.max=2` |
+   | Android (`AndroidManifest.xml`, `app/build.gradle*`) | as Gradle | `qemu-system-*`, `emulator*`, `adb` if the tests need an emulator | as Gradle |
+   | `pom.xml` + `.mvn/` with mvnd | `mvnd --stop` | – | – |
+   | `*.csproj` / `*.sln` | `dotnet build-server shutdown` | – | – |
+   | `WORKSPACE` / `MODULE.bazel` | `bazel shutdown` | – | `.bazelrc`: `startup --host_jvm_args=-Xmx3g` |
+   | `docker-compose.yml` / `compose.yaml` | `docker compose stop` only if the tests do not need the containers; otherwise nothing | – (Docker runs outside the run) | – |
+   | `package.json` | – (Node ends with the run) | – | `NODE_OPTIONS=--max-old-space-size=4096` only if builds ran out of memory before |
+   | iOS (`*.xcodeproj`, `ios/`) | – (Windows cannot build it) | – | – |
+
+   Cleanup commands run only when memory is low, at most every 10 minutes, and must not change files in the working tree. `keepProcesses` are names with wildcards, without `.exe`; memory recovery never stops them. A memory limit is a project change: explain it in one sentence and commit it only after the user's ok. If nothing fits, leave both lists empty and say that the generic recovery (stopping leftover processes of the runs, waiting) still works.
+6. Offer acceptance tests (recommended when the project has tests): set `acceptanceMode: "reviewed"`, `acceptanceCommand` (e.g. `node --test "acceptance/{change}/*.accept.js"`) and `acceptanceDir`, then run the runner with `-SetupAcceptanceSchema`. It adds an `acceptance` artifact to the project's OpenSpec workflow (proposal, specs, design, **acceptance**, tasks), so `/opsx:propose` writes the acceptance tests with the user as part of every change. Say that this uses OpenSpec's custom schemas, which are experimental; after an OpenSpec update, run `-SetupAcceptanceSchema` again.
+7. Offer push notifications: ask whether the user wants a message on the phone when a change is done and when the run ends, and which notify script to use (a PowerShell script taking `-Message`, `-Priority` and optionally `-Title`, e.g. `C:\claude-notifier\send-notify.ps1`; check that the file exists, never read or print its keys or `.env`). Set `notifyScript` to its absolute path; set `notifyProjectName` only if the folder name is not a good name. Without an answer leave `notifyScript` at `null`.
+8. Add `.gitattributes` with `* text=auto eol=lf` if the project has none.
+9. Commit the setup (`Setup OpenSpec auto-mode`). The runner needs a clean working tree.
+10. Tell the user the next step: propose changes named `01-…`, `02-…` (e.g. `/opsx:propose 01-login: …`), commit them, then `/openspec-auto run`. Mention that `tasks.md` should be split into groups that are logical units with their own tests ("1. Login form (code + tests)"), because the runner tests after every group.
 
 ## check – readiness
 
@@ -71,6 +85,12 @@ Used when `openspec/auto-mode.json` has `acceptanceMode: "reviewed"`, or when th
 ## run – start auto-mode
 
 1. Run `check` first. If it fails, stop and explain, do not start. A warning `only x GB memory available` is not an error: name the biggest processes from the warning and suggest closing what the user does not need (emulator, Android Studio, browsers), then start if they agree.
+   Night checklist (always before a long or unattended run; read-only, you never close programs or change settings yourself):
+   - Memory: show the 8 biggest processes (`Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 Name, @{n='GB';e={[math]::Round($_.WorkingSet64/1GB,1)}}`) and the commit charge (`Get-CimInstance Win32_OperatingSystem`: used = `TotalVirtualMemorySize - FreeVirtualMemory`, in % of `TotalVirtualMemorySize`). Suggest what to close; say that Claude Code itself may be closed after the start (about 2 GB more).
+   - Entries of `keepProcesses` (e.g. an emulator) must already be running before the start; programs started inside the run end with it.
+   - Graphics driver updates: a driver installed during a run can crash the emulator and the terminal. If a GPU vendor updater runs (`Get-Process` names like `RadeonSoftware`, `AMDRSServ`, `NVIDIA app`, `DSATray`), remind the user to switch off automatic driver updates in that program and update by hand in the daytime.
+   - Windows Update: read `HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings` (`PauseUpdatesExpiryTime`, `ActiveHoursStart`, `ActiveHoursEnd`). If updates are not paused and the night is outside the active hours, suggest pausing updates for a day or moving the active hours (Settings → Windows Update), so the PC does not restart at night.
+   Show it as a short list; the user decides, then start.
 2. Start the runner with `-Background`, in the foreground (no `run_in_background`). It starts the run in its own minimized window named `openspec-auto: <project>`, outside Claude Code, and returns within about 20 seconds:
    - exit `0`: note the PID from `auto-mode started in its own minimized window (PID n)`. If it says `still starting`, read `.openspec-auto/running.json` (`phase` becomes `running`) and `.openspec-auto/last-run.json` a minute later.
    - exit `2`: the run did not start; explain the reason it prints (`the run ended at once (failed-start): …`, `already running`).
