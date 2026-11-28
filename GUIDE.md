@@ -107,6 +107,8 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `notifyTimeoutSeconds` | how long one notification may take | 30 |
 | `minFreeMemoryGB` | warn at the start when less memory is available; `0` = off (section 5.6) | 8 |
 | `maxCommitPercent` | warn when Windows has promised almost all memory it can give (commit charge in percent of its limit); `0` = off (section 5.6) | 85 |
+| `criticalFreeMemoryGB` / `criticalCommitPercent` | critical memory level: below 3 GB free or above 95 % commit auto-mode waits for memory and stops if it does not come back (section 5.6) | 3 / 95 |
+| `memoryWaitMinutes` | how long auto-mode waits at a critical memory level | 10 |
 | `keepProcesses` | programs auto-mode never stops to free memory, e.g. `["qemu-system-*", "emulator*", "adb"]` for an Android emulator (section 5.6) | none |
 | `preventSleep` | keep the PC awake during the run | `true` |
 | `memoryErrorPatterns` | error texts that mean "out of memory" (e.g. `java.lang.OutOfMemoryError`); `[]` = off | a built-in list |
@@ -230,6 +232,8 @@ Auto-mode watches memory during the whole run: before every run and every test i
 
 Programs that a run started and left running (for example build helpers that stay in the background) are listed in the console and in the report. When memory is low before a run or before the tests, auto-mode stops them to free memory, then goes on. It never stops programs that were already running before you started auto-mode (your browser, an emulator you started), and never the ones named in `keepProcesses`.
 
+When memory is **critical** (less than 3 GB free, or Windows has promised more than 95 % of what it can give), auto-mode also waits up to 10 minutes for memory to come back. If it does, the run goes on; if not, auto-mode stops with `memory stayed critical …` and the 🛑 notification, and the next start continues where it stopped. When a run or the tests run out of memory, auto-mode frees memory and tries the same step **once more** before it stops.
+
 ### 5.7 Heavy projects (Gradle, Android, emulators)
 
 Builds with Gradle, Kotlin and Android emulators need a lot of memory; with less than about 8 GB free a run can stop.
@@ -313,6 +317,7 @@ This is mostly for Claude, not for you.
 | `the runner is in a job object that kills its processes when it closes` (warning) | a newer Claude Code ends the run when Claude Code ends; keep Claude Code open during the run and report it |
 | `could not start: …` (🛑 notification, `last-run.json` `failed-start`) | the start check failed inside the background window; the reason is in `console.txt` and in the message |
 | `commit at x % of the limit …; biggest processes: …` (warning) | close programs you do not need; the run starts anyway (section 5.6) |
+| `memory stayed critical for 10 min (…) before run …` / `tests … not run (memory stayed critical …)` | the PC had too little memory for 10 minutes; close programs (the message names the biggest) and run `/openspec-auto run` again |
 | `memory was low before x of y checks …` (report warning) | look at `memory.csv` of that run to see which program grew; close it before the next run |
 | `preventSleep … must be true or false` / `minFreeMemoryGB … must be a number >= 0` / `maxCommitPercent … must be a number from 0 to 100` | fix the value in `openspec/auto-mode.json` |
 

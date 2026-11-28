@@ -1,6 +1,6 @@
 # Memory recovery for unattended (night) runs – plan
 
-Status: plan agreed 2026-11-28 (section 8); steps 2 and 3 implemented 2026-11-28 (tests T43–T45; nested jobs checked by a probe inside Claude Code and in an own window), steps 4–8 open. Date: 2026-11-28.
+Status: plan agreed 2026-11-28 (section 8); steps 2–4 implemented 2026-11-28 (tests T43–T46; nested jobs checked by a probe inside Claude Code and in an own window; step 4 with two levels: low = recover and go on, critical 3 GB / 95 % = also wait, then stop), steps 5–8 open. Date: 2026-11-28.
 Order: first of the three plans, before `docs/limit-continue-plan.md`. Builds on `docs/memory-pressure-plan.md` (steps 1–4).
 
 ## 1. Problem
@@ -143,3 +143,7 @@ Risks:
    (its import step before 2026-12-08).
 2. Defaults: `maxCommitPercent` 85, `memoryWaitMinutes` 10, one retry per change.
 3. Memory log once per minute.
+4. Two levels (decided before step 4): *low* (`minFreeMemoryGB` 8 / `maxCommitPercent` 85) = cleanup
+   and stop leftovers, then go on; *critical* (`criticalFreeMemoryGB` 3 / `criticalCommitPercent` 95)
+   = the same, then wait `memoryWaitMinutes` and stop. Waiting already at the warning level would
+   stop runs that pass today (6–10 GB free is normal on a busy PC).

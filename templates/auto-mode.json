@@ -23,5 +23,8 @@
   "notifyScript": null,
   "minFreeMemoryGB": 8,
   "maxCommitPercent": 85,
-  "keepProcesses": []
+  "keepProcesses": [],
+  "criticalFreeMemoryGB": 3,
+  "criticalCommitPercent": 95,
+  "memoryWaitMinutes": 10
 }

@@ -59,6 +59,7 @@ function New-Project([string]$Name, [string[]]$Changes, [string]$Config = $Defau
     Set-Content 'run-tests.cmd' @(
         '@if exist oom.txt (echo Exception in thread main java.lang.OutOfMemoryError: Java heap space & exit /b 1)'
         '@if exist oom-green.txt (echo test of java.lang.OutOfMemoryError handling: ok & exit /b 0)'
+        '@if exist oom-once.txt if not exist .git\oom-once-done (echo x> .git\oom-once-done & echo Exception in thread main java.lang.OutOfMemoryError: Java heap space & exit /b 1)'
         '@if exist slow.txt (powershell -NoProfile -Command "if ($env:OSA_TEST_FREE_MB_FILE) { Set-Content -LiteralPath $env:OSA_TEST_FREE_MB_FILE ([string]$PID + '' 3000'') }; Start-Sleep 120" & exit /b 1)'
         '@if exist broken.txt (echo FAIL broken.txt & exit /b 1) else (echo ok)'
     )
@@ -551,7 +552,10 @@ Check ($st -and $st.consoleLog -and (Test-Path (Join-Path $p $st.consoleLog))) '
 $ids = @(); if (Test-Path $pidFile) { $ids = @((Get-Content $pidFile) -split ' ' | Where-Object { $_ }) }
 Check ($ids.Count -eq 2) 'fake worker started a grandchild'
 Stop-Process -Id $runnerProc.Id -Force
-Start-Sleep 3
+# the job ends its processes asynchronously; under load this can take longer than a few seconds
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+while ($sw.Elapsed.TotalSeconds -lt 15 -and @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count) { Start-Sleep -Milliseconds 250 }
+Write-Host "    (children gone after $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s)"
 Check ($ids.Count -eq 2 -and -not (Get-Process -Id $ids[0] -ErrorAction SilentlyContinue)) 'worker ended with the killed runner'
 Check ($ids.Count -eq 2 -and -not (Get-Process -Id $ids[1] -ErrorAction SilentlyContinue)) 'grandchild ended with the killed runner'
 foreach ($id in $ids) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
@@ -695,13 +699,13 @@ Check ($r.Code -eq 0 -and $r.Out -match 'baseline tests green' -and (Archived $p
 
 Write-Host "T39 memory warning at the start"
 $p = New-Project 't39' @('01-a:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
-$env:OSA_TEST_FREE_MB = '3000'; $env:OSA_TEST_PROCESSES = 'java=3400;java=200;qemu-system=2100;browser=2700;code=100'
+$env:OSA_TEST_FREE_MB = '4000'; $env:OSA_TEST_PROCESSES = 'java=3400;java=200;qemu-system=2100;browser=2700;code=100'
 $r = Invoke-Runner $p '' @('-DryRun')
-Check ($r.Code -eq 0 -and $r.Out -match 'only 2\.9 GB memory available') 'dry run warns too'
+Check ($r.Code -eq 0 -and $r.Out -match 'only 3.9 GB memory available') 'dry run warns too'
 $r = Invoke-NotifyRunner $p '01-a=success'
 $rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
-Check ($r.Code -eq 0 -and $rep -match 'only 2\.9 GB memory available \(minFreeMemoryGB 8\); biggest processes: java 3\.5 GB \(2\), browser 2\.6 GB, qemu-system 2\.1 GB, code 0\.1 GB') 'report: warning with the process list'
-Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'only 2\.9 GB memory available$' -and $r.Lines[0] -notmatch 'java|browser|qemu') 'E1: the number, no process names'
+Check ($r.Code -eq 0 -and $rep -match 'only 3.9 GB memory available \(minFreeMemoryGB 8\); biggest processes: java 3\.5 GB \(2\), browser 2\.6 GB, qemu-system 2\.1 GB, code 0\.1 GB') 'report: warning with the process list'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'only 3.9 GB memory available$' -and $r.Lines[0] -notmatch 'java|browser|qemu') 'E1: the number, no process names'
 $p = New-Project 't39b' @('01-a:1') ($DefaultConfig -replace ' }$', ', "minFreeMemoryGB": 0 }')
 $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 0 -and $r.Out -notmatch 'memory available \(minFreeMemoryGB') 'minFreeMemoryGB 0: no warning'
@@ -818,14 +822,14 @@ Check (@($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue 
 Check ([bool](Get-Process -Id $older.Id -ErrorAction SilentlyContinue)) 'a process older than the batch is not touched'
 Remove-Item $env:FAKE_DAEMON_FILE, $env:FAKE_DAEMON_CHECK -ErrorAction SilentlyContinue
 $p = New-Project 't45b' @('01-a:4:2') ($DefaultConfig -replace ' }$', ', "keepProcesses": ["ping.exe"] }')
-$env:OSA_TEST_FREE_MB = '3000'
+$env:OSA_TEST_FREE_MB = '4000'
 $r = Invoke-Runner $p '01-a=group-daemon'
 $env:OSA_TEST_FREE_MB = '16000'
 $rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
 $chk = @(); if (Test-Path $env:FAKE_DAEMON_CHECK) { $chk = @(Get-Content $env:FAKE_DAEMON_CHECK) }
 Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'low memory: the run goes on'
 Check ($r.Out -match 'left running after run 1 of 01-a: .*\(keepProcesses: PING') 'the kept process is named as kept'
-Check ($r.Out -match 'low memory before the tests: stopped 1 leftover process \(powershell [\d.]+ GB\); 2\.9 GB -> 2\.9 GB available') 'low memory before the group tests: the leftover is stopped'
+Check ($r.Out -match 'low memory before the tests: stopped 1 leftover process \(powershell [\d.]+ GB\); 3.9 GB -> 3.9 GB available') 'low memory before the group tests: the leftover is stopped'
 Check ($chk -contains 'group:2 sleeper=False ping=True') 'run 2 sees: sleeper stopped, kept process alive'
 Check ($rep -match '- after run 1 of 01-a: kept: PING [\d.]+ GB; stopped: powershell' -and $rep -match '- low memory before the tests: stopped 1 leftover process') 'report: kept / stopped and the recovery line'
 Check ([bool](Get-Process -Id $older.Id -ErrorAction SilentlyContinue)) 'a process older than the batch survives the recovery'
@@ -834,6 +838,48 @@ if (-not $older.HasExited) { $older.Kill() }
 $p = New-Project 't45c' @('01-a:1') ($DefaultConfig -replace ' }$', ', "keepProcesses": [1] }')
 $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'keepProcesses .* must be a list of process names') 'invalid keepProcesses refused'
+
+# ---------------------------------------------------------------- memory recovery, step 4
+Write-Host "T46 critical memory: wait and go on, or stop after memoryWaitMinutes; one retry after out of memory"
+$memFile = Join-Path $WorkDir 't46.mem'
+$env:OSA_TEST_FREE_MB_FILE = $memFile; $env:OSA_TEST_MEMWAIT_SECONDS = '1'
+$helper = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 6') -WindowStyle Hidden -PassThru
+Set-Content -LiteralPath $memFile "$($helper.Id) 2000"
+$p = New-Project 't46' @('01-a:1')
+$r = Invoke-Runner $p '01-a=success'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Out -match 'critical memory before the tests: only 2\.0 GB available \(criticalFreeMemoryGB 3\); waiting up to 10 min') 'critical memory before the baseline tests: waits'
+Check ($r.Code -eq 0 -and $r.Out -match 'memory before the tests recovered after [\d.]+ min of waiting' -and (Archived $p '01-a')) 'memory comes back: the run goes on'
+Check ($rep -match 'memory before the tests recovered after') 'report: the recovery line'
+Remove-Item $memFile -ErrorAction SilentlyContinue
+$p = New-Project 't46b' @('01-a:3') (Notify-Config "`"notifyScript`": `"$NotifyFake`", `"groupTesting`": false, `"memoryWaitMinutes`": 0.05")
+$env:FAKE_MEM_PID = "$PID"
+$r = Invoke-NotifyRunner $p '01-a=continue-memcrit'
+Remove-Item Env:FAKE_MEM_PID
+Check ($r.Code -eq 1 -and $r.Out -match '\| 01-a \| STOPPED' -and $r.Out -match 'memory stayed critical for 0\.05 min \(only 2\.0 GB available\) before run 2 of 01-a') 'memory stays critical: STOPPED before run 2 with the reason'
+Check ((Count-Prompts $p '01-a') -eq 1 -and (Clean $p)) 'run 2 not started, tree clean'
+Check ($r.Lines.Count -ge 2 -and $r.Lines[-1] -match 'stopped at 01-a: memory stayed critical for 0\.05 min \(only 2\.0 GB available\)' -and $r.Lines[-1] -notmatch 'biggest') 'E6: the reason with numbers only'
+Remove-Item $memFile -ErrorAction SilentlyContinue
+$r = Invoke-Runner $p '01-a=continue'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'next start with enough memory finishes the change'
+$p = New-Project 't46c' @('01-a:2')
+$r = Invoke-Runner $p '01-a=lowmem-once'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Count-Prompts $p '01-a') -eq 2) 'worker out of memory once: run again, SUCCESS'
+Check ($r.Out -match 'freeing memory and starting the run once more' -and $rep -match 'run 1: worker ran out of memory: .*run again after memory recovery') 'console and report name the retry'
+Check ((GitIn $p stash list --format=%s) -match 'leftovers of LOW-MEMORY in 01-a run 1') 'the half-done work of run 1 is in a stash'
+$p = New-Project 't46d' @('01-a:4:2')
+Set-Break 'oom-once.txt'
+$r = Invoke-Runner $p '01-a=group-red'
+Set-Break $null
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Count-Prompts $p '01-a') -eq 3) 'tests out of memory once: run again green, no repair run'
+Check ($r.Out -match 'tests after group 1 ran out of memory \(Exception in thread main java\.lang\.OutOfMemoryError.*running them once more' -and $rep -match 'tests after group 1 ran out of memory .*ran again after memory recovery: green') 'console and report name the retry'
+Check (Test-Path (Get-ChildItem "$p/.openspec-auto/runs/*/01-a.run01.group1.tests.retry.txt" | Select-Object -First 1).FullName) 'the repeated tests have their own log'
+$p = New-Project 't46e' @('01-a:1') ($DefaultConfig -replace ' }$', ', "criticalCommitPercent": 200 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'criticalCommitPercent .* must be a number from 0 to 100') 'invalid critical setting refused'
+Remove-Item Env:OSA_TEST_FREE_MB_FILE, Env:OSA_TEST_MEMWAIT_SECONDS
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }

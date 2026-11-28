@@ -157,6 +157,24 @@ switch ($mode) {
         Write-Output ($o | ConvertTo-Json -Compress)
         exit 0
     }
+    'lowmem-once' {
+        # the first run runs out of memory (uncommitted half-done work), the next one succeeds
+        if (-not (Test-Path '.git/fake-lowmem-done')) {
+            Set-Content '.git/fake-lowmem-done' 'x'
+            Tick 1; Set-Content 'broken.txt' 'half-done work'
+            $o = @{ type = 'result'; subtype = 'success'; is_error = $false; num_turns = 3; total_cost_usd = 0.01
+                result = "AUTO-MODE-RESULT: LOW-MEMORY`nException in thread main java.lang.OutOfMemoryError: Java heap space" }
+            Write-Output ($o | ConvertTo-Json -Compress)
+            exit 0
+        }
+        Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
+    }
+    'continue-memcrit' {
+        # one task per run; afterwards memory is "critical" while process FAKE_MEM_PID lives
+        Tick 1; Commit "$change one task"
+        if ($env:OSA_TEST_FREE_MB_FILE -and $env:FAKE_MEM_PID) { Set-Content -LiteralPath $env:OSA_TEST_FREE_MB_FILE "$($env:FAKE_MEM_PID) 2000" }
+        Result 'CONTINUE'
+    }
     'envcheck' {
         # proves the detached copy got the launching shell's environment, and stays alive a while
         if ($env:FAKE_ENV_OUT) { Set-Content $env:FAKE_ENV_OUT "mark=$env:OSA_TEST_ENV_MARK" }

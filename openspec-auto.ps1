@@ -310,6 +310,9 @@ function Read-Config {
         minFreeMemoryGB    = 8
         maxCommitPercent   = 85
         keepProcesses      = @()
+        criticalFreeMemoryGB = 3
+        criticalCommitPercent = 95
+        memoryWaitMinutes  = 10
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -330,6 +333,9 @@ function Read-Config {
     if ($null -eq $cfg.minFreeMemoryGB) { $cfg.minFreeMemoryGB = 8 }
     if ($null -eq $cfg.maxCommitPercent) { $cfg.maxCommitPercent = 85 }
     if ($null -eq $cfg.keepProcesses) { $cfg.keepProcesses = @() }
+    if ($null -eq $cfg.criticalFreeMemoryGB) { $cfg.criticalFreeMemoryGB = 3 }
+    if ($null -eq $cfg.criticalCommitPercent) { $cfg.criticalCommitPercent = 95 }
+    if ($null -eq $cfg.memoryWaitMinutes) { $cfg.memoryWaitMinutes = 10 }
     $cfg.memoryErrorPatterns = @($cfg.memoryErrorPatterns | Where-Object { $null -ne $_ -and "$_" -ne '' })
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
@@ -441,9 +447,17 @@ function New-WorkerAgents([string]$Path) {
 # (the whole process tree is killed on timeout). Never throws on a non-zero exit code.
 function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$StdIn, [string]$JobLabel = '') {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $gate = $null
     if ($IsWin) {
         $psi.FileName = 'cmd.exe'
         $psi.Arguments = "/d /s /c `"$CommandLine`""
+        if ($JobLabel -and $script:JobHandle -ne [IntPtr]::Zero) {
+            # gate (recovery 2.3): cmd waits until it is in the job of this run, so the command and
+            # everything it starts are in that job from their first moment (no race with Assign)
+            $gate = Join-Path ([System.IO.Path]::GetTempPath()) ("osa-gate-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N'))
+            $wait = "`$n = 0; while (-not (Test-Path -LiteralPath '$gate') -and `$n -lt 1500) { Start-Sleep -Milliseconds 20; `$n++ }"
+            $psi.Arguments = "/d /s /c `"powershell -NoProfile -NonInteractive -Command `"$wait`" <nul & $CommandLine`""
+        }
     } else {
         $psi.FileName = '/bin/sh'
         $psi.Arguments = "-c '$($CommandLine.Replace("'", "'\''"))'"
@@ -461,6 +475,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
     $proc = [System.Diagnostics.Process]::Start($psi)
     Add-ToJob $proc
     Add-ToRunJob $proc $JobLabel
+    if ($gate) { try { [System.IO.File]::WriteAllText($gate, 'go') } catch { } }
     Set-RunChild $proc
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
@@ -482,6 +497,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
             if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
         }
         Set-RunChild $null
+        if ($gate) { Remove-Item -LiteralPath $gate -Force -ErrorAction SilentlyContinue }
     }
     $null = $outTask.Wait(15000); $null = $errTask.Wait(15000)
     $stdout = ''; $stderr = ''
@@ -507,10 +523,18 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
     $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0; $memory = $null
     $jobLabel = 'tests ' + ([System.IO.Path]::GetFileNameWithoutExtension($LogPath) -replace '\.tests$', '')
     $mem = Test-MemoryState
-    if ($mem.Problems.Count) {
+    if ($mem.Problems.Count -or $mem.Critical.Count) {
         Write-Host ''
-        Write-Warn "low memory before the tests: $($mem.Problems -join ', ') ($($mem.Text))"
-        [void](Stop-LeftoversForMemory 'the tests')
+        Write-Warn "low memory before the tests: $(@(@($mem.Problems) + @($mem.Critical) | Select-Object -First 1) -join ', ') ($($mem.Text))"
+        $rec = Invoke-MemoryRecovery 'the tests'
+        if ($rec) {
+            # memory stayed critical: the tests are not run; the caller stops like after out of memory
+            Write-TextFile $LogPath "not run: $($rec.Reason)`n"
+            return [pscustomobject]@{
+                Passed = $false; ExitCode = -1; TimedOut = $false; Label = 'not run (memory)'; Memory = $rec.Short; NotRun = $true
+                Tail = ''; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = 0
+            }
+        }
     }
     foreach ($c in $cmds) {
         $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) '' $jobLabel
@@ -541,9 +565,29 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
     }
     Write-TextFile $LogPath $log
     [pscustomobject]@{
-        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label; Memory = $memory
+        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label; Memory = $memory; NotRun = $false
         Tail = $tail; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = [math]::Round($minutes, 1)
     }
+}
+
+# One retry per change after the tests ran out of memory (docs/memory-recovery-plan.md 2.5): memory
+# recovery, then the same tests once more (log <name>.retry.txt). Notes go to $script:MemoryNotes.
+$script:MemRetriesLeft = 1
+$script:MemoryNotes = @()
+function Invoke-TestsWithMemoryRetry($Cfg, [string]$LogPath, [string[]]$AcceptFor, [string]$What) {
+    $t = Invoke-Tests $Cfg $LogPath $AcceptFor
+    if ($t.Passed -or -not $t.Memory -or $t.NotRun -or $t.Dirty -or $script:MemRetriesLeft -lt 1) { return $t }
+    $script:MemRetriesLeft--
+    Write-Host ''
+    Write-Warn "$What ran out of memory ($($t.Memory)); freeing memory and running them once more"
+    $rec = Invoke-MemoryRecovery "the repeated $What" -Force
+    if ($rec) { $t.Memory = "$($t.Memory); then $($rec.Short)"; return $t }
+    Write-Host "    $What again ..." -NoNewline
+    $t2 = Invoke-Tests $Cfg ($LogPath -replace '\.txt$', '.retry.txt') $AcceptFor
+    Write-Host (" {0}, {1} min" -f $t2.Label, $t2.Minutes)
+    $script:MemoryNotes += "$What ran out of memory ($($t.Memory)), ran again after memory recovery: $($t2.Label)"
+    $t2.Minutes = [math]::Round($t.Minutes + $t2.Minutes, 1)
+    $t2
 }
 
 # Push notifications (docs/notify-plan.md): the runner calls the user's notifyScript in a separate
@@ -793,8 +837,19 @@ public static class OsaJob {
         Write-Warn $w
         return
     }
+    # the job the runner was started in (4.1), read before the runner joins its own job below
+    $script:OwnJobFlags = [OsaJob]::OwnJobFlags()
     try {
         $script:JobHandle = [OsaJob]::Create()
+        # the runner joins its own job, so every child is in it from its first moment: assigning a
+        # child after Process.Start loses a race when the child (cmd) starts its own child at once,
+        # which then survives a killed runner. Kill-on-close ends them all when the runner ends.
+        try { [OsaJob]::Assign($script:JobHandle, [System.Diagnostics.Process]::GetCurrentProcess().Handle) }
+        catch {
+            $w = "the runner could not join its own job object ($($_.Exception.Message)); a child started at the same moment may survive a killed runner"
+            $script:warnings += $w
+            Write-Warn $w
+        }
     } catch {
         $w = "child processes are not bound to the runner (job object: $($_.Exception.Message)); after a killed runner check that no claude process is left"
         $script:warnings += $w
@@ -959,9 +1014,50 @@ function Test-MemoryState([switch]$NoCount) {
     $maxPct = [double]$script:cfg.maxCommitPercent
     if ($maxPct -gt 0 -and $commit -and $commit.Percent -gt $maxPct) { $problems += "commit at $($commit.Percent) % of the limit" }
     if ($problems.Count -and -not $NoCount) { $s.Low++ }
+    # critical level (recovery step 4): below it the runner waits and finally stops
+    $critical = @()
+    $critMB = [double]$script:cfg.criticalFreeMemoryGB * 1024
+    if ($critMB -gt 0 -and $null -ne $avail -and $avail -lt $critMB) { $critical += "only $(Format-GB $avail) available (criticalFreeMemoryGB $($script:cfg.criticalFreeMemoryGB))" }
+    $critPct = [double]$script:cfg.criticalCommitPercent
+    if ($critPct -gt 0 -and $commit -and $commit.Percent -gt $critPct) { $critical += "commit at $($commit.Percent) % of the limit (criticalCommitPercent $($script:cfg.criticalCommitPercent))" }
     $text = "memory available: $(Format-GB $avail)"
     if ($commit) { $text += ", $(Format-Commit $commit)" }
-    [pscustomobject]@{ AvailMB = $avail; Commit = $commit; Problems = $problems; Text = $text }
+    [pscustomobject]@{ AvailMB = $avail; Commit = $commit; Problems = $problems; Critical = $critical; Text = $text }
+}
+
+# Memory recovery (docs/memory-recovery-plan.md 2.2), called when memory is low or after an
+# out-of-memory error (-Force: also when the measurement looks fine again):
+#   1. cleanup commands of the project (step 5), 2. stop leftover processes of runs,
+#   3. only when memory is critical: wait up to memoryWaitMinutes, measuring every 30 s.
+# Returns $null when the run can go on, otherwise Reason (with process names, local) and Short
+# (numbers only, for the notification).
+function Invoke-MemoryRecovery([string]$Before, [switch]$Force) {
+    $m = Test-MemoryState -NoCount
+    if (-not $Force -and -not $m.Problems.Count -and -not $m.Critical.Count) { return $null }
+    $r = Stop-LeftoversForMemory $Before
+    if ($r) { $m = $r }
+    if (-not $m.Critical.Count) { return $null }
+    $waitMin = [double]$script:cfg.memoryWaitMinutes
+    $step = 30
+    if ($env:OSA_TEST_MEMWAIT_SECONDS -match '^\d+$') { $step = [int]$env:OSA_TEST_MEMWAIT_SECONDS }
+    Write-Warn "critical memory before ${Before}: $($m.Critical -join ', '); waiting up to $waitMin min for memory to be freed"
+    $started = Get-Date
+    while (((Get-Date) - $started).TotalMinutes -lt $waitMin) {
+        Start-Sleep -Seconds $step
+        $m = Test-MemoryState -NoCount
+        if (-not $m.Critical.Count) {
+            $line = "memory before $Before recovered after $([math]::Round(((Get-Date) - $started).TotalMinutes, 1)) min of waiting ($($m.Text))"
+            Write-Ok $line
+            $script:MemoryRecoveries += $line
+            return $null
+        }
+    }
+    $short = "memory stayed critical for $waitMin min ($(($m.Critical | ForEach-Object { $_ -replace ' \((critical\w+) [\d.]+\)$', '' }) -join ', '))"
+    $script:MemoryRecoveries += "before ${Before}: $short"
+    [pscustomobject]@{
+        Reason = "$short before ${Before}; $($m.Text); biggest processes: $(Get-BigProcesses); close other programs and run again"
+        Short = $short
+    }
 }
 
 # Memory log (docs/memory-recovery-plan.md 2.6): memory-log.ps1 next to the runner writes one line
@@ -1294,7 +1390,7 @@ Write-Step "OpenSpec auto-mode in $Project"
 if ($Detached) { try { $Host.UI.RawUI.WindowTitle = "openspec-auto: $(Split-Path -Leaf $Project)" } catch { } }
 # the job object the runner itself is in (4.1): one that kills on close would end the run with it
 if ('OsaJob' -as [type]) {
-    $jf = [OsaJob]::OwnJobFlags()
+    $jf = $script:OwnJobFlags
     if ($jf -eq -1) { Write-Ok 'runner is not in a job object' }
     elseif ($jf -lt 0) { Write-Ok "job object of the runner could not be read ($jf)" }
     elseif ($jf -band 0x2000) {
@@ -1313,6 +1409,9 @@ elseif ($cfg.scenarioCoverage -isnot [bool]) { $errors += "scenarioCoverage in $
 elseif ($cfg.preventSleep -isnot [bool]) { $errors += "preventSleep in $ConfigRel must be true or false (is '$($cfg.preventSleep)')" }
 elseif ("$($cfg.minFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "minFreeMemoryGB in $ConfigRel must be a number >= 0 (is '$($cfg.minFreeMemoryGB)')" }
 elseif ("$($cfg.maxCommitPercent)" -notmatch '^\d+(\.\d+)?$' -or [double]$cfg.maxCommitPercent -gt 100) { $errors += "maxCommitPercent in $ConfigRel must be a number from 0 to 100 (is '$($cfg.maxCommitPercent)')" }
+elseif ("$($cfg.criticalFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "criticalFreeMemoryGB in $ConfigRel must be a number >= 0 (is '$($cfg.criticalFreeMemoryGB)')" }
+elseif ("$($cfg.criticalCommitPercent)" -notmatch '^\d+(\.\d+)?$' -or [double]$cfg.criticalCommitPercent -gt 100) { $errors += "criticalCommitPercent in $ConfigRel must be a number from 0 to 100 (is '$($cfg.criticalCommitPercent)')" }
+elseif ("$($cfg.memoryWaitMinutes)" -notmatch '^\d+(\.\d+)?$') { $errors += "memoryWaitMinutes in $ConfigRel must be a number >= 0 (is '$($cfg.memoryWaitMinutes)')" }
 elseif (@($cfg.memoryErrorPatterns | Where-Object { $_ -isnot [string] }).Count) { $errors += "memoryErrorPatterns in $ConfigRel must be a list of strings" }
 elseif (@($cfg.keepProcesses | Where-Object { $_ -isnot [string] -or -not $_.Trim() }).Count) { $errors += "keepProcesses in $ConfigRel must be a list of process names (wildcards allowed, e.g. [`"qemu-system-*`", `"adb`"])" }
 elseif ($cfg.acceptanceMode -ne 'off') {
@@ -1442,9 +1541,10 @@ if ($runActive) {
     # dry run while a run is going: do not run the tests in the tree the worker is using
     $baseline = [pscustomobject]@{ Passed = $true; Label = 'skipped (a run is in progress)'; Minutes = 0; Dirty = ''; Tail = ''; Log = $baselineLog }
 } else {
-    $baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
+    $baseline = Invoke-TestsWithMemoryRetry $cfg $baselineLog $baselineAccept 'baseline tests'
 }
 Write-Host (" {0}, {1} min" -f $baseline.Label, $baseline.Minutes)
+if ($script:MemoryNotes.Count) { $warnings += $script:MemoryNotes; $script:MemoryNotes = @() }
 if ($baselineAccept.Count) { Write-Ok "acceptance tests of archived changes included: $($baselineAccept -join ', ')" }
 $resumeFix = $null
 if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
@@ -1455,7 +1555,7 @@ if ($baseline.Dirty) {
     Exit-Runner 2 'testCommand leaves the working tree dirty'
 }
 if (-not $baseline.Passed -and $baseline.Memory) {
-    $why = "baseline tests ran out of memory ($($baseline.Memory)); close other programs and run again"
+    $why = "baseline tests $(if ($baseline.NotRun) { 'not run' } else { 'ran out of memory' }) ($($baseline.Memory)); close other programs and run again"
     Write-Bad "$why. Output: $StateDirName/baseline-tests.txt"
     Exit-Runner 2 $why
 }
@@ -1581,6 +1681,7 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
     if ($branches -notcontains $branch) { $branches += $branch }
 
     $outcome = $null; $notes = @(); $cost = 0.0; $run = 0; $testsLabel = '-'
+    $script:MemRetriesLeft = 1; $script:MemoryNotes = @()   # one memory retry per change (recovery 2.5)
     if ($item.IsFix) { $notes += "fixes $($item.Parent)" }
 
     # task groups as units (step 2): one group per run, runner tests after every group
@@ -1644,9 +1745,18 @@ Do the completion check and archive (SUCCESS).
         Show-NewLeftovers
         $mem = Test-MemoryState
         Write-Host "    $($mem.Text)"
-        if ($mem.Problems.Count) {
-            Write-Warn "low memory before run ${run}: $($mem.Problems -join ', ')"
-            [void](Stop-LeftoversForMemory "run $run of $change")
+        if ($mem.Problems.Count -or $mem.Critical.Count) {
+            Write-Warn "low memory before run ${run}: $(@(@($mem.Problems) + @($mem.Critical) | Select-Object -First 1) -join ', ')"
+            $rec = Invoke-MemoryRecovery "run $run of $change"
+            if ($rec) {
+                # the run is not started (the working tree is clean between runs)
+                Write-Bad $rec.Reason
+                $run--
+                $outcome = 'STOPPED'; $notes += $rec.Reason
+                $stopReason = "change ${change}: $($rec.Reason)"
+                $script:MemoryStop = $rec.Short
+                break
+            }
         }
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
@@ -1677,6 +1787,17 @@ Do the completion check and archive (SUCCESS).
                         $s = Save-Leftovers "openspec-auto: leftovers of LOW-MEMORY in $change run $run"
                         $memNote += "; leftovers stashed on branch $($s.Branch) ($($s.Ref), $($s.Count) files)"
                     } catch { $memNote += "; stashing the leftovers failed: $($_.Exception.Message -replace '\s+', ' ')" }
+                }
+                # one retry per change (recovery 2.5): free memory, then a fresh run of the same unit
+                if ($script:MemRetriesLeft -ge 1) {
+                    $script:MemRetriesLeft--
+                    Write-Warn "$memNote; freeing memory and starting the run once more"
+                    $rec = Invoke-MemoryRecovery "the repeated run of $change" -Force
+                    if (-not $rec) {
+                        $notes += "run ${run}: $memNote; run again after memory recovery"
+                        continue
+                    }
+                    $memNote += "; then $($rec.Short)"
                 }
                 Write-Bad $memNote
                 $outcome = 'STOPPED'; $notes += $memNote
@@ -1757,14 +1878,14 @@ Do the completion check and archive (SUCCESS).
         if ($problems.Count -eq 0 -and $kind -in @('SUCCESS', 'NONCRITICAL')) {
             Write-Host '    tests ...' -NoNewline
             # the change is archived now, so its acceptance tests are part of the regression set
-            $tests = Invoke-Tests $cfg "$logBase.tests.txt" @(Get-DoneAcceptance)
+            $tests = Invoke-TestsWithMemoryRetry $cfg "$logBase.tests.txt" @(Get-DoneAcceptance) 'tests after the archive'
             $testsLabel = $tests.Label
             Write-Host (" {0}, {1} min" -f $tests.Label, $tests.Minutes)
             $claimText = '-'
             if ($w.Claimed) { $claimText = $w.Claimed }
             if ($tests.Dirty) { $problems += "testCommand left the working tree dirty:`n$($tests.Dirty)" }
             elseif (-not $tests.Passed -and $tests.Memory) {
-                $memStop = "tests ran out of memory ($($tests.Memory)); close other programs and run again; output: $(Get-RelPath $tests.Log)"
+                $memStop = "tests $(if ($tests.NotRun) { 'not run' } else { 'ran out of memory' }) ($($tests.Memory)); close other programs and run again; output: $(Get-RelPath $tests.Log)"
             }
             elseif ($kind -eq 'SUCCESS' -and -not $tests.Passed) {
                 $problems += "tests fail after $change was archived ($($tests.Label), agent claimed $claimText); output: $(Get-RelPath $tests.Log)"
@@ -1795,7 +1916,7 @@ Do the completion check and archive (SUCCESS).
                     $allDone = -not ($groupsAfter | Where-Object { $_.Done -lt $_.Total })
                     if ($allDone -and (Test-HasAcceptance $change)) { $gAccept = @($change) }
                     Write-Host "    tests after group $gid$(if ($gAccept.Count) { ' (+ acceptance)' }) ..." -NoNewline
-                    $gt = Invoke-Tests $cfg ("{0}.group{1}.tests.txt" -f $logBase, $gid) $gAccept
+                    $gt = Invoke-TestsWithMemoryRetry $cfg ("{0}.group{1}.tests.txt" -f $logBase, $gid) $gAccept "tests after group $gid"
                     Write-Host (" {0}, {1} min" -f $gt.Label, $gt.Minutes)
                     if ($gt.Dirty) { $problems += "testCommand left the working tree dirty:`n$($gt.Dirty)" }
                     else {
@@ -1807,7 +1928,7 @@ Do the completion check and archive (SUCCESS).
                         } elseif ($gt.Memory) {
                             # no repair run: the tests could not run, the code is not to blame
                             $groupHistory[$gid] += 'out of memory'
-                            $memStop = "tests after group $gid ran out of memory ($($gt.Memory)); close other programs and run again; output: $(Get-RelPath $gt.Log)"
+                            $memStop = "tests after group $gid $(if ($gt.NotRun) { 'not run' } else { 'ran out of memory' }) ($($gt.Memory)); close other programs and run again; output: $(Get-RelPath $gt.Log)"
                         } else {
                             $groupHistory[$gid] += 'red'
                             if ($mode -eq 'repair') { $repairCount++ }
@@ -1861,6 +1982,7 @@ Do the completion check and archive (SUCCESS).
             Write-Ok "result: $kind"
         }
     }
+    if ($script:MemoryNotes.Count) { $notes += $script:MemoryNotes; $script:MemoryNotes = @() }
     if ($outcome -eq 'STOPPED' -and -not $stopReason) { $stopReason = "change ${change}: $($notes -join '; ')" }
     if ($groupHistory.Count) {
         # e.g. "groups: 1 green, 2 red->green (1 repair)"
