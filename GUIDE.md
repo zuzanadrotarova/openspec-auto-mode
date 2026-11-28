@@ -90,9 +90,9 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `tasksPerRun` | how many tasks the agent does in one run, i.e. in one context; fewer = cleaner context, more runs | 8 |
 | `maxRunsPerChange` | max. runs per change | 10 |
 | `timeoutMinutes` | time limit of one run | 60 |
-| `maxTurns` | max. agent turns in one run | 200 |
+| `maxTurns` | max. agent turns in one run; a run that reaches it after finishing work does not stop auto-mode (section 5.8) | 200 |
 | `model` | `sonnet` (cheaper), `opus`, … | default model |
-| `maxBudgetUsdPerRun` | cost cap of one run in USD | no limit |
+| `maxBudgetUsdPerRun` | cost cap of one run in USD; works like `maxTurns` (section 5.8); recommended, e.g. `8` | no limit |
 | `testTimeoutMinutes` | time limit of one test run by auto-mode itself | 20 |
 | `fixMode` | what happens when a change is NONCRITICAL and the tests fail: `immediate` = fix it right away, `stop` = stop and leave it to you | `immediate` |
 | `maxRunsPerFix` | max. runs to fix such a bug | 2 |
@@ -193,6 +193,7 @@ You get a summary at the end. `/openspec-auto report` repeats it any time later.
 | **BLOCKED** | Architectural problem, auto-mode stopped. | Decide and resolve (section 5.1). |
 | **FAILED-CHECK / STOPPED** | The check after a run failed (nothing written, crash, timeout, no progress, push attempt, tests fail although the agent reported success, the fix did not make the tests pass). Auto-mode stopped. | Claude explains the cause and proposes a fix (section 5.2). |
 | **STOPPED: out of memory** | The tests or the agent ran out of memory. Nothing is broken; unfinished work was set aside. | Close programs, run again (section 5.6). |
+| **STOPPED: limit** | A run reached `maxTurns` or `maxBudgetUsdPerRun` without finishing a task, or two runs in a row reached it. | Split the task or raise the limit, run again (section 5.8). |
 | **not processed** | The loop never reached the change. | It is processed on the next start. |
 
 ### Merge
@@ -258,6 +259,18 @@ Builds with Gradle, Kotlin and Android emulators need a lot of memory; with less
 - An emulator you need: start it before the run and add it to `keepProcesses` (e.g. `["qemu-system-*", "emulator*", "adb"]`), so memory recovery never stops it.
 - Test outputs (build folders, reports) belong in `.gitignore`, otherwise they end up among the set-aside files after an interruption.
 
+### 5.8 A run reached its limit (`maxTurns`, `maxBudgetUsdPerRun`)
+
+Every run has a limit of turns (`maxTurns`, 200) and, if you set it, of money (`maxBudgetUsdPerRun`). When a run reaches one, Claude Code ends it. Auto-mode then looks at what the run achieved:
+
+- **At least one task finished:** auto-mode goes on with a new run, as after a normal run (the report notes `hit the turn limit … after progress`). If a task group was completed, its tests run first.
+- **No task finished:** auto-mode stops with `STOPPED` and `… without finishing a task; the task is probably too large`. Split the task in `tasks.md` into smaller ones or raise the limit, then `/openspec-auto run`; it continues where it stopped.
+- **Two runs in a row reached the limit:** auto-mode stops (`… again (2 runs in a row)`) so it does not spend money without end. Look at what the runs did before you raise the limit.
+
+The work the run had not committed yet (the task in progress) is kept: it goes into `git stash` and as a file into `.openspec-auto/leftovers/<change>-runNN.patch`. The next run gets a note to read it, use what is correct and redo the rest. When the change ends successfully, auto-mode removes these stashes; the patch files stay (they are small and not part of the project).
+
+A run that runs longer than `timeoutMinutes` is not such a limit: it stops auto-mode (`timed out after … min`).
+
 ---
 
 ## 6. Safety
@@ -274,7 +287,9 @@ Only run auto-mode in projects you trust.
 
 ## 7. Cost
 
-A small change on the `sonnet` model costs about USD 0.15. The summary shows the cost of each change. Set a cap with `maxBudgetUsdPerRun`.
+A small change on the `sonnet` model costs about USD 0.15. The summary shows the cost of each change. Set a cap with `maxBudgetUsdPerRun`: a run that reaches it after real progress does not stop the night, the next run continues (section 5.8).
+
+**What did a project cost in total?** Double-click **OpenSpec dashboard** on the desktop (or in the Start menu), or tell Claude "ukáž dashboard" / "koľko to stálo". The page shows the cost of every project, split into auto-mode, spec preparation (your OpenSpec planning sessions with Claude), other work with Claude, and mixed sessions; per week, per change and per run. It updates itself after every auto-mode start and every ended Claude Code session, stays on your PC and keeps the history even after Claude Code deletes old conversations. The amounts are the list-price value of the usage; with a subscription you do not pay them on top.
 
 ---
 
@@ -331,8 +346,11 @@ This is mostly for Claude, not for you.
 | `memory stayed critical for 10 min (…) before run …` / `tests … not run (memory stayed critical …)` | the PC had too little memory for 10 minutes; close programs (the message names the biggest) and run `/openspec-auto run` again |
 | `memory was low before x of y checks …` (report warning) | look at `memory.csv` of that run to see which program grew; close it before the next run |
 | `memory cleanup before …: <command> (exit n)` (console, `cleanup.txt`) | the cleanup command failed; only a note, the run goes on. Try the command by hand, fix it or remove it from `memoryCleanupCommands` |
+| `run N of NN-x hit the turn limit (maxTurns 200) without finishing a task …` / `hit the budget limit (maxBudgetUsdPerRun …) …` (STOPPED) | split the task in `tasks.md` or raise the limit, commit, run again (section 5.8) |
+| `run N of NN-x hit the … limit … again (2 runs in a row)` (STOPPED) | look at the run logs (what took so long), then split the work or raise the limit (section 5.8) |
+| `timed out after N min (timeoutMinutes)` (FAILED-CHECK) | the run hung or the work is too large; raise `timeoutMinutes` or split the tasks |
 | `memoryCleanupCommands left the working tree dirty before …` (STOPPED) | the cleanup command changed project files; use a command that does not write into the project, commit or remove the files, run again |
 | `preventSleep … must be true or false` / `minFreeMemoryGB …`, `criticalFreeMemoryGB …`, `memoryWaitMinutes … must be a number >= 0` / `maxCommitPercent …`, `criticalCommitPercent … must be a number from 0 to 100` | fix the value in `openspec/auto-mode.json` |
 | `memoryCleanupCommands … must be a list of commands` / `keepProcesses … must be a list of process names` | write a list of non-empty strings, e.g. `["gradlew --stop"]`, `["qemu-system-*", "adb"]` |
 
-- **Tool tests** (no API calls): `tests/run-tests.ps1`.
+- **Tool tests** (no API calls): `tests/run-tests.ps1`, `tests/dashboard-tests.ps1`.

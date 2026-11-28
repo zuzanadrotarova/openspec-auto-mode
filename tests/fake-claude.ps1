@@ -74,6 +74,28 @@ function Result([string]$Kind) {
     exit 0
 }
 
+# Claude Code ended by --max-turns / --max-budget-usd: nonzero exit, subtype error_max_*
+function Limit([string]$Sub = 'error_max_turns') {
+    $o = @{ type = 'result'; subtype = $Sub; is_error = $true; num_turns = 200; total_cost_usd = 0.01 }
+    Write-Output ($o | ConvertTo-Json -Compress)
+    exit 1
+}
+# the leftover hint of the runner (docs/limit-continue-plan.md 4 B) is written to .git/fake-hint.txt
+if ($prompt -match 'interrupted by a limit( during .+?)?\. Its uncommitted work is in `([^`]+)`') {
+    Add-Content '.git/fake-hint.txt' "$change$($Matches[1]) $($Matches[2])"
+}
+# ticks the first open task of a group (one task per run)
+function Tick-OneInGroup([string]$Group) {
+    $lines = [System.IO.File]::ReadAllLines((Resolve-Path $tasks))
+    $cur = $null
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        if ($lines[$i] -match '^##\s+(\d+)\.') { $cur = $Matches[1]; continue }
+        if ($cur -eq $Group -and $lines[$i] -match '^- \[ \]') { $lines[$i] = $lines[$i] -replace '^- \[ \]', '- [x]'; break }
+    }
+    [System.IO.File]::WriteAllText((Resolve-Path $tasks), (($lines -join "`n") + "`n"))
+    Mark-Impl
+}
+
 # FAKE_BREAK_FILE picks how the project tests break (see run-tests.cmd in tests/run-tests.ps1):
 # broken.txt = red, oom.txt = red with an out-of-memory line, oom-green.txt = green with such a
 # line, slow.txt = hang until the test timeout.
@@ -184,6 +206,38 @@ switch ($mode) {
         # for the manual checks (docs/memory-pressure-plan.md 13): a long run, FAKE_SLEEP_SECONDS
         $secs = 240; if ($env:FAKE_SLEEP_SECONDS) { $secs = [int]$env:FAKE_SLEEP_SECONDS }
         Start-Sleep $secs; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
+    }
+    'limit-g1' {
+        # group 1 is finished and committed, then the turn limit ends the run; the rest is normal
+        if ((Unit) -eq 'group:1') { Tick-Group '1'; Commit "$change group 1"; Limit }
+        Group-Worker '' $true
+    }
+    'limit-dirty' {
+        # first run of group 1: one task committed, the next one half done (uncommitted), turn limit;
+        # later runs finish normally
+        if ((Unit) -eq 'group:1' -and -not (Test-Path '.git/fake-limit-done')) {
+            Set-Content '.git/fake-limit-done' 'x'
+            Tick-OneInGroup '1'; Commit "$change task 1.1"
+            Set-Content 'wip.txt' 'half-done task 1.2'
+            Limit
+        }
+        Group-Worker '' $true
+    }
+    'limit-noprogress' {
+        # first run: no task finished, uncommitted work, turn limit (budget limit with FAKE_LIMIT_SUBTYPE)
+        $sub = 'error_max_turns'; if ($env:FAKE_LIMIT_SUBTYPE) { $sub = $env:FAKE_LIMIT_SUBTYPE }
+        Set-Content 'wip.txt' 'started, not finished'
+        Limit $sub
+    }
+    'limit-always' {
+        # every run finishes one task, commits it and hits the turn limit
+        $u = Unit
+        if ($u -like 'group:*') { Tick-OneInGroup $u.Substring(6); Commit "$change one task" }
+        Limit
+    }
+    'limit-leave' {
+        # turn limit after switching the branch: still a FAILED-CHECK
+        Tick 1; Commit "$change one task"; git checkout -q -b elsewhere 2>&1 | Out-Null; Limit
     }
     'slow' { Start-Sleep 20; Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS' }
     'noop' { Result 'CONTINUE' }

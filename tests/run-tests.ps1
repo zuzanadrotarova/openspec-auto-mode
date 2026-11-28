@@ -13,6 +13,8 @@ $script:Failed = 0
 # (T39 and T43 change them)
 $env:OSA_TEST_FREE_MB = '16000'
 $env:OSA_TEST_COMMIT = '20000/40000'
+# the dashboard import at the end of every start writes into the work folder, never the user's history
+$env:OSA_HISTORY_DIR = Join-Path $WorkDir 'dashboard-home'
 
 function Check([bool]$Cond, [string]$Msg) {
     if ($Cond) { Write-Host "    ok   $Msg" -ForegroundColor Green }
@@ -96,6 +98,8 @@ Check ((Get-ChildItem "$p/.openspec-auto/runs/*/02-b.run*.prompt.txt").Count -eq
 Check ((GitIn $p rev-parse origin/main) -eq (GitIn $p rev-parse main)) 'nothing pushed'
 Check (Clean $p) 'git status clean (report is git-excluded)'
 Check (Test-Path "$p/.openspec-auto/auto-mode-report.md") 'report written'
+$dashRuns = Join-Path $env:OSA_HISTORY_DIR 'history/runs.jsonl'
+Check ((Test-Path $dashRuns) -and @(Get-Content $dashRuns | Where-Object { $_ -match '"change":"02-b"' }).Count -eq 3) 'dashboard history updated at the end (3 runs of 02-b)'
 
 Write-Host "T2 non-critical error"
 $p = New-Project 't2' @('01-a:2', '02-b:1')
@@ -923,6 +927,42 @@ Check ($r.Code -eq 2 -and $r.Out -match 'memoryCleanupCommands left the working 
 $p = New-Project 't47f' @('01-a:1') ($DefaultConfig -replace ' }$', ', "memoryCleanupCommands": [""] }')
 $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'memoryCleanupCommands .* must be a list of commands') 'invalid memoryCleanupCommands refused'
+
+Write-Host "T48 limit stops (maxTurns / maxBudgetUsdPerRun): continue after progress, stop without, leftovers as a patch"
+function Get-Stashes([string]$P) { GitIn $P stash list --format=%s }
+function Get-Hints([string]$P) { $f = Join-Path $P '.git/fake-hint.txt'; if (Test-Path $f) { @(Get-Content $f) } else { @() } }
+$p = New-Project 't48' @('01-a:4:2', '02-b:1')
+$r = Invoke-Runner $p '01-a=limit-g1;02-b=success'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Archived $p '02-b')) 'turn limit after a finished group: the batch goes on'
+Check ($r.Out -match 'run 1: hit the turn limit \(maxTurns 200\) after progress' -and $r.Out -match 'tests after group 1') 'note in the report, group tests ran'
+$p = New-Project 't48b' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=limit-dirty'
+$patch = Join-Path $p '.openspec-auto/leftovers/01-a-run01.patch'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Clean $p)) 'limit with uncommitted work after progress: continue, change done'
+Check ((Test-Path $patch) -and (Get-Content -Raw $patch) -match 'wip\.txt' -and (Get-Content -Raw $patch) -match 'half-done task 1\.2') 'the uncommitted work is in the patch file'
+Check ((Get-Hints $p) -contains '01-a during task 1.2 .openspec-auto/leftovers/01-a-run01.patch') 'the next run gets the hint with the task and the patch'
+Check (-not (Get-Stashes $p) -and $r.Out -match '1 leftover of limit stops kept only as patches') 'stash dropped after SUCCESS, patch kept'
+$p = New-Project 't48c' @('01-a:2')
+$r = Invoke-Runner $p '01-a=limit-noprogress'
+Check ($r.Code -eq 1 -and $r.Out -match 'run 1 of 01-a hit the turn limit \(maxTurns 200\) without finishing a task; the task is probably too large: split it in tasks\.md or raise maxTurns') 'limit without progress: STOPPED with a clear message'
+Check ($r.Out -notmatch 'FAILED-CHECK' -and $r.Out -match 'STOPPED' -and (Clean $p)) 'not FAILED-CHECK, working tree clean'
+Check ((Get-Stashes $p) -match 'leftovers of limit stop in 01-a run 1 \(patch \.openspec-auto/leftovers/01-a-run01\.patch\)') 'stash kept after STOPPED'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'the next start continues the change'
+Check ((Get-Hints $p) -contains '01-a during task 1.1 .openspec-auto/leftovers/01-a-run01.patch') 'after a restart the first run still gets the hint'
+Check (-not (Get-Stashes $p)) 'stash dropped after SUCCESS'
+$p = New-Project 't48d' @('01-a:2') ($DefaultConfig -replace ' }$', ', "maxBudgetUsdPerRun": 8 }')
+$env:FAKE_LIMIT_SUBTYPE = 'error_max_budget_usd'
+$r = Invoke-Runner $p '01-a=limit-noprogress'
+Remove-Item Env:FAKE_LIMIT_SUBTYPE
+Check ($r.Code -eq 1 -and $r.Out -match 'hit the budget limit \(maxBudgetUsdPerRun 8\) without finishing a task; .* raise maxBudgetUsdPerRun') 'budget limit without progress: STOPPED, names maxBudgetUsdPerRun'
+$p = New-Project 't48e' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=limit-always'
+Check ($r.Code -eq 1 -and $r.Out -match 'run 2 of 01-a hit the turn limit \(maxTurns 200\) again \(2 runs in a row\)') 'two limit stops in a row: STOPPED'
+Check ((Get-ChildItem "$p/.openspec-auto/runs/*/01-a.run*.prompt.txt").Count -eq 2) 'no third run'
+$p = New-Project 't48f' @('01-a:2')
+$r = Invoke-Runner $p '01-a=limit-leave'
+Check ($r.Code -eq 1 -and $r.Out -match 'FAILED-CHECK' -and $r.Out -match 'run 1 of 01-a: agent left branch auto/01-a') 'limit stop with another problem: FAILED-CHECK, the message names the problem'
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }

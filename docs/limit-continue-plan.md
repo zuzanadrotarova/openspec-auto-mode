@@ -1,6 +1,6 @@
 # Runs stopped by a limit: continue instead of FAILED-CHECK – plan
 
-Status: plan agreed in principle 2026-11-28, not implemented; open questions in section 8.
+Status: steps 1–4 implemented 2026-11-28 (runner, tests T48, docs); step 5 (paid check) open. Decisions: timeouts are not limit stops; the second limit stop in a row ends STOPPED; D (-CleanLeftovers) not done.
 Date: 2026-11-28
 
 ## 1. Problem (real batch of 2026-11-27)

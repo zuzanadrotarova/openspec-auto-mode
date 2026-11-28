@@ -7,5 +7,7 @@ param(
 $tool = Split-Path -Parent $PSScriptRoot
 $env:FAKE_PLAN = '01-check=long'
 $env:FAKE_SLEEP_SECONDS = [string]$Seconds
+# fake runs stay out of the user's cost dashboard
+$env:OSA_HISTORY_DIR = Join-Path ([System.IO.Path]::GetTempPath()) 'osa-check-dashboard'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $tool 'openspec-auto.ps1') -Project $Path -ClaudeCommand (Join-Path $PSScriptRoot 'fake-claude.cmd') -Background
 exit $LASTEXITCODE

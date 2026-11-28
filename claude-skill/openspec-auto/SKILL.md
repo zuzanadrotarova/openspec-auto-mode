@@ -1,7 +1,7 @@
 ---
 name: openspec-auto
-description: OpenSpec auto-mode – unattended implementation of numbered OpenSpec changes (01-…, 02-…), each in a fresh Claude Code process with an empty context. Use when the user wants to set up auto-mode in a project, check readiness, start it, or see its report ("openspec-auto", "auto-mode", "spusti auto-mode", "priprav projekt na auto-mode", "ako dopadol auto-mode").
-argument-hint: "[init | check | acceptance <change> | run | report]"
+description: OpenSpec auto-mode – unattended implementation of numbered OpenSpec changes (01-…, 02-…), each in a fresh Claude Code process with an empty context. Use when the user wants to set up auto-mode in a project, check readiness, start it, or see its report, or wants the cost dashboard ("openspec-auto", "auto-mode", "spusti auto-mode", "priprav projekt na auto-mode", "ako dopadol auto-mode", "ukáž dashboard", "koľko to stálo").
+argument-hint: "[init | check | acceptance <change> | run | report | dashboard]"
 ---
 
 # OpenSpec auto-mode
@@ -32,6 +32,7 @@ Exit codes: `0` = OK, `1` = the loop stopped (BLOCKED / FAILED-CHECK / STOPPED),
 | `acceptance <change>` | Write the acceptance tests of a change with the user |
 | `run` | Start auto-mode |
 | `report` | Summarize the last report |
+| `dashboard` | Cost dashboard of all projects |
 | none | `check`; if everything passes, ask whether to start it |
 
 ## init – set up the project
@@ -115,12 +116,24 @@ Then read `.openspec-auto/auto-mode-report.md` in the project root and summarize
   - FAILED-CHECK / STOPPED = the runner's check failed (`agent changed frozen acceptance tests` = the agent touched the acceptance folder; show the commit with `git log -p -- <acceptanceDir>/`),
   - not processed = the loop never reached it;
 - STOPPED with `ran out of memory` (runner tests) or `worker ran out of memory` = the PC was short of memory, not a code problem; no repair was paid for. Suggest closing other programs (the warnings name the biggest processes) and `/openspec-auto run` again; it continues where it stopped;
+- STOPPED with `hit the turn limit` / `hit the budget limit` (`maxTurns` / `maxBudgetUsdPerRun`) = a run used its whole limit: `without finishing a task` → the task is probably too large; propose splitting it in `tasks.md` (an OpenSpec artifact, only with the user's ok) or raising the limit; `again (2 runs in a row)` → read only the `result` field and `num_turns` of the two named logs first. A limit stop after progress is only a note; the run went on. Its uncommitted work is in `.openspec-auto/leftovers/<change>-runNN.patch`;
 - `## Stashed leftovers`: unfinished files of an interrupted or out-of-memory run. Explain that `git stash show -p stash@{n}` shows them and `git stash drop stash@{n}` deletes them; the work itself is redone by the run. Never drop a stash without the user's ok;
 - total cost, and the `fix-…` changes waiting for the user;
 - **BLOCKED:** summarize `openspec/changes/<change>/BLOCKED.md` (what blocks, options) and explain the way out. The user decides; you then help fix it, delete `BLOCKED.md`, commit, and `/openspec-auto run` again.
 - **FAILED-CHECK:** read the reason in the report notes. If needed, read only the `result` and `permission_denials` fields of the named log `.openspec-auto/runs/<time>/<change>.runXX.out.json`, never whole logs. When the tests failed, read only the end of the named `.tests.txt` log. Explain it and propose a fix. The tests must be green before the next start (an interrupted `fix-…` change is the exception: the runner resumes it).
 - **Everything OK:** offer to review and merge. The last `auto/…` branch contains all changes (`git log --oneline main..auto/<last>`, then `git checkout main` and `git merge auto/<last>`). Merge only when the user agrees.
 - `fix-…` changes: offer `/opsx:apply fix-…` interactively, or renaming them to a numbered change for the next auto-mode run.
+
+## dashboard – costs of all projects
+
+Also when the user asks what auto-mode or a project cost ("ukáž dashboard", "koľko to stálo").
+
+1. Run `powershell -NoProfile -ExecutionPolicy Bypass -File "{{OPENSPEC_AUTO_HOME}}\dashboard.ps1" -Import`. It reads the auto-mode runs of the projects and the Claude Code session records (only numbers and names) into `%USERPROFILE%\.openspec-auto\history\` and rebuilds `%USERPROFILE%\.openspec-auto\dashboard.html`. It is safe while a run goes.
+2. Open the page with `Start-Process "$env:USERPROFILE\.openspec-auto\dashboard.html"`.
+3. Answer in a few lines from `history\runs.jsonl` and `history\sessions.jsonl` (sum the `cost` fields; sessions have `category` spec / other / mixed): total, auto-mode, spec preparation, other, the most expensive project or change, and how many sessions have an unknown cost. Say that the costs are list-price values of the usage; with a subscription that is not money paid.
+4. Never paste the history files into the conversation and never send them anywhere.
+
+The page also rebuilds itself after every auto-mode start and every ended Claude Code session (SessionEnd hook from `install.ps1`); the "OpenSpec dashboard" shortcut on the desktop opens it.
 
 ## Rules
 

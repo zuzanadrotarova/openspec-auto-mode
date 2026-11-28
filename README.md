@@ -87,9 +87,9 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `tasksPerRun` | max. tasks from `tasks.md` per run (one context) | 8 |
 | `maxRunsPerChange` | max. runs per change | 10 |
 | `timeoutMinutes` | time limit of one run | 60 |
-| `maxTurns` | max. agent turns in one run | 200 |
+| `maxTurns` | max. agent turns in one run; reaching it is a *limit stop* (see Outcomes) | 200 |
 | `model`, `effort` | model and reasoning effort for Claude Code | Claude Code default |
-| `maxBudgetUsdPerRun` | cost cap of one run | no limit |
+| `maxBudgetUsdPerRun` | cost cap of one run; reaching it is a *limit stop*; recommended for unattended runs | no limit |
 | `testTimeoutMinutes` | time limit of one test run by the script | 20 |
 | `groupTesting` | one task group (`## N. …` in `tasks.md`) per run, the script tests after every group, archiving in a separate final run; `false` = one pass, tests only at the end | `true` |
 | `maxGroupRepairs` | repair runs for a group whose tests are red when it is complete | 2 |
@@ -199,8 +199,10 @@ powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Background      
 | SUCCESS | change implemented and archived, the script's own test run passes → next change |
 | NONCRITICAL | archived + a `fix-NN-name` change describing the bug is created. Tests green (bug not visible to tests): the fix waits for you → next change. Tests red: the script processes the fix right away on the same branch (at most `maxRunsPerFix` runs, done = tests green) → next change, or **stop** if the fix does not pass |
 | BLOCKED | architectural problem, `openspec/changes/NN-name/BLOCKED.md`, not archived → **stop** |
-| FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress, tests fail after archiving) → **stop** |
-| STOPPED | a limit was reached (`maxRunsPerChange`, `maxRunsPerFix`, a group still red after `maxGroupRepairs` repair runs), or the tests or the worker ran out of memory → **stop** |
+| FAILED-CHECK | a script check failed (uncommitted changes, invalid specs, push attempt, crash, timeout, no progress, tests fail after archiving) → **stop**; the stop reason names the first problem (`run 3 of 02-x: agent left branch …`) |
+| STOPPED | a limit was reached (`maxRunsPerChange`, `maxRunsPerFix`, a group still red after `maxGroupRepairs` repair runs), the tests or the worker ran out of memory, or a limit stop without progress / twice in a row → **stop** |
+
+**Limit stops:** a run ended by `maxTurns` or `maxBudgetUsdPerRun` (Claude Code subtype `error_max_turns` / `error_max_budget_usd`) is not a FAILED-CHECK. All other checks still apply (branch, push, validation, frozen acceptance tests). If tasks were ticked, the loop continues with a fresh run (group tests first when a group was completed); without progress the change ends STOPPED (`… without finishing a task; split it in tasks.md or raise maxTurns`); a second limit stop in a row also ends STOPPED. Uncommitted work is stashed and written to `.openspec-auto/leftovers/<change>-runNN.patch`; the next run (also after a restart) gets a hint to read it and use what is correct. After SUCCESS / NONCRITICAL the runner drops these stashes (only limit-stop stashes of that change whose patch exists). `timeoutMinutes` is not a limit stop.
 
 The notes column shows the test result of every task group, e.g. `groups: 1 green, 2 red->green (1 repair)`.
 
@@ -224,6 +226,18 @@ Apart from `running.json` / `last-run.json` (section above), the script keeps no
 
 Every run is a full Claude Code session on your account: with a Claude subscription it counts toward your plan's usage limits, with an API key it is billed. The cost shown in the report comes from Claude Code itself. Measured on a small Node project with `sonnet`: about USD 0.15–0.20 per change in one pass (`groupTesting: false`), about USD 0.38 for a change with two task groups (three runs). Set a cap with `maxBudgetUsdPerRun`. The tests in `tests/` use a fake agent and make no API calls.
 
+
+### Cost dashboard
+
+`dashboard.ps1` collects the cost of every project into one local page, split into **auto-mode** (runner runs), **spec preparation** (interactive sessions that used OpenSpec propose / explore / update / sync), **other interactive work** and **mixed** sessions.
+
+- Sources: `<project>/.openspec-auto/runs/*/*.runNN.out.json` (cost, tokens per model, turns, subtype, unit from the prompt, change result from the report) and the Claude Code transcripts `~/.claude/projects/*/*.jsonl`: per Claude Code process that worked on a session the last `cost-state` record; the session cost is their sum. A session without such a record (crashed, still open) has an unknown cost. Subagent transcripts are part of their session.
+- History: `%USERPROFILE%\.openspec-auto\history\runs.jsonl` and `sessions.jsonl`, one record per run / session keyed by project + stamp + change + run or session id; a re-import updates records, records of deleted projects and transcripts stay. Only numbers and names (no prompts, code or conversation text). Raise `cleanupPeriodDays` in `~/.claude/settings.json` (e.g. 90) so transcripts live long enough to be imported.
+- Page: `%USERPROFILE%\.openspec-auto\dashboard.html`, self-contained (data embedded, no server): totals per category, cost per week, projects (click for changes, runs and sessions), cost by model, token shares, the 10 most expensive runs and sessions.
+- Kept current automatically: the runner imports its project at the end of every start; `install.ps1` adds a `SessionEnd` hook (`dashboard.ps1 -Hook`, returns at once and imports the session in a hidden process 20 s later; errors go to `history\dashboard-errors.log`) and an "OpenSpec dashboard" shortcut on the desktop and in the Start menu. `install.ps1 -NoDashboard` removes hook and shortcuts. In Claude Code: `/openspec-auto dashboard` or "koľko to stálo".
+- Categories: the skill list for spec preparation can be changed in `%USERPROFILE%\.openspec-auto\dashboard-config.json` (`{ "specSkills": [...] }`).
+- Costs are list-price values computed by Claude Code; with a subscription they show the value of the usage, not money paid.
+
 ## Safety
 
 - The agent runs in `dontAsk` mode: it may only do what is on the allowlist (file tools, `openspec`, local git without branch operations, `testCommand` and `allowedCommands`). Skills are denied: global ones such as OpenSpec's `verify` are for interactive use only.
@@ -238,10 +252,12 @@ Every run is a full Claude Code session on your account: with a Claude subscript
 | `openspec-auto.ps1` | control script (loop, checks, report) |
 | `memory-log.ps1` | memory log of a run (`memory.csv`), started by the runner |
 | `worker-prompt.md` | instructions for the agent of a single run |
-| `install.ps1` | installs the `/openspec-auto` skill for the current user |
+| `install.ps1` | installs the `/openspec-auto` skill for the current user, the dashboard hook and shortcuts |
+| `dashboard.ps1`, `dashboard-template.html` | cost dashboard: import into the central history, local HTML page |
 | `claude-skill/openspec-auto/SKILL.md` | skill source (`install.ps1` fills in the runner path) |
 | `templates/auto-mode.json` | project configuration template |
 | `tests/run-tests.ps1`, `tests/fake-claude.ps1` | tests of the loop logic with a fake agent (no API calls) |
+| `tests/dashboard-tests.ps1` | tests of the dashboard import with synthetic data |
 | `GUIDE.md` | step-by-step guide |
 | `docs/hardening-plan.md` | design notes: why the script verifies the agent, decisions, and the roadmap |
 | `docs/memory-pressure-plan.md` | design notes: background runs, interrupted runs, out of memory |

@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenSpec dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-0: #f6f6f4; --surface-1: #ffffff; --line: #e4e4e0; --grid: #ececea;
+  --text-primary: #191919; --text-secondary: #666666;
+  --series-1: #257de0; --series-2: #f47230; --series-3: #00b894; --series-4: #f2a600;
+  --accent: #1b64be; --warn: #b54708;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-0: #111111; --surface-1: #191919; --line: #2e2e2e; --grid: #262626;
+    --text-primary: #efefef; --text-secondary: #9c9c9c;
+    --series-1: #338ced; --series-2: #e76624; --series-3: #00a888; --series-4: #d28e05;
+    --accent: #6aabf1; --warn: #f79009;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #111111; --surface-1: #191919; --line: #2e2e2e; --grid: #262626;
+  --text-primary: #efefef; --text-secondary: #9c9c9c;
+  --series-1: #338ced; --series-2: #e76624; --series-3: #00a888; --series-4: #d28e05;
+  --accent: #6aabf1; --warn: #f79009;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface-0); color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 28px 0 10px; }
+h3 { font-size: 14px; margin: 16px 0 8px; }
+.sub { color: var(--text-secondary); font-size: 13px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-top: 16px; }
+.card { background: var(--surface-1); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+.card .label { color: var(--text-secondary); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.card .value { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.panel { background: var(--surface-1); border: 1px solid var(--line); border-radius: 10px; padding: 14px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--text-secondary); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--grid); }
+tr.sel td { background: var(--grid); font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 0 0 8px; font-size: 12px; color: var(--text-secondary); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.bar { fill-opacity: 1; }
+.axis text { fill: var(--text-secondary); font-size: 11px; }
+.axis line { stroke: var(--grid); }
+#tip { position: fixed; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.15); display: none; z-index: 10; font-variant-numeric: tabular-nums; }
+#tip .row { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+.tag { display: inline-block; padding: 0 6px; border-radius: 6px; border: 1px solid var(--line); font-size: 12px; }
+.warn { color: var(--warn); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+.empty { color: var(--text-secondary); padding: 8px 0; }
+button.link { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>OpenSpec dashboard</h1>
+  <div class="sub" id="built"></div>
+  <div class="cards" id="cards"></div>
+
+  <h2>Cost per week</h2>
+  <div class="panel">
+    <div class="legend" id="legend"></div>
+    <div id="weeks"></div>
+  </div>
+
+  <h2>Projects</h2>
+  <div class="panel"><table id="projects"></table></div>
+  <div id="detail"></div>
+
+  <div class="grid2">
+    <div><h2>Cost by model</h2><div class="panel"><table id="models"></table></div></div>
+    <div><h2>Tokens</h2><div class="panel"><table id="tokens"></table></div></div>
+  </div>
+
+  <div class="grid2">
+    <div><h2>Most expensive runs</h2><div class="panel"><table id="toprun"></table></div></div>
+    <div><h2>Most expensive sessions</h2><div class="panel"><table id="topses"></table></div></div>
+  </div>
+  <p class="sub">Costs are Claude Code's list-price values; with a subscription they show the value of the usage, not money paid.
+  Sessions are sorted into a category by the skills they used (spec preparation: OpenSpec propose, explore, update, sync).
+  A session without a cost record (crashed or still open) is counted as "cost unknown".</p>
+</main>
+<div id="tip"></div>
+<script id="data" type="application/json">/*DATA*/null</script>
+<script>
+(function () {
+  var D = JSON.parse(document.getElementById('data').textContent) || { runs: [], sessions: [] };
+  var runs = D.runs || [], sessions = D.sessions || [];
+  var CATS = [
+    { key: 'auto', name: 'auto-mode', color: 'var(--series-1)' },
+    { key: 'spec', name: 'spec preparation', color: 'var(--series-2)' },
+    { key: 'other', name: 'other interactive', color: 'var(--series-3)' },
+    { key: 'mixed', name: 'mixed', color: 'var(--series-4)' }
+  ];
+  function usd(v) { return v == null ? '–' : (v < 10 ? v.toFixed(2) : v.toFixed(1)) + ' USD'; }
+  function n(v) { return (v || 0).toLocaleString('en-US'); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function day(s) { return s ? String(s).slice(0, 10) : ''; }
+  function mon(d) { var x = new Date(d); if (isNaN(x)) return null; var w = (x.getDay() + 6) % 7; x.setDate(x.getDate() - w); return x.toISOString().slice(0, 10); }
+  function catOf(s) { return s.category || 'other'; }
+  function sum(a, f) { var t = 0; a.forEach(function (x) { t += f(x) || 0; }); return t; }
+  function dot(c) { return '<i class="dot" style="background:' + c + '"></i>'; }
+
+  document.getElementById('built').textContent = 'Built ' + String(D.built || '').replace('T', ' ') + ' · ' + runs.length + ' auto-mode runs · ' + sessions.length + ' interactive sessions';
+
+  // ---- totals
+  var tot = { auto: sum(runs, function (r) { return r.cost; }) };
+  ['spec', 'other', 'mixed'].forEach(function (k) { tot[k] = sum(sessions.filter(function (s) { return catOf(s) === k; }), function (s) { return s.cost; }); });
+  var unknown = sessions.filter(function (s) { return !s.costKnown; }).length;
+  var all = tot.auto + tot.spec + tot.other + tot.mixed;
+  var cards = '<div class="card"><div class="label">total</div><div class="value">' + usd(all) + '</div></div>';
+  CATS.forEach(function (c) { cards += '<div class="card"><div class="label">' + dot(c.color) + c.name + '</div><div class="value">' + usd(tot[c.key]) + '</div></div>'; });
+  if (unknown) cards += '<div class="card"><div class="label">sessions with cost unknown</div><div class="value">' + unknown + '</div></div>';
+  document.getElementById('cards').innerHTML = cards;
+  document.getElementById('legend').innerHTML = CATS.map(function (c) { return '<span>' + dot(c.color) + c.name + '</span>'; }).join('');
+
+  // ---- tooltip
+  var tip = document.getElementById('tip');
+  function showTip(e, html) { tip.innerHTML = html; tip.style.display = 'block'; var x = e.clientX + 14, y = e.clientY + 14;
+    var w = tip.offsetWidth, h = tip.offsetHeight; if (x + w > innerWidth - 8) x = e.clientX - w - 14; if (y + h > innerHeight - 8) y = e.clientY - h - 14; tip.style.left = x + 'px'; tip.style.top = y + 'px'; }
+  function hideTip() { tip.style.display = 'none'; }
+
+  // ---- weekly stacked bars (one axis, cost)
+  var weeks = {};
+  function addW(d, k, v) { var w = mon(d); if (!w || !v) return; weeks[w] = weeks[w] || { auto: 0, spec: 0, other: 0, mixed: 0 }; weeks[w][k] += v; }
+  runs.forEach(function (r) { addW(r.end, 'auto', r.cost); });
+  sessions.forEach(function (s) { addW(s.start, catOf(s), s.cost); });
+  var wk = Object.keys(weeks).sort();
+  var box = document.getElementById('weeks');
+  if (!wk.length) { box.innerHTML = '<div class="empty">No data yet.</div>'; }
+  else {
+    var W = Math.max(320, box.clientWidth || 800), H = 220, L = 52, B = 26, T = 8;
+    var max = 0; wk.forEach(function (w) { var t = 0; CATS.forEach(function (c) { t += weeks[w][c.key]; }); if (t > max) max = t; });
+    var step = Math.pow(10, Math.floor(Math.log10(max || 1))); var top = Math.ceil(max / step) * step; if (top / step > 6) { step *= 2; top = Math.ceil(max / step) * step; }
+    var bw = Math.min(48, (W - L - 8) / wk.length - 6), gap = (W - L - 8) / wk.length;
+    var y = function (v) { return T + (H - T - B) * (1 - v / top); };
+    var s = '<svg width="100%" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Cost per week by category">';
+    s += '<g class="axis">';
+    for (var v = 0; v <= top + 1e-9; v += step) { s += '<line x1="' + L + '" x2="' + (W - 4) + '" y1="' + y(v) + '" y2="' + y(v) + '"/><text x="' + (L - 6) + '" y="' + (y(v) + 4) + '" text-anchor="end">' + Math.round(v) + '</text>'; }
+    s += '</g>';
+    wk.forEach(function (w, i) {
+      var x = L + i * gap + (gap - bw) / 2, acc = 0, segs = CATS.filter(function (c) { return weeks[w][c.key] > 0; });
+      segs.forEach(function (c, j) {
+        var v = weeks[w][c.key], y1 = y(acc + v), y0 = y(acc), h = Math.max(0, y0 - y1 - (j < segs.length - 1 ? 2 : 0));
+        var isTop = j === segs.length - 1;
+        if (isTop && h > 4) s += '<path d="M' + x + ',' + (y1 + h) + 'V' + (y1 + 4) + 'Q' + x + ',' + y1 + ' ' + (x + 4) + ',' + y1 + 'H' + (x + bw - 4) + 'Q' + (x + bw) + ',' + y1 + ' ' + (x + bw) + ',' + (y1 + 4) + 'V' + (y1 + h) + 'Z" fill="' + c.color + '"/>';
+        else s += '<rect x="' + x + '" y="' + y1 + '" width="' + bw + '" height="' + h + '" fill="' + c.color + '"/>';
+        acc += v;
+      });
+      s += '<rect class="hit" data-w="' + w + '" x="' + (L + i * gap) + '" y="' + T + '" width="' + gap + '" height="' + (H - T - B) + '" fill="transparent"/>';
+      if (wk.length <= 16 || i % Math.ceil(wk.length / 16) === 0) s += '<g class="axis"><text x="' + (x + bw / 2) + '" y="' + (H - 8) + '" text-anchor="middle">' + w.slice(5) + '</text></g>';
+    });
+    s += '<g class="axis"><text x="4" y="12">USD</text></g></svg>';
+    box.innerHTML = s;
+    box.querySelectorAll('.hit').forEach(function (r) {
+      r.addEventListener('mousemove', function (e) { var w = r.getAttribute('data-w'), t = 0;
+        var h = '<b>week of ' + w + '</b>'; CATS.forEach(function (c) { t += weeks[w][c.key]; h += '<div class="row"><span>' + dot(c.color) + ' ' + c.name + '</span><span>' + usd(weeks[w][c.key]) + '</span></div>'; });
+        showTip(e, h + '<div class="row"><b>total</b><b>' + usd(t) + '</b></div>'); });
+      r.addEventListener('mouseleave', hideTip);
+    });
+  }
+
+  // ---- projects
+  var P = {};
+  function proj(name, path) { var k = name; P[k] = P[k] || { name: name, path: path, auto: 0, spec: 0, other: 0, mixed: 0, unknown: 0, runs: [], sessions: [] }; return P[k]; }
+  runs.forEach(function (r) { var p = proj(r.projectName, r.project); p.auto += r.cost || 0; p.runs.push(r); });
+  sessions.forEach(function (s) { var p = proj(s.projectName, s.project); p[catOf(s)] += s.cost || 0; if (!s.costKnown) p.unknown++; p.sessions.push(s); });
+  var plist = Object.keys(P).map(function (k) { var p = P[k]; p.total = p.auto + p.spec + p.other + p.mixed; return p; }).sort(function (a, b) { return b.total - a.total; });
+  var th = '<tr><th>Project</th>' + CATS.map(function (c) { return '<th class="num">' + c.name + '</th>'; }).join('') + '<th class="num">total</th><th class="num">prep : auto</th><th class="num">cost unknown</th></tr>';
+  var selected = null;
+  function drawProjects() {
+    document.getElementById('projects').innerHTML = th + plist.map(function (p, i) {
+      var ratio = p.auto > 0 ? (p.spec / p.auto).toFixed(2) : '–';
+      return '<tr class="click' + (selected === p.name ? ' sel' : '') + '" data-i="' + i + '"><td>' + esc(p.name) + '</td>' + CATS.map(function (c) { return '<td class="num">' + (p[c.key] ? usd(p[c.key]) : '–') + '</td>'; }).join('') +
+        '<td class="num"><b>' + usd(p.total) + '</b></td><td class="num">' + ratio + '</td><td class="num">' + (p.unknown || '') + '</td></tr>';
+    }).join('');
+    document.querySelectorAll('#projects tr.click').forEach(function (tr) { tr.addEventListener('click', function () { var p = plist[+tr.getAttribute('data-i')]; selected = selected === p.name ? null : p.name; drawProjects(); drawDetail(selected ? p : null); }); });
+  }
+  function drawDetail(p) {
+    var el = document.getElementById('detail');
+    if (!p) { el.innerHTML = ''; return; }
+    var ch = {};
+    p.runs.forEach(function (r) { var c = ch[r.change] = ch[r.change] || { name: r.change, runs: [], cost: 0, min: 0, turns: 0, limits: 0, outcome: '', last: '' };
+      c.runs.push(r); c.cost += r.cost || 0; c.min += r.minutes || 0; c.turns += r.turns || 0;
+      if (/^error_max_/.test(r.subtype || '')) c.limits++;
+      if (r.outcome && r.end >= c.last) { c.outcome = r.outcome; c.last = r.end; } });
+    var cl = Object.keys(ch).map(function (k) { return ch[k]; }).sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+    var h = '<h2>' + esc(p.name) + '</h2><div class="sub">' + esc(p.path || '') + '</div><h3>Changes (auto-mode)</h3><div class="panel">';
+    if (!cl.length) h += '<div class="empty">No auto-mode runs.</div>';
+    else {
+      h += '<table><tr><th>Change</th><th>Result</th><th class="num">runs</th><th class="num">cost</th><th class="num">minutes</th><th class="num">turns</th><th class="num">limit stops</th><th></th></tr>';
+      cl.forEach(function (c, i) {
+        h += '<tr><td>' + esc(c.name) + '</td><td>' + esc(c.outcome || '–') + '</td><td class="num">' + c.runs.length + '</td><td class="num">' + usd(c.cost) + '</td><td class="num">' + Math.round(c.min) + '</td><td class="num">' + n(c.turns) + '</td><td class="num">' + (c.limits ? '<span class="warn">' + c.limits + '</span>' : '') + '</td><td><button class="link" data-c="' + i + '">runs</button></td></tr>';
+        h += '<tr id="runs-' + i + '" style="display:none"><td colspan="8"><table><tr><th>started</th><th>run</th><th>unit</th><th class="num">turns</th><th class="num">minutes</th><th class="num">cost</th><th>end</th></tr>' +
+          c.runs.slice().sort(function (a, b) { return a.start < b.start ? -1 : 1; }).map(function (r) {
+            var lim = /^error_max_/.test(r.subtype || '');
+            return '<tr><td>' + esc(String(r.start || '').replace('T', ' ').slice(0, 16)) + '</td><td>' + r.run + '</td><td>' + esc(r.unit || '') + '</td><td class="num">' + n(r.turns) + '</td><td class="num">' + (r.minutes || 0) + '</td><td class="num">' + usd(r.cost) + '</td><td' + (lim || r.subtype !== 'success' ? ' class="warn"' : '') + '>' + esc(r.subtype || '') + '</td></tr>';
+          }).join('') + '</table></td></tr>';
+      });
+      h += '</table>';
+    }
+    h += '</div><h3>Interactive sessions</h3><div class="panel">';
+    var ss = p.sessions.slice().sort(function (a, b) { return (a.start || '') < (b.start || '') ? 1 : -1; });
+    if (!ss.length) h += '<div class="empty">No sessions.</div>';
+    else h += '<table><tr><th>date</th><th>category</th><th class="num">cost</th><th class="num">minutes</th><th>skills</th></tr>' + ss.map(function (s) {
+      var c = CATS.filter(function (x) { return x.key === catOf(s); })[0];
+      return '<tr><td>' + esc(day(s.start)) + '</td><td>' + dot(c.color) + ' ' + c.name + '</td><td class="num">' + (s.costKnown ? usd(s.cost) : '<span class="warn">unknown</span>') + '</td><td class="num">' + (s.minutes || '') + '</td><td>' + esc((s.skills || []).join(', ')) + '</td></tr>';
+    }).join('') + '</table>';
+    h += '</div>';
+    el.innerHTML = h;
+    el.querySelectorAll('button.link').forEach(function (b) { b.addEventListener('click', function () { var r = document.getElementById('runs-' + b.getAttribute('data-c')); r.style.display = r.style.display === 'none' ? '' : 'none'; }); });
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  if (!plist.length) document.getElementById('projects').innerHTML = '<tr><td class="empty">No data yet.</td></tr>'; else drawProjects();
+
+  // ---- models and tokens
+  var M = {}, tk = { runs: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }, sessions: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 } };
+  function addM(models, kind) { Object.keys(models || {}).forEach(function (m) { var v = models[m]; M[m] = (M[m] || 0) + (v.cost || 0);
+    ['input', 'output', 'cacheRead', 'cacheCreation'].forEach(function (f) { tk[kind][f] += v[f] || 0; }); }); }
+  runs.forEach(function (r) { addM(r.models, 'runs'); });
+  sessions.forEach(function (s) { addM(s.models, 'sessions'); });
+  var ml = Object.keys(M).sort(function (a, b) { return M[b] - M[a]; });
+  document.getElementById('models').innerHTML = '<tr><th>model</th><th class="num">cost</th></tr>' + (ml.length ? ml.map(function (m) { return '<tr><td>' + esc(m) + '</td><td class="num">' + usd(M[m]) + '</td></tr>'; }).join('') : '<tr><td class="empty">No data.</td></tr>');
+  var rows = [['cache read', 'cacheRead'], ['cache write', 'cacheCreation'], ['new input', 'input'], ['output', 'output']];
+  function share(kind, f) { var t = tk[kind].input + tk[kind].output + tk[kind].cacheRead + tk[kind].cacheCreation; return t ? Math.round(100 * tk[kind][f] / t) + ' %' : '–'; }
+  document.getElementById('tokens').innerHTML = '<tr><th>tokens</th><th class="num">auto-mode</th><th class="num">share</th><th class="num">interactive</th><th class="num">share</th></tr>' +
+    rows.map(function (r) { return '<tr><td>' + r[0] + '</td><td class="num">' + n(tk.runs[r[1]]) + '</td><td class="num">' + share('runs', r[1]) + '</td><td class="num">' + n(tk.sessions[r[1]]) + '</td><td class="num">' + share('sessions', r[1]) + '</td></tr>'; }).join('');
+
+  // ---- top 10
+  var tr = runs.filter(function (r) { return r.cost; }).sort(function (a, b) { return b.cost - a.cost; }).slice(0, 10);
+  document.getElementById('toprun').innerHTML = '<tr><th>project</th><th>change</th><th class="num">run</th><th class="num">turns</th><th class="num">cost</th></tr>' + (tr.length ? tr.map(function (r) {
+    return '<tr><td>' + esc(r.projectName) + '</td><td>' + esc(r.change) + '</td><td class="num">' + r.run + '</td><td class="num">' + n(r.turns) + '</td><td class="num">' + usd(r.cost) + '</td></tr>'; }).join('') : '<tr><td class="empty">No data.</td></tr>');
+  var ts = sessions.filter(function (s) { return s.cost; }).sort(function (a, b) { return b.cost - a.cost; }).slice(0, 10);
+  document.getElementById('topses').innerHTML = '<tr><th>project</th><th>date</th><th>category</th><th class="num">cost</th></tr>' + (ts.length ? ts.map(function (s) {
+    var c = CATS.filter(function (x) { return x.key === catOf(s); })[0];
+    return '<tr><td>' + esc(s.projectName) + '</td><td>' + esc(day(s.start)) + '</td><td>' + dot(c.color) + ' ' + c.name + '</td><td class="num">' + usd(s.cost) + '</td></tr>'; }).join('') : '<tr><td class="empty">No data.</td></tr>');
+})();
+</script>
+</body>
+</html>

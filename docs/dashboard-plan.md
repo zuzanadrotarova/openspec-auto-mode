@@ -1,6 +1,6 @@
 # Cost and run dashboard – plan
 
-Status: plan, not implemented. Date: 2026-11-28.
+Status: steps 2–6 implemented 2026-11-28 (dashboard.ps1, page, hook, shortcuts, runner import at the end of a start, tests, docs). History files are rewritten by key (not append-only). Date: 2026-11-28.
 Order agreed: this comes after `docs/limit-continue-plan.md`, except the import (step 2), which
 should run before 2026-12-08 (see section 2).
 

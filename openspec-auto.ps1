@@ -1282,6 +1282,40 @@ function Get-LeftoverStashes {
     @(($r.Out -split "`n") | Where-Object { $_ -match 'openspec-auto: leftovers' })
 }
 
+# Leftovers of a run stopped by a limit (docs/limit-continue-plan.md 4): stash + patch file that the
+# next run gets as a hint. The stash message names the patch, so a later start finds both.
+function Save-LimitLeftovers([string]$Change, [int]$Run) {
+    $rel = "$StateDirName/leftovers/{0}-run{1:D2}.patch" -f $Change, $Run
+    $s = Save-Leftovers "openspec-auto: leftovers of limit stop in $Change run $Run (patch $rel)"
+    $r = Invoke-Git @('stash', 'show', '-p', '--include-untracked', 'stash@{0}')
+    if ($r.Code -ne 0) { throw "git stash show failed:`n$($r.Out)" }
+    Write-TextFile (Join-Path $Project $rel) ($r.Out + "`n")
+    $s | Add-Member -NotePropertyName Patch -NotePropertyValue $rel -PassThru
+}
+
+# Limit-stop stashes of a change whose patch file still exists: Index (n of stash@{n}) and Patch.
+function Get-LimitStashes([string]$Change) {
+    $r = Invoke-Git @('stash', 'list', '--format=%gd%x09%s')
+    if ($r.Code -ne 0 -or -not $r.Out) { return @() }
+    $pattern = "openspec-auto: leftovers of limit stop in $([regex]::Escape($Change)) run \d+ \(patch (.+)\)$"
+    @(foreach ($line in ($r.Out -split "`n")) {
+        $parts = $line -split "`t", 2
+        if ($parts.Count -eq 2 -and $parts[0] -match '^stash@\{(\d+)\}$') {
+            $idx = [int]$Matches[1]
+            if ($parts[1] -match $pattern -and (Test-Path (Join-Path $Project $Matches[1]))) {
+                [pscustomobject]@{ Index = $idx; Patch = $Matches[1] }
+            }
+        }
+    })
+}
+
+# First line of the most important problem, for stopReason, the notification and the report.
+function Get-StopText([string[]]$Problems) {
+    $first = ((([string]$Problems[0]) -replace "`r", '') -split "`n")[0].Trim().TrimEnd(':')
+    if ($Problems.Count -gt 1) { $first += " (+$($Problems.Count - 1) more, see notes)" }
+    $first
+}
+
 $script:LastRunPath = $null       # set when this start should leave last-run.json
 $script:EndCode = $null
 $script:EndReason = $null
@@ -1735,6 +1769,11 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
     $groupHistory = [ordered]@{}            # group id -> list of 'green' / 'red'
     $repairGroup = $null; $repairCount = 0; $repairEvidence = ''; $repairLabel = ''; $repairScope = @()
     $groupStartHead = Get-Head
+    # limit stops (docs/limit-continue-plan.md): runs in a row ended by maxTurns / maxBudgetUsdPerRun,
+    # and the patch of the last one for the next run (also found again after a restart)
+    $limitStreak = 0; $leftoverPatch = $null
+    $oldLimit = @(Get-LimitStashes $change | Sort-Object Index | Select-Object -First 1)
+    if ($oldLimit.Count) { $leftoverPatch = $oldLimit[0].Patch }
 
     while (-not $outcome) {
         $run++
@@ -1785,6 +1824,20 @@ Do the completion check and archive (SUCCESS).
             }
         }
 
+        if ($leftoverPatch) {
+            $where = ''
+            if ($mode -eq 'repair') { $where = " during the repair of group $unitGroup" }
+            else {
+                $tid = @($groupsBefore | Where-Object { $_.Open.Count } | Select-Object -First 1 | ForEach-Object { $_.Open[0] })
+                if ($tid.Count) { $where = " during task $($tid[0])" }
+            }
+            $unitText = @"
+The previous run was interrupted by a limit$where. Its uncommitted work is in ``$leftoverPatch``.
+Read it; if it is correct, use it as the starting point; fix or redo whatever is wrong or unfinished.
+
+"@ + $unitText
+        }
+
         # 2. new process = empty context (kap. 5.1)
         $unitLabel = ''
         if ($mode -eq 'group') { $unitLabel = ", group $unitGroup" } elseif ($mode -eq 'repair') { $unitLabel = ", repair of group $unitGroup" } elseif ($mode -eq 'final') { $unitLabel = ', final' }
@@ -1807,6 +1860,7 @@ Do the completion check and archive (SUCCESS).
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
         $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath $unitText
+        $leftoverPatch = $null
         if ($w.Cost) { $cost += [double]$w.Cost }
         if ($env:OSA_TEST_THROW -eq 'after-worker') { throw 'test crash after the worker (OSA_TEST_THROW)' }
         Write-Host (" exit {0}, {1} min, claims {2}" -f $w.ExitCode, $w.Minutes, $(if ($w.Claimed) { $w.Claimed } else { '-' }))
@@ -1853,18 +1907,36 @@ Do the completion check and archive (SUCCESS).
             }
             foreach ($p in $lmProblems) { Write-Bad $p }
             $outcome = 'FAILED-CHECK'; $notes += $lmProblems
-            $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+            $stopReason = "run $run of ${change}: $(Get-StopText $lmProblems); log: $logBase.out.json"
             break
         }
 
+        # 2c. limit stop (docs/limit-continue-plan.md 3): maxTurns or maxBudgetUsdPerRun ended the run.
+        # Progress decides (below); timeouts are not limit stops.
+        $limit = $null; $limitRaise = $null
+        if (-not $w.TimedOut -and $w.Subtype -eq 'error_max_turns') { $limit = "hit the turn limit (maxTurns $($cfg.maxTurns))"; $limitRaise = 'maxTurns' }
+        elseif (-not $w.TimedOut -and $w.Subtype -eq 'error_max_budget_usd') { $limit = "hit the budget limit (maxBudgetUsdPerRun $($cfg.maxBudgetUsdPerRun))"; $limitRaise = 'maxBudgetUsdPerRun' }
+        if ($limit) { $limitStreak++; Write-Warn "run $run $limit" } else { $limitStreak = 0 }
+
         # 3. write-check by the runner (kap. 6.1 C) - must pass before the next process starts
         $problems = @()
-        if ($w.TimedOut) { $problems += "run timed out after $($cfg.timeoutMinutes) min" }
+        if ($w.TimedOut) { $problems += "timed out after $($cfg.timeoutMinutes) min (timeoutMinutes)" }
+        elseif ($limit) { }   # judged by the progress below
         elseif ($w.ExitCode -ne 0) { $problems += "claude exited with code $($w.ExitCode) $($w.Subtype)" }
         elseif ($w.IsError) { $problems += "claude reported an error ($($w.Subtype))" }
         $cur = Get-CurrentBranch
         if ($cur -ne $branch) { $problems += "agent left branch $branch (now on $cur)" }
         $dirty = Get-DirtyStatus
+        if ($dirty -and $limit -and $cur -eq $branch) {
+            # uncommitted part of the task in progress: stash + patch, the next run gets it as a hint
+            try {
+                $ls = Save-LimitLeftovers $change $run
+                $leftoverPatch = $ls.Patch
+                $notes += "run ${run}: uncommitted work of the limit stop kept as $($ls.Patch) ($($ls.Count) file$(if ($ls.Count -ne 1) { 's' }), also in git stash)"
+                Write-Warn "uncommitted work kept as $($ls.Patch)"
+            } catch { $problems += "saving the leftovers of the limit stop failed: $($_.Exception.Message -replace '\s+', ' ')" }
+            $dirty = Get-DirtyStatus
+        }
         if ($dirty) { $problems += "git status is not clean:`n$dirty" }
         if ((Get-RemoteRefs) -ne $refsBefore) { $problems += 'remote-tracking refs changed during the run (possible push)' }
         $v = Invoke-OpenSpec @('validate', '--specs', '--no-interactive')
@@ -1909,6 +1981,7 @@ Do the completion check and archive (SUCCESS).
             if ($cv.Code -ne 0) { $problems += "openspec validate $change failed:`n$($cv.Out)" }
             if ($after.Done -gt $before.Done) { $kind = 'CONTINUE' }
             elseif ($mode -eq 'repair') { $kind = 'CONTINUE' }   # progress of a repair = tests turn green (below)
+            elseif ($limit) { $kind = 'LIMIT' }                  # stopped by a limit without finishing a task
             else {
                 $problems += "no progress: change not archived, no BLOCKED.md, tasks $($after.Done)/$($after.Total) unchanged (kap. 7.4)"
                 $kind = 'UNEXPECTED'
@@ -1994,10 +2067,19 @@ Do the completion check and archive (SUCCESS).
             }
         }
 
+        $limitStop = $null
+        if ($kind -eq 'LIMIT') {
+            $limitStop = "run $run of $change $limit without finishing a task; the task is probably too large: split it in tasks.md or raise $limitRaise, then run again"
+        } elseif ($limit -and $kind -eq 'CONTINUE' -and $limitStreak -ge 2) {
+            $limitStop = "run $run of $change $limit again ($limitStreak runs in a row); look at the run logs before you raise $limitRaise, then run again"
+        } elseif ($limit -and $kind -eq 'CONTINUE') {
+            $notes += "run ${run}: $limit after progress; the next run continues"
+        }
+
         if ($problems.Count -gt 0) {
             foreach ($p in $problems) { Write-Bad $p }
             $outcome = 'FAILED-CHECK'; $notes += $problems
-            $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+            $stopReason = "run $run of ${change}: $(Get-StopText $problems); log: $logBase.out.json"
         } elseif ($memStop) {
             Write-Bad $memStop
             $outcome = 'STOPPED'; $notes += $memStop
@@ -2007,6 +2089,10 @@ Do the completion check and archive (SUCCESS).
             Write-Bad $groupStop
             $outcome = 'STOPPED'; $notes += $groupStop
             $stopReason = "change ${change}: $groupStop"
+        } elseif ($limitStop) {
+            Write-Bad $limitStop
+            $outcome = 'STOPPED'; $notes += $limitStop
+            $stopReason = "change ${change}: $limitStop; log: $logBase.out.json"
         } elseif ($kind -eq 'CONTINUE') {
             $after = Get-TaskCounts $activeDir
             Write-Ok "progress $($before.Done) -> $($after.Done)/$($after.Total); starting a fresh process"
@@ -2048,6 +2134,14 @@ Do the completion check and archive (SUCCESS).
             if ($outcome -eq 'SUCCESS') { $fixNote = "fixed by $change" }
             $parentRow.Notes = (@($parentRow.Notes, $fixNote) | Where-Object { $_ }) -join '; '
         }
+    }
+    if ($outcome -in @('SUCCESS', 'NONCRITICAL')) {
+        # tidy up (docs/limit-continue-plan.md 4 C): the patch files keep the content of these stashes
+        $dropped = 0
+        foreach ($s in @(Get-LimitStashes $change | Sort-Object Index -Descending)) {
+            if ((Invoke-Git @('stash', 'drop', "stash@{$($s.Index)}")).Code -eq 0) { $dropped++ }
+        }
+        if ($dropped) { $notes += "$dropped leftover$(if ($dropped -ne 1) { 's' }) of limit stops kept only as patches in $StateDirName/leftovers/ (stash dropped)" }
     }
     $results += [pscustomobject]@{ Change = $change; Outcome = $outcome; Runs = [math]::Min($run, $item.MaxRuns); Branch = $branch; Cost = $cost; Tests = $testsLabel; Notes = ($notes -join '; ') }
     if ($outcome -in @('SUCCESS', 'NONCRITICAL')) {
@@ -2179,7 +2273,7 @@ if ($leftoverStashes.Count) {
     [void]$sb.AppendLine()
     foreach ($s in $leftoverStashes) { [void]$sb.AppendLine("- ``$s``") }
     [void]$sb.AppendLine()
-    [void]$sb.AppendLine('Look at one with `git stash show -p stash@{n}`, drop it with `git stash drop stash@{n}`. Auto-mode never drops a stash.')
+    [void]$sb.AppendLine('Look at one with `git stash show -p stash@{n}`, drop it with `git stash drop stash@{n}`. Auto-mode drops only the stashes of limit stops, after their change succeeded (the patch in .openspec-auto/leftovers/ stays).')
 }
 [void]$sb.AppendLine()
 [void]$sb.AppendLine("Logs: ``$StateDirName/runs/$stamp/``")
@@ -2189,6 +2283,15 @@ Write-TextFile (Join-Path $Project "$StateDirName/auto-mode-report.md") $report
 Write-TextFile (Join-Path $runDir 'auto-mode-report.md') $report
 Write-Host ''
 Write-Host $report
+# cost dashboard (docs/dashboard-plan.md): import the runs of this project, rebuild the page;
+# a failure is only a warning
+$dashScript = Join-Path $PSScriptRoot 'dashboard.ps1'
+if (Test-Path $dashScript) {
+    try {
+        $d = Invoke-Exec 'powershell' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dashScript, '-Project', $Project, '-Quiet')
+        if ($d.Code -ne 0) { Write-Warn "cost dashboard not updated (exit $($d.Code)); run dashboard.ps1 -Import" }
+    } catch { Write-Warn "cost dashboard not updated: $($_.Exception.Message)" }
+}
 if ($stopReason) { Exit-Runner 1 $stopReason }
 Exit-Runner 0 $null
 
