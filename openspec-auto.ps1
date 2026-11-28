@@ -309,6 +309,7 @@ function Read-Config {
         preventSleep       = $true
         minFreeMemoryGB    = 8
         maxCommitPercent   = 85
+        keepProcesses      = @()
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -328,6 +329,7 @@ function Read-Config {
     if ($null -eq $cfg.preventSleep) { $cfg.preventSleep = $true }
     if ($null -eq $cfg.minFreeMemoryGB) { $cfg.minFreeMemoryGB = 8 }
     if ($null -eq $cfg.maxCommitPercent) { $cfg.maxCommitPercent = 85 }
+    if ($null -eq $cfg.keepProcesses) { $cfg.keepProcesses = @() }
     $cfg.memoryErrorPatterns = @($cfg.memoryErrorPatterns | Where-Object { $null -ne $_ -and "$_" -ne '' })
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
@@ -437,7 +439,7 @@ function New-WorkerAgents([string]$Path) {
 
 # Runs a command line through the shell in a NEW process and waits with a timeout
 # (the whole process tree is killed on timeout). Never throws on a non-zero exit code.
-function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$StdIn) {
+function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$StdIn, [string]$JobLabel = '') {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     if ($IsWin) {
         $psi.FileName = 'cmd.exe'
@@ -458,6 +460,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
     $started = Get-Date
     $proc = [System.Diagnostics.Process]::Start($psi)
     Add-ToJob $proc
+    Add-ToRunJob $proc $JobLabel
     Set-RunChild $proc
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
@@ -502,10 +505,15 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
         $cmds += [pscustomobject]@{ Name = "acceptance $c "; Line = (Get-AcceptanceCommand $c) }
     }
     $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0; $memory = $null
+    $jobLabel = 'tests ' + ([System.IO.Path]::GetFileNameWithoutExtension($LogPath) -replace '\.tests$', '')
     $mem = Test-MemoryState
-    if ($mem.Problems.Count) { Write-Host ''; Write-Warn "low memory before the tests: $($mem.Problems -join ', ') ($($mem.Text))" }
+    if ($mem.Problems.Count) {
+        Write-Host ''
+        Write-Warn "low memory before the tests: $($mem.Problems -join ', ') ($($mem.Text))"
+        [void](Stop-LeftoversForMemory 'the tests')
+    }
     foreach ($c in $cmds) {
-        $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) ''
+        $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) '' $jobLabel
         $minutes += $p.Minutes
         $text = [string]$p.Stdout
         if ($p.Stderr) { $text = $text.TrimEnd() + "`n" + $p.Stderr }
@@ -658,7 +666,7 @@ Process this change according to your OpenSpec auto-mode instructions.
     if ($Cfg.maxBudgetUsdPerRun) { $claudeArgs += @('--max-budget-usd', [string]$Cfg.maxBudgetUsdPerRun) }
 
     $cmdLine = ((@($ClaudeCommand) + $claudeArgs) | ForEach-Object { ConvertTo-CmdArg $_ }) -join ' '
-    $p = Invoke-Process $cmdLine ([double]$Cfg.timeoutMinutes) $prompt
+    $p = Invoke-Process $cmdLine ([double]$Cfg.timeoutMinutes) $prompt "run $Run of $($Item.Name)"
     $stdout = [string]$p.Stdout
     Write-TextFile "$LogBase.out.json" $stdout
     if ($p.Stderr) { Write-TextFile "$LogBase.err.txt" $p.Stderr }
@@ -717,6 +725,26 @@ public static class OsaJob {
     }
     public static void Assign(IntPtr job, IntPtr process) {
         if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
+    }
+    // job of one run or test command (docs/memory-recovery-plan.md 2.3): no limits, nested in the
+    // runner's job (a process already in the runner's job is assigned to it second)
+    public static IntPtr CreatePlain() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception();
+        return job;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length, IntPtr returned);
+    // JobObjectBasicProcessIdList (3): ids of the processes still in the job, incl. detached ones
+    public static long[] Pids(IntPtr job) {
+        int size = 8 + IntPtr.Size * 4096;
+        IntPtr buf = Marshal.AllocHGlobal(size);
+        try {
+            if (!QueryInformationJobObject(job, 3, buf, (uint)size, IntPtr.Zero)) throw new Win32Exception();
+            int n = Marshal.ReadInt32(buf, 4);
+            long[] r = new long[n];
+            for (int i = 0; i < n; i++) r[i] = Marshal.ReadIntPtr(buf, 8 + i * IntPtr.Size).ToInt64();
+            return r;
+        } finally { Marshal.FreeHGlobal(buf); }
     }
 
     [StructLayout(LayoutKind.Sequential)] class MemStatus {
@@ -786,6 +814,93 @@ function Add-ToJob([System.Diagnostics.Process]$Proc) {
     }
 }
 
+# Leftover processes of runs (docs/memory-recovery-plan.md 2.3): every worker run and test command
+# gets its own job nested in the runner's job; what is still in it after the command ended was
+# left behind by that run (build daemons, dev servers, an emulator the agent started, ...).
+# Processes that existed before the batch are never in these jobs.
+$script:RunJobs = @()            # Label, Handle
+$script:LeftoverSeen = [ordered]@{}   # pid -> Name, MB, Label, State (running / kept / stopped)
+$script:MemoryRecoveries = @()   # report lines
+
+function Add-ToRunJob([System.Diagnostics.Process]$Proc, [string]$Label) {
+    if ($script:JobHandle -eq [IntPtr]::Zero -or -not $Label) { return }
+    try {
+        $h = [OsaJob]::CreatePlain()
+        [OsaJob]::Assign($h, $Proc.Handle)
+        $script:RunJobs += [pscustomobject]@{ Label = $Label; Handle = $h }
+    } catch {
+        if ($Proc.HasExited -or $script:RunJobWarned) { return }
+        $script:RunJobWarned = $true
+        $w = "processes left by runs cannot be found (nested job object: $($_.Exception.Message)); memory recovery cannot stop them"
+        $script:warnings += $w
+        Write-Warn $w
+    }
+}
+
+function Test-KeepProcess([string]$Name) {
+    foreach ($p in @($script:cfg.keepProcesses)) {
+        if ($Name -like (([string]$p) -replace '\.exe$', '')) { return $true }
+    }
+    $false
+}
+
+# Processes still alive in the run jobs: Id, Name, MB, Label, Keep. conhost (console host of a
+# leftover) is left out: it ends with its console program.
+function Get-LeftoverProcesses {
+    $list = @()
+    foreach ($j in $script:RunJobs) {
+        $ids = @()
+        try { $ids = @([OsaJob]::Pids($j.Handle)) } catch { continue }
+        foreach ($id in $ids) {
+            $p = Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue
+            if (-not $p -or $p.ProcessName -eq 'conhost') { continue }
+            $list += [pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; MB = $p.WorkingSet64 / 1MB; Label = $j.Label; Keep = (Test-KeepProcess $p.ProcessName) }
+        }
+    }
+    @($list | Sort-Object Id -Unique)
+}
+
+# "java 2.1 GB (2), adb 0.1 GB"
+function Format-ProcessList($Procs) {
+    @(@($Procs) | Group-Object Name | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; MB = ($_.Group | Measure-Object MB -Sum).Sum; Count = $_.Count }
+    } | Sort-Object MB -Descending | ForEach-Object { "$($_.Name) $(Format-GB $_.MB)$(if ($_.Count -gt 1) { " ($($_.Count))" })" }) -join ', '
+}
+
+# Console line for leftovers not shown before; remembered for the report.
+function Show-NewLeftovers {
+    $new = @(Get-LeftoverProcesses | Where-Object { -not $script:LeftoverSeen.Contains([string]$_.Id) })
+    foreach ($p in $new) {
+        $script:LeftoverSeen[[string]$p.Id] = [pscustomobject]@{ Name = $p.Name; MB = $p.MB; Label = $p.Label; State = $(if ($p.Keep) { 'kept' } else { 'running' }) }
+    }
+    foreach ($g in @($new | Group-Object Label)) {
+        $kept = @($g.Group | Where-Object Keep)
+        $text = "left running after $($g.Name): $(Format-ProcessList $g.Group)"
+        if ($kept.Count) { $text += " (keepProcesses: $(Format-ProcessList $kept))" }
+        Write-Host "    $text"
+    }
+}
+
+# Memory is short (step 3 of the recovery): stop the leftovers of earlier runs except keepProcesses,
+# measure again. Returns the new measurement, or $null when there was nothing to stop.
+function Stop-LeftoversForMemory([string]$Before) {
+    Show-NewLeftovers
+    $stop = @(Get-LeftoverProcesses | Where-Object { -not $_.Keep })
+    if (-not $stop.Count) { return $null }
+    $was = Test-MemoryState -NoCount
+    foreach ($p in $stop) {
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { }
+        if ($script:LeftoverSeen.Contains([string]$p.Id)) { $script:LeftoverSeen[[string]$p.Id].State = 'stopped' }
+    }
+    foreach ($p in $stop) { try { (Get-Process -Id $p.Id -ErrorAction Stop).WaitForExit(5000) | Out-Null } catch { } }
+    $now = Test-MemoryState -NoCount
+    $line = "low memory before ${Before}: stopped $($stop.Count) leftover process$(if ($stop.Count -ne 1) { 'es' }) ($(Format-ProcessList $stop)); $(Format-GB $was.AvailMB) -> $(Format-GB $now.AvailMB) available"
+    if ($now.Commit) { $line += ", $(Format-Commit $now.Commit)" }
+    Write-Warn $line
+    $script:MemoryRecoveries += $line
+    $now
+}
+
 # Available physical memory in MB, or $null when unknown (docs/memory-pressure-plan.md 9).
 # Test hooks: OSA_TEST_FREE_MB_FILE holds "<pid> <mb>", valid only while that process lives;
 # otherwise OSA_TEST_FREE_MB.
@@ -831,11 +946,11 @@ function Format-Commit($Commit) {
 # the statistics for the report and names what is below minFreeMemoryGB / above maxCommitPercent.
 # Step 2 only warns; nothing is stopped here.
 $script:MemStats = [ordered]@{ Checks = 0; Low = 0; MinAvailMB = $null; MaxCommitPct = $null }
-function Test-MemoryState {
+function Test-MemoryState([switch]$NoCount) {
     $avail = Get-AvailableMB
     $commit = Get-CommitInfo
     $s = $script:MemStats
-    $s.Checks++
+    if (-not $NoCount) { $s.Checks++ }
     if ($null -ne $avail -and ($null -eq $s.MinAvailMB -or $avail -lt $s.MinAvailMB)) { $s.MinAvailMB = $avail }
     if ($commit -and ($null -eq $s.MaxCommitPct -or $commit.Percent -gt $s.MaxCommitPct)) { $s.MaxCommitPct = $commit.Percent }
     $problems = @()
@@ -843,7 +958,7 @@ function Test-MemoryState {
     if ($minMB -gt 0 -and $null -ne $avail -and $avail -lt $minMB) { $problems += "only $(Format-GB $avail) available" }
     $maxPct = [double]$script:cfg.maxCommitPercent
     if ($maxPct -gt 0 -and $commit -and $commit.Percent -gt $maxPct) { $problems += "commit at $($commit.Percent) % of the limit" }
-    if ($problems.Count) { $s.Low++ }
+    if ($problems.Count -and -not $NoCount) { $s.Low++ }
     $text = "memory available: $(Format-GB $avail)"
     if ($commit) { $text += ", $(Format-Commit $commit)" }
     [pscustomobject]@{ AvailMB = $avail; Commit = $commit; Problems = $problems; Text = $text }
@@ -1199,6 +1314,7 @@ elseif ($cfg.preventSleep -isnot [bool]) { $errors += "preventSleep in $ConfigRe
 elseif ("$($cfg.minFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "minFreeMemoryGB in $ConfigRel must be a number >= 0 (is '$($cfg.minFreeMemoryGB)')" }
 elseif ("$($cfg.maxCommitPercent)" -notmatch '^\d+(\.\d+)?$' -or [double]$cfg.maxCommitPercent -gt 100) { $errors += "maxCommitPercent in $ConfigRel must be a number from 0 to 100 (is '$($cfg.maxCommitPercent)')" }
 elseif (@($cfg.memoryErrorPatterns | Where-Object { $_ -isnot [string] }).Count) { $errors += "memoryErrorPatterns in $ConfigRel must be a list of strings" }
+elseif (@($cfg.keepProcesses | Where-Object { $_ -isnot [string] -or -not $_.Trim() }).Count) { $errors += "keepProcesses in $ConfigRel must be a list of process names (wildcards allowed, e.g. [`"qemu-system-*`", `"adb`"])" }
 elseif ($cfg.acceptanceMode -ne 'off') {
     if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }
     if (-not $cfg.acceptanceDir -or [System.IO.Path]::IsPathRooted($cfg.acceptanceDir) -or $cfg.acceptanceDir -match '(^|/)\.\.?(/|$)' -or $cfg.acceptanceDir -match '[*?]') {
@@ -1525,9 +1641,13 @@ Do the completion check and archive (SUCCESS).
         # 2. new process = empty context (kap. 5.1)
         $unitLabel = ''
         if ($mode -eq 'group') { $unitLabel = ", group $unitGroup" } elseif ($mode -eq 'repair') { $unitLabel = ", repair of group $unitGroup" } elseif ($mode -eq 'final') { $unitLabel = ', final' }
+        Show-NewLeftovers
         $mem = Test-MemoryState
         Write-Host "    $($mem.Text)"
-        if ($mem.Problems.Count) { Write-Warn "low memory before run ${run}: $($mem.Problems -join ', ')" }
+        if ($mem.Problems.Count) {
+            Write-Warn "low memory before run ${run}: $($mem.Problems -join ', ')"
+            [void](Stop-LeftoversForMemory "run $run of $change")
+        }
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
         $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath $unitText
@@ -1801,6 +1921,7 @@ if ($stopReason) {
 }
 
 # memory summary (docs/memory-recovery-plan.md 2.1): one line, and a warning when it was low
+Show-NewLeftovers
 $ms = $script:MemStats
 $memLine = "lowest $(Format-GB $ms.MinAvailMB) available"
 if ($null -ne $ms.MaxCommitPct) { $memLine += ", highest commit $($ms.MaxCommitPct) %" }
@@ -1865,6 +1986,23 @@ if ($warnings.Count) {
     [void]$sb.AppendLine('## Warnings')
     [void]$sb.AppendLine()
     foreach ($w in $warnings) { [void]$sb.AppendLine("- $($w -replace "`r?`n", ' ')") }
+}
+if ($script:LeftoverSeen.Count -or $script:MemoryRecoveries.Count) {
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('## Processes left by runs')
+    [void]$sb.AppendLine()
+    $seen = @($script:LeftoverSeen.Values)
+    foreach ($g in @($seen | Group-Object Label)) {
+        $parts = @()
+        foreach ($st in @('running', 'kept', 'stopped')) {
+            $sub = @($g.Group | Where-Object State -eq $st)
+            if ($sub.Count) { $parts += "${st}: $(Format-ProcessList $sub)" }
+        }
+        [void]$sb.AppendLine("- after $($g.Name): $($parts -join '; ')")
+    }
+    foreach ($m in $script:MemoryRecoveries) { [void]$sb.AppendLine("- $m") }
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('"stopped" = ended because memory was low; "kept" = in keepProcesses, never stopped for memory; "running" = not needed to stop. Processes started inside the run end with auto-mode; start what you need afterwards (e.g. an emulator) before the run.')
 }
 $leftoverStashes = @(Get-LeftoverStashes)
 if ($leftoverStashes.Count) {

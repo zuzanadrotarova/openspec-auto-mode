@@ -22,5 +22,6 @@
   "acceptanceDir": "acceptance",
   "notifyScript": null,
   "minFreeMemoryGB": 8,
-  "maxCommitPercent": 85
+  "maxCommitPercent": 85,
+  "keepProcesses": []
 }

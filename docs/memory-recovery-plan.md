@@ -1,6 +1,6 @@
 # Memory recovery for unattended (night) runs – plan
 
-Status: plan agreed 2026-11-28 (section 8); step 2 implemented 2026-11-28 (tests T43–T44), steps 3–8 open. Date: 2026-11-28.
+Status: plan agreed 2026-11-28 (section 8); steps 2 and 3 implemented 2026-11-28 (tests T43–T45; nested jobs checked by a probe inside Claude Code and in an own window), steps 4–8 open. Date: 2026-11-28.
 Order: first of the three plans, before `docs/limit-continue-plan.md`. Builds on `docs/memory-pressure-plan.md` (steps 1–4).
 
 ## 1. Problem

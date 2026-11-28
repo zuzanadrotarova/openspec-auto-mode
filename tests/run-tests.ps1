@@ -801,6 +801,40 @@ Check ($logPid -and $gone) 'the logger is gone after the runner ended'
 $r = Invoke-Runner $p '' @('-DryRun')
 Check ($r.Code -eq 2 -or $r.Out -notmatch 'memory log:') 'dry run starts no memory log'
 
+# ---------------------------------------------------------------- memory recovery, step 3
+Write-Host "T45 processes left by a run: listed; stopped only when memory is low, keepProcesses and older processes stay"
+$older = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 300') -WindowStyle Hidden -PassThru
+$env:FAKE_DAEMON_FILE = Join-Path $WorkDir 't45.daemons.txt'; $env:FAKE_DAEMON_CHECK = Join-Path $WorkDir 't45.check.txt'
+Remove-Item $env:FAKE_DAEMON_FILE, $env:FAKE_DAEMON_CHECK -ErrorAction SilentlyContinue
+$p = New-Project 't45' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=group-daemon'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+$chk = @(); if (Test-Path $env:FAKE_DAEMON_CHECK) { $chk = @(Get-Content $env:FAKE_DAEMON_CHECK) }
+$ids = @(); if (Test-Path $env:FAKE_DAEMON_FILE) { $ids = @((Get-Content $env:FAKE_DAEMON_FILE) -split ' ' | ForEach-Object { [int]$_ }) }
+Check ($r.Code -eq 0 -and $r.Out -match 'left running after run 1 of 01-a: .*powershell' -and $r.Out -match 'left running after run 1 of 01-a: .*PING') 'leftovers of run 1 listed (detached processes too)'
+Check ($chk -contains 'group:2 sleeper=True ping=True') 'enough memory: nothing stopped'
+Check ($rep -match '## Processes left by runs' -and $rep -match '- after run 1 of 01-a: running: ') 'report lists them'
+Check (@($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -eq 0) 'they end with the runner'
+Check ([bool](Get-Process -Id $older.Id -ErrorAction SilentlyContinue)) 'a process older than the batch is not touched'
+Remove-Item $env:FAKE_DAEMON_FILE, $env:FAKE_DAEMON_CHECK -ErrorAction SilentlyContinue
+$p = New-Project 't45b' @('01-a:4:2') ($DefaultConfig -replace ' }$', ', "keepProcesses": ["ping.exe"] }')
+$env:OSA_TEST_FREE_MB = '3000'
+$r = Invoke-Runner $p '01-a=group-daemon'
+$env:OSA_TEST_FREE_MB = '16000'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+$chk = @(); if (Test-Path $env:FAKE_DAEMON_CHECK) { $chk = @(Get-Content $env:FAKE_DAEMON_CHECK) }
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'low memory: the run goes on'
+Check ($r.Out -match 'left running after run 1 of 01-a: .*\(keepProcesses: PING') 'the kept process is named as kept'
+Check ($r.Out -match 'low memory before the tests: stopped 1 leftover process \(powershell [\d.]+ GB\); 2\.9 GB -> 2\.9 GB available') 'low memory before the group tests: the leftover is stopped'
+Check ($chk -contains 'group:2 sleeper=False ping=True') 'run 2 sees: sleeper stopped, kept process alive'
+Check ($rep -match '- after run 1 of 01-a: kept: PING [\d.]+ GB; stopped: powershell' -and $rep -match '- low memory before the tests: stopped 1 leftover process') 'report: kept / stopped and the recovery line'
+Check ([bool](Get-Process -Id $older.Id -ErrorAction SilentlyContinue)) 'a process older than the batch survives the recovery'
+Remove-Item Env:FAKE_DAEMON_FILE, Env:FAKE_DAEMON_CHECK
+if (-not $older.HasExited) { $older.Kill() }
+$p = New-Project 't45c' @('01-a:1') ($DefaultConfig -replace ' }$', ', "keepProcesses": [1] }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'keepProcesses .* must be a list of process names') 'invalid keepProcesses refused'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

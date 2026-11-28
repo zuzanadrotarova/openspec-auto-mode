@@ -107,6 +107,7 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `notifyTimeoutSeconds` | how long one notification may take | 30 |
 | `minFreeMemoryGB` | warn at the start when less memory is available; `0` = off (section 5.6) | 8 |
 | `maxCommitPercent` | warn when Windows has promised almost all memory it can give (commit charge in percent of its limit); `0` = off (section 5.6) | 85 |
+| `keepProcesses` | programs auto-mode never stops to free memory, e.g. `["qemu-system-*", "emulator*", "adb"]` for an Android emulator (section 5.6) | none |
 | `preventSleep` | keep the PC awake during the run | `true` |
 | `memoryErrorPatterns` | error texts that mean "out of memory" (e.g. `java.lang.OutOfMemoryError`); `[]` = off | a built-in list |
 
@@ -226,6 +227,8 @@ If you start auto-mode while it is already running in that project, it refuses (
 When the tests or the agent run out of memory, auto-mode does not try to "repair" the code (there is nothing wrong with it). It stops with `STOPPED` and the reason `ran out of memory`, sets the unfinished files aside (section 5.5) and sends the 🛑 notification. Close programs you do not need (browsers, Android Studio, an emulator) and run `/openspec-auto run` again.
 
 Auto-mode watches memory during the whole run: before every run and every test it measures the free memory and the **commit charge** (how much memory Windows has promised to programs; when it reaches its limit, programs get no more memory even if some RAM looks free). It only warns; the report then says how often memory was low. The file `.openspec-auto/runs/<time>/memory.csv` has one line per minute with the numbers and the five biggest programs, so after a stop you can see what grew. It stays on your PC.
+
+Programs that a run started and left running (for example build helpers that stay in the background) are listed in the console and in the report. When memory is low before a run or before the tests, auto-mode stops them to free memory, then goes on. It never stops programs that were already running before you started auto-mode (your browser, an emulator you started), and never the ones named in `keepProcesses`.
 
 ### 5.7 Heavy projects (Gradle, Android, emulators)
 

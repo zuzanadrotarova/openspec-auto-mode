@@ -92,6 +92,21 @@ switch ($mode) {
     'group-red' { Group-Worker '1' $true }
     'group-stuck' { Group-Worker '1' $false }
     'group-late' { $script:LateImpl = $true; Group-Worker '' $true }
+    'group-daemon' {
+        # run of group 1 leaves two detached "daemons" (a powershell sleeper and ping) running, like
+        # a build daemon and an emulator; later runs write which of them are still alive
+        $u = Unit
+        if ($u -eq 'group:1' -and $env:FAKE_DAEMON_FILE) {
+            $a = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 300') -WindowStyle Hidden -PassThru
+            $b = Start-Process ping -ArgumentList @('-n', '300', '127.0.0.1') -WindowStyle Hidden -PassThru
+            Set-Content $env:FAKE_DAEMON_FILE "$($a.Id) $($b.Id)"
+        } elseif ($env:FAKE_DAEMON_FILE -and $env:FAKE_DAEMON_CHECK -and (Test-Path $env:FAKE_DAEMON_FILE)) {
+            $ids = @((Get-Content $env:FAKE_DAEMON_FILE) -split ' ')
+            $alive = @($ids | ForEach-Object { [bool](Get-Process -Id ([int]$_) -ErrorAction SilentlyContinue) })
+            Add-Content $env:FAKE_DAEMON_CHECK "$u sleeper=$($alive[0]) ping=$($alive[1])"
+        }
+        Group-Worker '' $true
+    }
     'tamper' {
         Get-ChildItem "acceptance/$change" -File | ForEach-Object { Set-Content $_.FullName '@echo ok' }
         Tick 999; Commit "$change impl"; Archive; Result 'SUCCESS'
