@@ -881,6 +881,49 @@ $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'criticalCommitPercent .* must be a number from 0 to 100') 'invalid critical setting refused'
 Remove-Item Env:OSA_TEST_FREE_MB_FILE, Env:OSA_TEST_MEMWAIT_SECONDS
 
+# ---------------------------------------------------------------- memory recovery, step 5
+Write-Host "T47 memoryCleanupCommands: first step of the recovery, at most every 10 min when low, always after out of memory"
+function New-CleanupProject([string]$Name, [string[]]$Changes, [string[]]$Lines, [string]$Extra = '') {
+    $cfgText = $DefaultConfig -replace ' }$', ", `"memoryCleanupCommands`": [`".\\cleanup.cmd`"]$Extra }"
+    $pp = New-Project $Name $Changes $cfgText
+    Set-Content (Join-Path $pp 'cleanup.cmd') $Lines
+    GitIn $pp add -A | Out-Null; GitIn $pp commit -q -m 'cleanup script' | Out-Null
+    $pp
+}
+function Count-Cleanups([string]$P) { $f = Join-Path $P '.git/cleanup-ran.txt'; if (Test-Path $f) { @(Get-Content $f).Count } else { 0 } }
+$ok = @('@echo x>> .git\cleanup-ran.txt', '@echo daemons stopped')
+$p = New-CleanupProject 't47' @('01-a:4:2') $ok
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and (Count-Cleanups $p) -eq 0) 'enough memory: the cleanup does not run'
+$p = New-CleanupProject 't47b' @('01-a:4:2') $ok
+$env:OSA_TEST_FREE_MB = '4000'
+$r = Invoke-Runner $p '01-a=group'
+$env:OSA_TEST_FREE_MB = '16000'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+$log = Get-ChildItem "$p/.openspec-auto/runs/*/cleanup.txt" | Select-Object -First 1
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'low memory: cleanup, then the run goes on'
+Check ((Count-Cleanups $p) -eq 1) 'low memory at every check, but the cleanup ran only once (10 min)'
+Check ($r.Out -match 'memory cleanup before the tests: \.\\cleanup\.cmd \(exit 0\); 3\.9 GB -> 3\.9 GB available' -and $rep -match '- memory cleanup before the tests: \.\\cleanup\.cmd \(exit 0\)') 'console and report name the cleanup'
+Check ($log -and (Get-Content -Raw $log.FullName) -match '===== .* before the tests: \.\\cleanup\.cmd \(exit 0\)\s+daemons stopped') 'cleanup.txt has the output'
+$p = New-CleanupProject 't47c' @('01-a:4:2') $ok
+Set-Break 'oom-once.txt'
+$r = Invoke-Runner $p '01-a=group-red'
+Set-Break $null
+Check ($r.Code -eq 0 -and (Count-Cleanups $p) -eq 1 -and $r.Out -match 'memory cleanup before the repeated tests after group 1') 'out of memory with enough memory measured: the cleanup still runs before the retry'
+$p = New-CleanupProject 't47d' @('01-a:1') @('@echo cannot stop & exit /b 3')
+$env:OSA_TEST_FREE_MB = '4000'
+$r = Invoke-Runner $p '01-a=success'
+$env:OSA_TEST_FREE_MB = '16000'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and $r.Out -match 'memory cleanup before the tests: \.\\cleanup\.cmd \(exit 3\)') 'a failing cleanup command is only a note'
+$p = New-CleanupProject 't47e' @('01-a:1') @('@echo x> cleanup-dirt.txt')
+$env:OSA_TEST_FREE_MB = '4000'
+$r = Invoke-Runner $p '01-a=success'
+$env:OSA_TEST_FREE_MB = '16000'
+Check ($r.Code -eq 2 -and $r.Out -match 'memoryCleanupCommands left the working tree dirty') 'a cleanup that dirties the tree stops'
+$p = New-Project 't47f' @('01-a:1') ($DefaultConfig -replace ' }$', ', "memoryCleanupCommands": [""] }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'memoryCleanupCommands .* must be a list of commands') 'invalid memoryCleanupCommands refused'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green

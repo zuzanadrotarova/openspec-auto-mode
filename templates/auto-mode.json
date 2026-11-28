@@ -26,5 +26,6 @@
   "keepProcesses": [],
   "criticalFreeMemoryGB": 3,
   "criticalCommitPercent": 95,
-  "memoryWaitMinutes": 10
+  "memoryWaitMinutes": 10,
+  "memoryCleanupCommands": []
 }

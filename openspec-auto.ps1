@@ -313,6 +313,7 @@ function Read-Config {
         criticalFreeMemoryGB = 3
         criticalCommitPercent = 95
         memoryWaitMinutes  = 10
+        memoryCleanupCommands = @()
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -336,6 +337,7 @@ function Read-Config {
     if ($null -eq $cfg.criticalFreeMemoryGB) { $cfg.criticalFreeMemoryGB = 3 }
     if ($null -eq $cfg.criticalCommitPercent) { $cfg.criticalCommitPercent = 95 }
     if ($null -eq $cfg.memoryWaitMinutes) { $cfg.memoryWaitMinutes = 10 }
+    if ($null -eq $cfg.memoryCleanupCommands) { $cfg.memoryCleanupCommands = @() }
     $cfg.memoryErrorPatterns = @($cfg.memoryErrorPatterns | Where-Object { $null -ne $_ -and "$_" -ne '' })
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
@@ -1025,6 +1027,46 @@ function Test-MemoryState([switch]$NoCount) {
     [pscustomobject]@{ AvailMB = $avail; Commit = $commit; Problems = $problems; Critical = $critical; Text = $text }
 }
 
+# Cleanup commands of the project (docs/memory-recovery-plan.md 3), e.g. "gradlew --stop": the first
+# step of the recovery. At the low level at most once per 10 minutes (stopping build daemons makes
+# the next build slower); always when memory is critical or after an out-of-memory error (-Always).
+# A failing command is only a note; a command that leaves the working tree dirty stops the change.
+# Output goes to <runDir>/cleanup.txt. Returns Measured (memory afterwards) or Stop (like recovery).
+$script:LastCleanup = $null
+function Invoke-MemoryCleanup([string]$Before, [bool]$Always) {
+    $cmds = @($script:cfg.memoryCleanupCommands | Where-Object { $_ })
+    $none = [pscustomobject]@{ Measured = $null; Stop = $null }
+    if (-not $cmds.Count -or $DryRun) { return $none }   # a dry run changes nothing
+    if (-not $Always -and $script:LastCleanup -and ((Get-Date) - $script:LastCleanup).TotalMinutes -lt 10) { return $none }
+    $script:LastCleanup = Get-Date
+    $was = Test-MemoryState -NoCount
+    $logPath = Join-Path $script:runDir 'cleanup.txt'
+    $results = @()
+    foreach ($cmd in $cmds) {
+        $p = Invoke-Process ([string]$cmd) ([double]$script:cfg.testTimeoutMinutes) '' 'memory cleanup'
+        $state = "exit $($p.ExitCode)"
+        if ($p.TimedOut) { $state = "timeout after $($script:cfg.testTimeoutMinutes) min" }
+        $results += "$cmd ($state)"
+        $text = ([string]$p.Stdout).TrimEnd()
+        if ($p.Stderr) { $text += "`n" + ([string]$p.Stderr).TrimEnd() }
+        try {
+            [System.IO.File]::AppendAllText($logPath, "===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') before ${Before}: $cmd ($state)`n$text`n", $Utf8)
+        } catch { }
+    }
+    $dirty = Get-DirtyStatus
+    if ($dirty) {
+        $reason = "memoryCleanupCommands left the working tree dirty before ${Before}:`n$dirty"
+        Write-Bad $reason
+        return [pscustomobject]@{ Measured = $null; Stop = [pscustomobject]@{ Reason = $reason; Short = 'memoryCleanupCommands left the working tree dirty' } }
+    }
+    $now = Test-MemoryState -NoCount
+    $line = "memory cleanup before ${Before}: $($results -join ', '); $(Format-GB $was.AvailMB) -> $(Format-GB $now.AvailMB) available"
+    if ($now.Commit) { $line += ", $(Format-Commit $now.Commit)" }
+    if (@($results | Where-Object { $_ -notmatch '\(exit 0\)$' }).Count) { Write-Warn $line } else { Write-Ok $line }
+    $script:MemoryRecoveries += $line
+    [pscustomobject]@{ Measured = $now; Stop = $null }
+}
+
 # Memory recovery (docs/memory-recovery-plan.md 2.2), called when memory is low or after an
 # out-of-memory error (-Force: also when the measurement looks fine again):
 #   1. cleanup commands of the project (step 5), 2. stop leftover processes of runs,
@@ -1034,6 +1076,9 @@ function Test-MemoryState([switch]$NoCount) {
 function Invoke-MemoryRecovery([string]$Before, [switch]$Force) {
     $m = Test-MemoryState -NoCount
     if (-not $Force -and -not $m.Problems.Count -and -not $m.Critical.Count) { return $null }
+    $c = Invoke-MemoryCleanup $Before ($Force -or $m.Critical.Count -gt 0)
+    if ($c.Stop) { return $c.Stop }
+    if ($c.Measured) { $m = $c.Measured }
     $r = Stop-LeftoversForMemory $Before
     if ($r) { $m = $r }
     if (-not $m.Critical.Count) { return $null }
@@ -1413,6 +1458,7 @@ elseif ("$($cfg.criticalFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "
 elseif ("$($cfg.criticalCommitPercent)" -notmatch '^\d+(\.\d+)?$' -or [double]$cfg.criticalCommitPercent -gt 100) { $errors += "criticalCommitPercent in $ConfigRel must be a number from 0 to 100 (is '$($cfg.criticalCommitPercent)')" }
 elseif ("$($cfg.memoryWaitMinutes)" -notmatch '^\d+(\.\d+)?$') { $errors += "memoryWaitMinutes in $ConfigRel must be a number >= 0 (is '$($cfg.memoryWaitMinutes)')" }
 elseif (@($cfg.memoryErrorPatterns | Where-Object { $_ -isnot [string] }).Count) { $errors += "memoryErrorPatterns in $ConfigRel must be a list of strings" }
+elseif (@($cfg.memoryCleanupCommands | Where-Object { $_ -isnot [string] -or -not $_.Trim() }).Count) { $errors += "memoryCleanupCommands in $ConfigRel must be a list of commands (e.g. [`"gradlew --stop`"])" }
 elseif (@($cfg.keepProcesses | Where-Object { $_ -isnot [string] -or -not $_.Trim() }).Count) { $errors += "keepProcesses in $ConfigRel must be a list of process names (wildcards allowed, e.g. [`"qemu-system-*`", `"adb`"])" }
 elseif ($cfg.acceptanceMode -ne 'off') {
     if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }

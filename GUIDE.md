@@ -109,6 +109,7 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `maxCommitPercent` | warn when Windows has promised almost all memory it can give (commit charge in percent of its limit); `0` = off (section 5.6) | 85 |
 | `criticalFreeMemoryGB` / `criticalCommitPercent` | critical memory level: below 3 GB free or above 95 % commit auto-mode waits for memory and stops if it does not come back (section 5.6) | 3 / 95 |
 | `memoryWaitMinutes` | how long auto-mode waits at a critical memory level | 10 |
+| `memoryCleanupCommands` | commands that free memory politely when it gets low, e.g. `["gradlew --stop"]` for a Gradle project (section 5.6) | none |
 | `keepProcesses` | programs auto-mode never stops to free memory, e.g. `["qemu-system-*", "emulator*", "adb"]` for an Android emulator (section 5.6) | none |
 | `preventSleep` | keep the PC awake during the run | `true` |
 | `memoryErrorPatterns` | error texts that mean "out of memory" (e.g. `java.lang.OutOfMemoryError`); `[]` = off | a built-in list |
@@ -230,6 +231,8 @@ When the tests or the agent run out of memory, auto-mode does not try to "repair
 
 Auto-mode watches memory during the whole run: before every run and every test it measures the free memory and the **commit charge** (how much memory Windows has promised to programs; when it reaches its limit, programs get no more memory even if some RAM looks free). It only warns; the report then says how often memory was low. The file `.openspec-auto/runs/<time>/memory.csv` has one line per minute with the numbers and the five biggest programs, so after a stop you can see what grew. It stays on your PC.
 
+If your project has a command that frees memory (for Gradle `gradlew --stop`, for Maven `mvnd --stop`, for .NET `dotnet build-server shutdown`), put it into `memoryCleanupCommands`. Auto-mode runs it first when memory gets low (at most every 10 minutes, so builds are not slowed down all the time) and always before it tries again after running out of memory. The output is in `.openspec-auto/runs/<time>/cleanup.txt`.
+
 Programs that a run started and left running (for example build helpers that stay in the background) are listed in the console and in the report. When memory is low before a run or before the tests, auto-mode stops them to free memory, then goes on. It never stops programs that were already running before you started auto-mode (your browser, an emulator you started), and never the ones named in `keepProcesses`.
 
 When memory is **critical** (less than 3 GB free, or Windows has promised more than 95 % of what it can give), auto-mode also waits up to 10 minutes for memory to come back. If it does, the run goes on; if not, auto-mode stops with `memory stayed critical …` and the 🛑 notification, and the next start continues where it stopped. When a run or the tests run out of memory, auto-mode frees memory and tries the same step **once more** before it stops.
@@ -244,7 +247,8 @@ Builds with Gradle, Kotlin and Android emulators need a lot of memory; with less
   - `kotlin.compiler.execution.strategy=in-process` (no separate Kotlin daemon),
   - optionally `org.gradle.daemon=false`: nothing stays in memory between test runs, but every build is slower, so raise `testTimeoutMinutes`.
 - Give the emulator less RAM, or use tests that do not need it. If the changes need the emulator, start it **before** the run: helper programs started inside the run (Gradle and Kotlin daemons, adb, an emulator) end with it. Otherwise close it.
-- `gradlew --stop` frees memory, but it stops all Gradle daemons of that version, also those of Android Studio and of auto-mode runs in other projects, and the next build starts slower. Auto-mode does not run it for you.
+- `gradlew --stop` frees memory, but it stops all Gradle daemons of that version, also those of Android Studio and of auto-mode runs in other projects, and the next build starts slower. Auto-mode runs it only if you put it into `memoryCleanupCommands`, and then only when memory gets low (section 5.6).
+- An emulator you need: start it before the run and add it to `keepProcesses` (e.g. `["qemu-system-*", "emulator*", "adb"]`), so memory recovery never stops it.
 - Test outputs (build folders, reports) belong in `.gitignore`, otherwise they end up among the set-aside files after an interruption.
 
 ---
