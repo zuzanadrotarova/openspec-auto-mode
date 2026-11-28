@@ -104,6 +104,7 @@ powershell -ExecutionPolicy Bypass -File C:\path\to\openspec-auto-mode\openspec-
 | `notifyStopPriority` | priority of the stop/crash message (Pushover: `1` high, `2` repeats until acknowledged) | 1 |
 | `notifyTimeoutSeconds` | time limit of one notification | 30 |
 | `minFreeMemoryGB` | warn at the start when less physical memory is available (with the 5 biggest processes, local only); also the limit for "a test timeout means out of memory"; `0` = off | 8 |
+| `maxCommitPercent` | warn when the commit charge (memory promised to programs, RAM + page file) is above this percent of its limit – Windows refuses memory when the limit is reached, even with RAM free; checked at the start, before every run and before every test command; `0` = off | 85 |
 | `preventSleep` | keep Windows awake during the run (`SetThreadExecutionState`); the screen may still turn off | `true` |
 | `memoryErrorPatterns` | substrings (case-insensitive) that mark a red test run, the runner's or the worker's, as out of memory; `[]` = off | `java.lang.OutOfMemoryError`, `GC overhead limit exceeded`, Gradle/Kotlin daemon died, JVM could not reserve memory |
 
@@ -180,6 +181,7 @@ powershell -ExecutionPolicy Bypass -File ...\openspec-auto.ps1 -Background      
 - **Run state:** `.openspec-auto/running.json` while a run goes (PID and start time, current change, run and child process), `.openspec-auto/last-run.json` at the end (`finished` / `stopped` / `crashed` / `failed-start`), console output in `runs/<time>/console.txt`. A second start in the same project is refused while the first one lives.
 - **Child processes:** everything the runner starts (worker, tests, notify script) is in a job object with kill-on-close, so stopping the runner (`Stop-Process`, closing its window) also stops the worker. Daemons started inside the run (Gradle, Kotlin, adb, an emulator) end with it.
 - **Interrupted run:** the next start sees a `running.json` whose process is gone, says so, and if the tree is dirty, stashes the leftovers (`git stash push --include-untracked`, message `openspec-auto: leftovers of interrupted run …`), lists the files, and redoes the unfinished group. A dirty tree without an interrupted run is still an error. The runner never drops a stash; the report lists the remaining `openspec-auto:` stashes.
+- **Memory checks and log:** before every run and every test command the runner measures available memory and the commit charge and warns below `minFreeMemoryGB` / above `maxCommitPercent` (warning only, the run goes on). The report has a line `Memory: lowest … available, highest commit … %` and, when it was low, a warning with the number of low checks. During the run `memory-log.ps1` writes one line per minute to `runs/<time>/memory.csv` (time, available, commit, limit, percent, the 5 biggest processes; local only, never in notifications); it ends with the runner.
 - **Out of memory:** a red test run counts as out of memory when its output matches `memoryErrorPatterns`, or it timed out while less than `minFreeMemoryGB` was available. The worker ends with `AUTO-MODE-RESULT: LOW-MEMORY` when its own build or tests hit a memory error, without committing. Either way: no repair run, no `fix-` change, the change ends as `STOPPED` (`… ran out of memory …`), worker leftovers are stashed, and the run can simply be started again. The worker may not change memory or JVM settings unless a task asks for it.
 - Heavy projects (Gradle, Android): see GUIDE section 5.7.
 
@@ -227,6 +229,7 @@ Every run is a full Claude Code session on your account: with a Claude subscript
 | File | Purpose |
 |---|---|
 | `openspec-auto.ps1` | control script (loop, checks, report) |
+| `memory-log.ps1` | memory log of a run (`memory.csv`), started by the runner |
 | `worker-prompt.md` | instructions for the agent of a single run |
 | `install.ps1` | installs the `/openspec-auto` skill for the current user |
 | `claude-skill/openspec-auto/SKILL.md` | skill source (`install.ps1` fills in the runner path) |
@@ -236,6 +239,7 @@ Every run is a full Claude Code session on your account: with a Claude subscript
 | `docs/hardening-plan.md` | design notes: why the script verifies the agent, decisions, and the roadmap |
 | `docs/memory-pressure-plan.md` | design notes: background runs, interrupted runs, out of memory |
 | `docs/notify-plan.md` | design notes: notifications |
+| `docs/memory-recovery-plan.md`, `docs/limit-continue-plan.md`, `docs/dashboard-plan.md` | plans: memory recovery for night runs, continuing after limit stops, cost dashboard |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tests\run-tests.ps1

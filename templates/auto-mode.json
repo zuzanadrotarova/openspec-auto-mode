@@ -21,5 +21,6 @@
   "acceptanceCommand": null,
   "acceptanceDir": "acceptance",
   "notifyScript": null,
-  "minFreeMemoryGB": 8
+  "minFreeMemoryGB": 8,
+  "maxCommitPercent": 85
 }

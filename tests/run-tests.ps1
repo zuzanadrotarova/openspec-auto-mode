@@ -9,8 +9,10 @@ $Fake = Join-Path $PSScriptRoot 'fake-claude.cmd'
 $os = 'openspec'
 if (Get-Command 'openspec.cmd' -ErrorAction SilentlyContinue) { $os = 'openspec.cmd' }
 $script:Failed = 0
-# fixed available memory, so the memory warning does not depend on this PC (T39 changes it)
+# fixed available memory and commit charge, so the memory warnings do not depend on this PC
+# (T39 and T43 change them)
 $env:OSA_TEST_FREE_MB = '16000'
+$env:OSA_TEST_COMMIT = '20000/40000'
 
 function Check([bool]$Cond, [string]$Msg) {
     if ($Cond) { Write-Host "    ok   $Msg" -ForegroundColor Green }
@@ -754,6 +756,50 @@ $p = New-Project 't42' @('01-a:1')
 Write-State $p @{ pid = $PID; processStart = (Get-Start (Get-Process -Id $PID)); startedAt = (Get-Date).ToString('o') }
 $r = Invoke-Runner $p '01-a=success' @('-Background')
 Check ($r.Code -eq 2 -and $r.Out -match 'already running' -and -not (Test-Path "$p/.openspec-auto/runs")) 'refused before launching'
+
+# ---------------------------------------------------------------- memory recovery, step 2
+Write-Host "T43 memory check before every run and test command, commit charge, report line"
+$p = New-Project 't43' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=group'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and $r.Out -match 'memory available: 15\.6 GB, commit 19\.5 of 39\.1 GB \(50 %\)') 'start and runs print available memory and commit'
+Check (([regex]::Matches($r.Out, '    memory available: 15\.6 GB, commit')).Count -eq 3) 'measured before each of the 3 runs'
+# checks: start + baseline + 3 runs + 2 group tests + final tests = 8
+Check ($rep -match '- Memory: lowest 15\.6 GB available, highest commit 50 % \(8 checks\); log `\.openspec-auto/runs/[^/]+/memory\.csv`') 'report: memory line with the number of checks and the log'
+Check ($rep -notmatch 'memory was low') 'no low-memory warning'
+$p = New-Project 't43b' @('01-a:4:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$env:OSA_TEST_COMMIT = '38000/40000'; $env:OSA_TEST_PROCESSES = 'java=3400;qemu-system=2100'
+$r = Invoke-NotifyRunner $p '01-a=group'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'high commit only warns, the run goes on'
+Check ($rep -match 'commit at 95 % of the limit, 37\.1 of 39\.1 GB \(maxCommitPercent 85\); biggest processes: java 3\.3 GB, qemu-system 2\.1 GB') 'start warning with commit, limit and processes'
+Check ($r.Out -match 'low memory before run 1: commit at 95 % of the limit' -and $r.Out -match 'low memory before the tests: commit at 95 %') 'console warns before runs and tests'
+Check ($rep -match 'memory was low before 8 of 8 checks \(lowest 15\.6 GB available, highest commit 95 %') 'report warning counts the low checks'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'commit at 95 % of the limit$' -and $r.Lines[0] -notmatch 'java|qemu') 'E1: commit number, no process names'
+$p = New-Project 't43c' @('01-a:1') ($DefaultConfig -replace ' }$', ', "maxCommitPercent": 0 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -notmatch 'commit at \d+ %') 'maxCommitPercent 0: no commit warning'
+$p = New-Project 't43d' @('01-a:1') ($DefaultConfig -replace ' }$', ', "maxCommitPercent": 120 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'maxCommitPercent .* must be a number from 0 to 100') 'invalid maxCommitPercent refused'
+$env:OSA_TEST_COMMIT = '20000/40000'; Remove-Item Env:OSA_TEST_PROCESSES
+
+Write-Host "T44 memory log: memory.csv per start, the logger ends with the runner"
+$p = New-Project 't44' @('01-a:4:2')
+$env:OSA_TEST_MEMLOG_SECONDS = '1'
+$r = Invoke-Runner $p '01-a=group'
+Remove-Item Env:OSA_TEST_MEMLOG_SECONDS
+$logPid = $null; if ($r.Out -match 'memory log: \S+memory\.csv \(PID (\d+), every 1 s\)') { $logPid = [int]$Matches[1] }
+Check ($r.Code -eq 0 -and $logPid) 'runner names the memory log and its PID'
+$csv = Get-ChildItem "$p/.openspec-auto/runs/*/memory.csv" | Select-Object -First 1
+$rows = @(); if ($csv) { $rows = @(Get-Content $csv.FullName) }
+Check ($rows.Count -ge 2 -and $rows[0] -eq 'time,availableMB,commitMB,commitLimitMB,commitPercent,top') 'memory.csv has the header and at least one line'
+Check ($rows.Count -ge 2 -and $rows[1] -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+,\d+,\d+,\d+,"[^"]+"$') 'a line has time, numbers and the top processes'
+$gone = $false
+for ($i = 0; $i -lt 20 -and -not $gone; $i++) { $gone = -not ($logPid -and (Get-Process -Id $logPid -ErrorAction SilentlyContinue)); if (-not $gone) { Start-Sleep -Milliseconds 250 } }
+Check ($logPid -and $gone) 'the logger is gone after the runner ended'
+$r = Invoke-Runner $p '' @('-DryRun')
+Check ($r.Code -eq 2 -or $r.Out -notmatch 'memory log:') 'dry run starts no memory log'
 
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }

@@ -1,6 +1,6 @@
 # Memory recovery for unattended (night) runs – plan
 
-Status: plan agreed 2026-11-28 (section 8), not implemented. Date: 2026-11-28.
+Status: plan agreed 2026-11-28 (section 8); step 2 implemented 2026-11-28 (tests T43–T44), steps 3–8 open. Date: 2026-11-28.
 Order: first of the three plans, before `docs/limit-continue-plan.md`. Builds on `docs/memory-pressure-plan.md` (steps 1–4).
 
 ## 1. Problem
@@ -87,6 +87,15 @@ note, not a stop. The commands must not dirty the working tree (checked like the
 - **Night start checklist:** before starting, shows the top memory consumers (any applications)
   and the commit charge, recommends what to close, and reminds that Claude Code itself can be
   closed after the start (the runner runs on its own, ~2 GB more). It never closes applications.
+- **Automatic updates in the checklist:** a driver update during a run can crash everything that
+  draws through the graphics card. Seen in a real batch: the GPU vendor's update tool installed a
+  new display driver in the middle of a run; the emulator and the terminal with Claude Code
+  crashed, the runner (own window) survived. The checklist therefore reminds to
+  - switch off automatic driver/software updates of the graphics card vendor (update by hand in
+    the daytime),
+  - pause Windows Update or set its active hours so it does not restart the PC at night.
+  Read-only hints where possible (e.g. Windows Update pause state, a vendor updater process
+  running); the skill never changes these settings itself.
 
 ## 5. Not planned
 
@@ -104,7 +113,7 @@ note, not a stop. The commands must not dirty the working tree (checked like the
    a kept process survives).
 4. Recovery sequence + wait + one retry after out of memory (fake agent LOW-MEMORY mode exists).
 5. `memoryCleanupCommands` (tests with a fake cleanup script).
-6. Skill: detection + proposals, night checklist; `install.ps1`.
+6. Skill: detection + proposals, night checklist (memory, automatic updates); `install.ps1`.
 7. Docs (GUIDE, README, appendix).
 8. Real check on a project with Gradle + emulator (e.g. a mobile project): recovery with the emulator kept
    running; cost estimate first, needs ok.

@@ -308,6 +308,7 @@ function Read-Config {
         memoryErrorPatterns = $DefaultMemoryPatterns
         preventSleep       = $true
         minFreeMemoryGB    = 8
+        maxCommitPercent   = 85
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -326,6 +327,7 @@ function Read-Config {
     if ($null -eq $cfg.memoryErrorPatterns) { $cfg.memoryErrorPatterns = $DefaultMemoryPatterns }
     if ($null -eq $cfg.preventSleep) { $cfg.preventSleep = $true }
     if ($null -eq $cfg.minFreeMemoryGB) { $cfg.minFreeMemoryGB = 8 }
+    if ($null -eq $cfg.maxCommitPercent) { $cfg.maxCommitPercent = 85 }
     $cfg.memoryErrorPatterns = @($cfg.memoryErrorPatterns | Where-Object { $null -ne $_ -and "$_" -ne '' })
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
@@ -500,6 +502,8 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
         $cmds += [pscustomobject]@{ Name = "acceptance $c "; Line = (Get-AcceptanceCommand $c) }
     }
     $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0; $memory = $null
+    $mem = Test-MemoryState
+    if ($mem.Problems.Count) { Write-Host ''; Write-Warn "low memory before the tests: $($mem.Problems -join ', ') ($($mem.Text))" }
     foreach ($c in $cmds) {
         $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) ''
         $minutes += $p.Minutes
@@ -727,6 +731,13 @@ public static class OsaJob {
         if (!GlobalMemoryStatusEx(m)) return -1;
         return m.AvailPhys / 1048576.0;
     }
+    // commit charge and commit limit in MB (TotalPageFile = limit, AvailPageFile = what is left);
+    // Windows refuses allocations when the limit is reached; null on error
+    public static double[] Commit() {
+        MemStatus m = new MemStatus();
+        if (!GlobalMemoryStatusEx(m)) return null;
+        return new double[] { (m.TotalPageFile - m.AvailPageFile) / 1048576.0, m.TotalPageFile / 1048576.0 };
+    }
 
     [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
     // ES_CONTINUOUS | ES_SYSTEM_REQUIRED while on; ES_CONTINUOUS alone clears it. 0 = failed.
@@ -794,6 +805,79 @@ function Get-AvailableMB {
 function Format-GB($MB) {
     if ($null -eq $MB) { return '? GB' }
     ([double]$MB / 1024).ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture) + ' GB'
+}
+
+# Commit charge (docs/memory-recovery-plan.md 2.1): used and limit in MB, percent; $null when unknown.
+# Test hook: OSA_TEST_COMMIT = "<used MB>/<limit MB>".
+function Get-CommitInfo {
+    if ($env:OSA_TEST_COMMIT -match '^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)$') {
+        $used = [double]$Matches[1]; $limit = [double]$Matches[2]
+    } else {
+        if (-not ('OsaJob' -as [type])) { return $null }
+        $c = [OsaJob]::Commit()
+        if (-not $c) { return $null }
+        $used = $c[0]; $limit = $c[1]
+    }
+    if ($limit -le 0) { return $null }
+    [pscustomobject]@{ UsedMB = $used; LimitMB = $limit; Percent = [int][math]::Round(100 * $used / $limit) }
+}
+
+function Format-Commit($Commit) {
+    if (-not $Commit) { return 'commit ?' }
+    "commit $((Format-GB $Commit.UsedMB) -replace ' GB$', '') of $(Format-GB $Commit.LimitMB) ($($Commit.Percent) %)"
+}
+
+# Memory check before a run or a test command (docs/memory-recovery-plan.md 2.1): measures, keeps
+# the statistics for the report and names what is below minFreeMemoryGB / above maxCommitPercent.
+# Step 2 only warns; nothing is stopped here.
+$script:MemStats = [ordered]@{ Checks = 0; Low = 0; MinAvailMB = $null; MaxCommitPct = $null }
+function Test-MemoryState {
+    $avail = Get-AvailableMB
+    $commit = Get-CommitInfo
+    $s = $script:MemStats
+    $s.Checks++
+    if ($null -ne $avail -and ($null -eq $s.MinAvailMB -or $avail -lt $s.MinAvailMB)) { $s.MinAvailMB = $avail }
+    if ($commit -and ($null -eq $s.MaxCommitPct -or $commit.Percent -gt $s.MaxCommitPct)) { $s.MaxCommitPct = $commit.Percent }
+    $problems = @()
+    $minMB = [double]$script:cfg.minFreeMemoryGB * 1024
+    if ($minMB -gt 0 -and $null -ne $avail -and $avail -lt $minMB) { $problems += "only $(Format-GB $avail) available" }
+    $maxPct = [double]$script:cfg.maxCommitPercent
+    if ($maxPct -gt 0 -and $commit -and $commit.Percent -gt $maxPct) { $problems += "commit at $($commit.Percent) % of the limit" }
+    if ($problems.Count) { $s.Low++ }
+    $text = "memory available: $(Format-GB $avail)"
+    if ($commit) { $text += ", $(Format-Commit $commit)" }
+    [pscustomobject]@{ AvailMB = $avail; Commit = $commit; Problems = $problems; Text = $text }
+}
+
+# Memory log (docs/memory-recovery-plan.md 2.6): memory-log.ps1 next to the runner writes one line
+# per minute to <runDir>/memory.csv. It is in the runner's job and also ends by itself when the
+# runner is gone. Test hook: OSA_TEST_MEMLOG_SECONDS.
+$script:MemLogProc = $null
+function Start-MemoryLog([string]$CsvPath) {
+    if (-not $IsWin) { return }
+    $tool = Join-Path $PSScriptRoot 'memory-log.ps1'
+    if (-not (Test-Path -LiteralPath $tool)) { Write-Warn "memory log not written ($tool missing)"; return }
+    $seconds = 60
+    if ($env:OSA_TEST_MEMLOG_SECONDS -match '^\d+$') { $seconds = [int]$env:OSA_TEST_MEMLOG_SECONDS }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = (Get-Process -Id $PID).Path
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$tool`" -Csv `"$CsvPath`" -Seconds $seconds -ParentPid $PID"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        Add-ToJob $proc
+        $script:MemLogProc = $proc
+        Write-Ok "memory log: $(Get-RelPath $CsvPath) (PID $($proc.Id), every $seconds s)"
+    } catch {
+        $w = "memory log not started ($($_.Exception.Message))"
+        $script:warnings += $w; Write-Warn $w
+    }
+}
+
+function Stop-MemoryLog {
+    $p = $script:MemLogProc
+    if ($p -and -not $p.HasExited) { try { $p.Kill(); $p.WaitForExit(5000) | Out-Null } catch { } }
 }
 
 # Biggest processes by working set, grouped by name: "java 3.4 GB (2), browser 2.7 GB, ...".
@@ -1113,6 +1197,7 @@ elseif ($cfg.acceptanceMode -notin @('off', 'reviewed')) { $errors += "acceptanc
 elseif ($cfg.scenarioCoverage -isnot [bool]) { $errors += "scenarioCoverage in $ConfigRel must be true or false (is '$($cfg.scenarioCoverage)')" }
 elseif ($cfg.preventSleep -isnot [bool]) { $errors += "preventSleep in $ConfigRel must be true or false (is '$($cfg.preventSleep)')" }
 elseif ("$($cfg.minFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "minFreeMemoryGB in $ConfigRel must be a number >= 0 (is '$($cfg.minFreeMemoryGB)')" }
+elseif ("$($cfg.maxCommitPercent)" -notmatch '^\d+(\.\d+)?$' -or [double]$cfg.maxCommitPercent -gt 100) { $errors += "maxCommitPercent in $ConfigRel must be a number from 0 to 100 (is '$($cfg.maxCommitPercent)')" }
 elseif (@($cfg.memoryErrorPatterns | Where-Object { $_ -isnot [string] }).Count) { $errors += "memoryErrorPatterns in $ConfigRel must be a list of strings" }
 elseif ($cfg.acceptanceMode -ne 'off') {
     if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }
@@ -1231,6 +1316,8 @@ if ($errors.Count -gt 0) {
 $resumed = ($baseBranch -like 'auto/*') -or ((Invoke-Git @('branch', '--list', 'auto/*')).Out -ne '')
 Write-Ok "base branch: $baseBranch$(if ($resumed) { ' (resuming)' })"
 
+if (-not $DryRun) { Start-MemoryLog (Join-Path $runDir 'memory.csv') }
+
 # Baseline: a failure must not be blamed on the first change, so the start has to be green.
 Write-Host '    baseline tests ...' -NoNewline
 $baselineLog = Join-Path $Project "$StateDirName/baseline-tests.txt"
@@ -1275,14 +1362,22 @@ if ($NotifyCandidate) { Write-Ok "notifications: $NotifyCandidate (project name 
 
 # memory warning (docs/memory-pressure-plan.md 9): a hint only, the tests decide
 $memoryWarning = $null
-$availStart = Get-AvailableMB
-if ([double]$cfg.minFreeMemoryGB -gt 0 -and $null -ne $availStart) {
-    if ($availStart -lt [double]$cfg.minFreeMemoryGB * 1024) {
-        $memoryWarning = "only $(Format-GB $availStart) memory available"
-        $w = "$memoryWarning (minFreeMemoryGB $($cfg.minFreeMemoryGB)); biggest processes: $(Get-BigProcesses)"
-        $warnings += $w; Write-Warn $w
-    } else { Write-Ok "memory available: $(Format-GB $availStart)" }
+$memStart = Test-MemoryState
+$memShort = @(); $memLong = @()   # numbers only (notification) / with the settings (console, report)
+if ([double]$cfg.minFreeMemoryGB -gt 0 -and $null -ne $memStart.AvailMB -and $memStart.AvailMB -lt [double]$cfg.minFreeMemoryGB * 1024) {
+    $t = "only $(Format-GB $memStart.AvailMB) memory available"
+    $memShort += $t; $memLong += "$t (minFreeMemoryGB $($cfg.minFreeMemoryGB))"
 }
+$cs = $memStart.Commit
+if ([double]$cfg.maxCommitPercent -gt 0 -and $cs -and $cs.Percent -gt [double]$cfg.maxCommitPercent) {
+    $memShort += "commit at $($cs.Percent) % of the limit"
+    $memLong += "commit at $($cs.Percent) % of the limit, $((Format-GB $cs.UsedMB) -replace ' GB$', '') of $(Format-GB $cs.LimitMB) (maxCommitPercent $($cfg.maxCommitPercent))"
+}
+if ($memShort.Count) {
+    $memoryWarning = $memShort -join ', '
+    $w = "$($memLong -join '; '); biggest processes: $(Get-BigProcesses)"
+    $warnings += $w; Write-Warn $w
+} elseif ($null -ne $memStart.AvailMB) { Write-Ok $memStart.Text }
 if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
 Set-RunState @{ phase = 'running' }
 
@@ -1430,7 +1525,9 @@ Do the completion check and archive (SUCCESS).
         # 2. new process = empty context (kap. 5.1)
         $unitLabel = ''
         if ($mode -eq 'group') { $unitLabel = ", group $unitGroup" } elseif ($mode -eq 'repair') { $unitLabel = ", repair of group $unitGroup" } elseif ($mode -eq 'final') { $unitLabel = ', final' }
-        Write-Host "    memory available: $(Format-GB (Get-AvailableMB))"
+        $mem = Test-MemoryState
+        Write-Host "    $($mem.Text)"
+        if ($mem.Problems.Count) { Write-Warn "low memory before run ${run}: $($mem.Problems -join ', ')" }
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
         $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath $unitText
@@ -1703,6 +1800,19 @@ if ($stopReason) {
     Send-Notify ("{0} auto-mode finished: {1}/{2} done $([char]0x00B7) {3}; {4}" -f (Get-Emoji 0x1F3C1), $doneCount, $planCount, $runFacts, $reportHint) 1
 }
 
+# memory summary (docs/memory-recovery-plan.md 2.1): one line, and a warning when it was low
+$ms = $script:MemStats
+$memLine = "lowest $(Format-GB $ms.MinAvailMB) available"
+if ($null -ne $ms.MaxCommitPct) { $memLine += ", highest commit $($ms.MaxCommitPct) %" }
+$memLine += " ($($ms.Checks) checks)"
+$memLog = $null
+if ($script:MemLogProc) { $memLog = "$StateDirName/runs/$stamp/memory.csv" }
+if ($ms.Low -gt 0) {
+    $w = "memory was low before $($ms.Low) of $($ms.Checks) checks ($memLine)"
+    if ($memLog) { $w += "; memory log: $memLog" }
+    $warnings += $w
+}
+
 $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('# OpenSpec auto-mode report')
 [void]$sb.AppendLine()
@@ -1715,6 +1825,9 @@ $baselineText = $baseline.Label
 if ($resumeFix) { $baselineText += " (resuming $resumeFix)" }
 if ($baselineAccept.Count) { $baselineText += " (incl. acceptance tests of $($baselineAccept -join ', '))" }
 [void]$sb.AppendLine("- Baseline tests: $baselineText")
+$memReport = "- Memory: $memLine"
+if ($memLog) { $memReport += '; log `' + $memLog + '`' }
+[void]$sb.AppendLine($memReport)
 if ($cfg.acceptanceMode -ne 'off') {
     [void]$sb.AppendLine("- Acceptance tests: $($cfg.acceptanceMode), frozen under ``$($cfg.acceptanceDir)/``")
     if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
@@ -1811,6 +1924,7 @@ Exit-Runner 0 $null
         if ($keep) { try { $script:RunGuard.Dispose() } catch { } }
         else { Exit-RunState }
     }
+    Stop-MemoryLog
     if ($script:KeptAwake) { try { [void][OsaJob]::KeepAwake($false) } catch { } }
     if ($script:Transcript) { try { Stop-Transcript | Out-Null } catch { } }
     Pop-Location

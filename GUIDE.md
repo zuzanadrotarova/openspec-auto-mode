@@ -106,6 +106,7 @@ To change something, tell Claude (e.g. "use the sonnet model in auto-mode" or "s
 | `notifyStopPriority` | priority of the "stopped" message (Pushover: `2` repeats until you confirm it) | 1 |
 | `notifyTimeoutSeconds` | how long one notification may take | 30 |
 | `minFreeMemoryGB` | warn at the start when less memory is available; `0` = off (section 5.6) | 8 |
+| `maxCommitPercent` | warn when Windows has promised almost all memory it can give (commit charge in percent of its limit); `0` = off (section 5.6) | 85 |
 | `preventSleep` | keep the PC awake during the run | `true` |
 | `memoryErrorPatterns` | error texts that mean "out of memory" (e.g. `java.lang.OutOfMemoryError`); `[]` = off | a built-in list |
 
@@ -224,6 +225,8 @@ If you start auto-mode while it is already running in that project, it refuses (
 
 When the tests or the agent run out of memory, auto-mode does not try to "repair" the code (there is nothing wrong with it). It stops with `STOPPED` and the reason `ran out of memory`, sets the unfinished files aside (section 5.5) and sends the 🛑 notification. Close programs you do not need (browsers, Android Studio, an emulator) and run `/openspec-auto run` again.
 
+Auto-mode watches memory during the whole run: before every run and every test it measures the free memory and the **commit charge** (how much memory Windows has promised to programs; when it reaches its limit, programs get no more memory even if some RAM looks free). It only warns; the report then says how often memory was low. The file `.openspec-auto/runs/<time>/memory.csv` has one line per minute with the numbers and the five biggest programs, so after a stop you can see what grew. It stays on your PC.
+
 ### 5.7 Heavy projects (Gradle, Android, emulators)
 
 Builds with Gradle, Kotlin and Android emulators need a lot of memory; with less than about 8 GB free a run can stop.
@@ -306,6 +309,8 @@ This is mostly for Claude, not for you.
 | `only x.x GB memory available (minFreeMemoryGB 8); biggest processes: …` (warning) | close programs you do not need; the run starts anyway |
 | `the runner is in a job object that kills its processes when it closes` (warning) | a newer Claude Code ends the run when Claude Code ends; keep Claude Code open during the run and report it |
 | `could not start: …` (🛑 notification, `last-run.json` `failed-start`) | the start check failed inside the background window; the reason is in `console.txt` and in the message |
-| `preventSleep … must be true or false` / `minFreeMemoryGB … must be a number >= 0` | fix the value in `openspec/auto-mode.json` |
+| `commit at x % of the limit …; biggest processes: …` (warning) | close programs you do not need; the run starts anyway (section 5.6) |
+| `memory was low before x of y checks …` (report warning) | look at `memory.csv` of that run to see which program grew; close it before the next run |
+| `preventSleep … must be true or false` / `minFreeMemoryGB … must be a number >= 0` / `maxCommitPercent … must be a number from 0 to 100` | fix the value in `openspec/auto-mode.json` |
 
 - **Tool tests** (no API calls): `tests/run-tests.ps1`.
