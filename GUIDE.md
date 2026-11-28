@@ -74,6 +74,7 @@ Claude:
 - checks git (if the project is not a repository, asks whether to create one),
 - installs OpenSpec into the project if it is not there yet,
 - creates the configuration `openspec/auto-mode.json` and finds out on its own how the project runs tests, build and lint,
+- recognises the technology (Gradle/Android, Maven daemon, .NET, Bazel, Docker, Node) and proposes memory settings: a command that frees memory (`memoryCleanupCommands`, e.g. `.\gradlew --stop`), programs that must never be stopped (`keepProcesses`, e.g. the Android emulator) and, where useful, a memory limit in the project (e.g. in `gradle.properties`); it writes only what you confirm (sections 5.6, 5.7),
 - commits everything.
 
 **Prerequisite:** the project's packages are installed and the tests pass. Auto-mode is not allowed to install packages. The tests must not leave files behind (e.g. a coverage report not listed in `.gitignore`).
@@ -170,6 +171,12 @@ Auto-mode runs in the background, possibly for hours. Claude tells you the order
 **To stop it:** close that window, or tell Claude "stop auto-mode". The agent working at that moment stops too. The next `/openspec-auto run` continues where it stopped (section 5.5).
 
 If less than 8 GB of memory is free at the start, Claude warns you and names the programs using the most memory. It still starts; closing what you do not need (e.g. browser windows) makes a stop less likely.
+
+**Before a night run** Claude shows a short checklist. It only looks and reminds; it never closes programs or changes settings:
+- the programs using the most memory and how much memory Windows has already promised (commit charge); close what you do not need. Claude Code itself may be closed after the start (about 2 GB more),
+- programs in `keepProcesses` (e.g. the emulator) must already be running, because programs started inside the run end with it,
+- switch off automatic driver updates in the graphics card program (AMD Software, NVIDIA app, Intel Driver & Support Assistant) and update by hand in the daytime: a new display driver installed during a real night run crashed the emulator and the terminal,
+- pause Windows Update for a day, or set its active hours (Settings → Windows Update → Advanced options) so they cover the night; outside the active hours Windows may restart the PC. After a restart, the next `/openspec-auto run` continues (section 5.5).
 
 **Notifications on your phone (optional):** tell Claude "turn on notifications in auto-mode" and give it the path of your notify script (e.g. a Pushover script, `C:\claude-notifier\send-notify.ps1`). You then get a message when auto-mode starts, after every finished change (`✅ 01-login done (1/3) · 2 runs · 0.40 USD · 12 min`) and at the end (`🏁 finished` or `🛑 stopped at …`). The title is the project name, so you can tell several projects running at once apart. As long as no end message came, it is still working. If a notification cannot be sent, auto-mode carries on and lists it under Warnings in the report. The script must accept `-Message` and `-Priority`, ideally `-Title`, and end with an error code when sending failed.
 
@@ -323,6 +330,9 @@ This is mostly for Claude, not for you.
 | `commit at x % of the limit …; biggest processes: …` (warning) | close programs you do not need; the run starts anyway (section 5.6) |
 | `memory stayed critical for 10 min (…) before run …` / `tests … not run (memory stayed critical …)` | the PC had too little memory for 10 minutes; close programs (the message names the biggest) and run `/openspec-auto run` again |
 | `memory was low before x of y checks …` (report warning) | look at `memory.csv` of that run to see which program grew; close it before the next run |
-| `preventSleep … must be true or false` / `minFreeMemoryGB … must be a number >= 0` / `maxCommitPercent … must be a number from 0 to 100` | fix the value in `openspec/auto-mode.json` |
+| `memory cleanup before …: <command> (exit n)` (console, `cleanup.txt`) | the cleanup command failed; only a note, the run goes on. Try the command by hand, fix it or remove it from `memoryCleanupCommands` |
+| `memoryCleanupCommands left the working tree dirty before …` (STOPPED) | the cleanup command changed project files; use a command that does not write into the project, commit or remove the files, run again |
+| `preventSleep … must be true or false` / `minFreeMemoryGB …`, `criticalFreeMemoryGB …`, `memoryWaitMinutes … must be a number >= 0` / `maxCommitPercent …`, `criticalCommitPercent … must be a number from 0 to 100` | fix the value in `openspec/auto-mode.json` |
+| `memoryCleanupCommands … must be a list of commands` / `keepProcesses … must be a list of process names` | write a list of non-empty strings, e.g. `["gradlew --stop"]`, `["qemu-system-*", "adb"]` |
 
 - **Tool tests** (no API calls): `tests/run-tests.ps1`.

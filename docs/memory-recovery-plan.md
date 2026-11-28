@@ -120,6 +120,8 @@ note, not a stop. The commands must not dirty the working tree (checked like the
 
 Each step needs the user's ok; nothing that touches a running batch.
 
+Status 2026-11-28: steps 1–7 done; step 8 waits for a cost estimate and the user's ok.
+
 ## 7. Benefits and risks
 
 Benefits: most memory stops at night become a short pause instead of a stopped batch; the cause

@@ -41,7 +41,7 @@ Limit: tests prove that nothing *known* broke. The agent is told never to weaken
 
 ## Using it from Claude Code (recommended)
 
-The `/openspec-auto` skill (`init`, `check`, `run`, `report`) runs the runner for you and summarizes the result. Installation (once per machine):
+The `/openspec-auto` skill (`init`, `check`, `run`, `report`) runs the runner for you and summarizes the result. `init` also detects the stack and proposes memory settings (`memoryCleanupCommands`, `keepProcesses`, optional limits such as `org.gradle.jvmargs`); `run` first shows a read-only night checklist (biggest processes and commit charge, GPU driver auto-updates, Windows Update pause and active hours). Installation (once per machine):
 
 ```powershell
 git clone https://github.com/zuzanadrotarova/openspec-auto-mode.git
