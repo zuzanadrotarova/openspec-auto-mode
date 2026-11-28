@@ -32,7 +32,8 @@ $dashboard = Join-Path $repo 'dashboard.ps1'
 $hookCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$dashboard`" -Hook"
 $js = @'
 const fs = require('fs');
-const [file, cmd, remove] = process.argv.slice(2);
+const [file, remove] = process.argv.slice(2);
+const cmd = process.env.OSA_HOOK_CMD;  // not an argument: Windows PowerShell drops the inner quotes
 let s = {};
 if (fs.existsSync(file)) {
   const raw = fs.readFileSync(file, 'utf8').replace(/^﻿/, '');
@@ -51,9 +52,11 @@ fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n');
 $jsPath = Join-Path ([System.IO.Path]::GetTempPath()) "osa-install-$PID.js"
 [System.IO.File]::WriteAllText($jsPath, $js, $Utf8)
 try {
-    if (Test-Path $settings) { Copy-Item $settings "$settings.bak-openspec-auto" -Force }
+    # backup of the settings as they were before the first install; later installs keep it
+    if ((Test-Path $settings) -and -not (Test-Path "$settings.bak-openspec-auto")) { Copy-Item $settings "$settings.bak-openspec-auto" }
     $mode = if ($NoDashboard) { 'remove' } else { 'add' }
-    & node $jsPath $settings $hookCmd $mode
+    $env:OSA_HOOK_CMD = $hookCmd
+    & node $jsPath $settings $mode
     if ($LASTEXITCODE -ne 0) { throw "could not update $settings (node exit $LASTEXITCODE); the backup is $settings.bak-openspec-auto" }
 } finally { Remove-Item $jsPath -ErrorAction SilentlyContinue }
 
