@@ -36,6 +36,14 @@
 .PARAMETER DryRun
     Runs the start checks and prints the plan without running anything.
 
+.PARAMETER Background
+    Starts the run in its own minimized window outside the calling shell's process tree and
+    returns within seconds (docs/memory-pressure-plan.md 4.1). Progress and result are in
+    .openspec-auto/running.json, last-run.json and runs/<stamp>/console.txt.
+
+.PARAMETER Detached
+    Internal: set on the copy started by -Background.
+
 .PARAMETER ClaudeCommand
     Command used to start Claude Code. Default: claude (overridable for tests).
 #>
@@ -45,6 +53,8 @@ param(
     [switch]$Init,
     [switch]$SetupAcceptanceSchema,
     [switch]$DryRun,
+    [switch]$Background,
+    [switch]$Detached,
     [string]$ClaudeCommand = 'claude'
 )
 
@@ -58,6 +68,15 @@ $AcceptSchemaName = 'spec-driven-acceptance'
 $HookMarker = '# openspec-auto-mode pre-push guard'
 $IsWin = ($env:OS -eq 'Windows_NT')
 $Utf8 = New-Object System.Text.UTF8Encoding $false
+# memoryErrorPatterns default (docs/memory-pressure-plan.md 6): plain substrings, case-insensitive
+$DefaultMemoryPatterns = @(
+    'java.lang.OutOfMemoryError',
+    'GC overhead limit exceeded',
+    'Gradle build daemon disappeared unexpectedly',
+    'The daemon has terminated unexpectedly',
+    'There is insufficient memory for the Java Runtime Environment',
+    'Could not reserve enough space'
+)
 
 # ---------------------------------------------------------------- helpers
 
@@ -245,8 +264,12 @@ function Get-CurrentBranch {
 
 function Get-Head { (Invoke-Git @('rev-parse', 'HEAD')).Out }
 
-function Get-DirtyStatus {
-    $r = Invoke-Git @('status', '--porcelain')
+# The state folder is excluded through .git/info/exclude; the pathspec is a safety net for a
+# .gitignore that re-includes it (docs/memory-pressure-plan.md 5.2).
+function Get-DirtyStatus([switch]$AllFiles) {
+    $a = @('status', '--porcelain')
+    if ($AllFiles) { $a += '-uall' }
+    $r = Invoke-Git ($a + @('--', '.', ":!$StateDirName"))
     if ($r.Code -ne 0) { return "git status failed: $($r.Out)" }
     $r.Out
 }
@@ -282,6 +305,10 @@ function Read-Config {
         notifyProjectName  = $null
         notifyStopPriority = 1
         notifyTimeoutSeconds = 30
+        memoryErrorPatterns = $DefaultMemoryPatterns
+        preventSleep       = $true
+        minFreeMemoryGB    = 8
+        maxCommitPercent   = 85
     }
     if (-not (Test-Path $path)) { return $null }
     $json = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
@@ -297,6 +324,11 @@ function Read-Config {
     if ($null -eq $cfg.notifyStopPriority) { $cfg.notifyStopPriority = 1 }
     if ($null -eq $cfg.notifyTimeoutSeconds) { $cfg.notifyTimeoutSeconds = 30 }
     if (-not $cfg.notifyProjectName) { $cfg.notifyProjectName = Split-Path -Leaf $Project }
+    if ($null -eq $cfg.memoryErrorPatterns) { $cfg.memoryErrorPatterns = $DefaultMemoryPatterns }
+    if ($null -eq $cfg.preventSleep) { $cfg.preventSleep = $true }
+    if ($null -eq $cfg.minFreeMemoryGB) { $cfg.minFreeMemoryGB = 8 }
+    if ($null -eq $cfg.maxCommitPercent) { $cfg.maxCommitPercent = 85 }
+    $cfg.memoryErrorPatterns = @($cfg.memoryErrorPatterns | Where-Object { $null -ne $_ -and "$_" -ne '' })
     $cfg.acceptanceDir = (([string]$cfg.acceptanceDir).Replace('\', '/').Trim().TrimEnd('/')) -replace '^\./', ''
     $cfg.allowedCommands = @($cfg.allowedCommands | Where-Object { $_ })
     [pscustomobject]$cfg
@@ -306,11 +338,19 @@ function Add-GitExclude {
     $gitDir = (Invoke-Git @('rev-parse', '--absolute-git-dir')).Out
     $exclude = Join-Path $gitDir 'info/exclude'
     $line = "/$StateDirName/"
-    $content = ''
-    if (Test-Path $exclude) { $content = [System.IO.File]::ReadAllText($exclude) }
-    if ($content -notmatch [regex]::Escape($line)) {
-        if ($content -and -not $content.EndsWith("`n")) { $content += "`n" }
-        Write-TextFile $exclude ($content + $line + "`n")
+    # retried: two starts at the same moment may write the file at once
+    for ($i = 1; ; $i++) {
+        try {
+            $content = ''
+            if (Test-Path $exclude) { $content = [System.IO.File]::ReadAllText($exclude) }
+            if ($content -match [regex]::Escape($line)) { return }
+            if ($content -and -not $content.EndsWith("`n")) { $content += "`n" }
+            Write-TextFile $exclude ($content + $line + "`n")
+            return
+        } catch {
+            if ($i -ge 5) { throw }
+            Start-Sleep -Milliseconds (200 * $i)
+        }
     }
 }
 
@@ -375,7 +415,9 @@ function New-WorkerSettings($Cfg, [string]$Path, [string[]]$AcceptChanges) {
         'Edit(./.git/**)', 'Write(./.git/**)', 'Edit(./.claude/**)', 'Write(./.claude/**)',
         "Edit(./$StateDirName/**)", "Write(./$StateDirName/**)",
         "Edit(./$ConfigRel)", "Write(./$ConfigRel)",
-        'WebFetch', 'WebSearch', 'PowerShell'
+        'WebFetch', 'WebSearch', 'PowerShell',
+        # global skills (e.g. OpenSpec's verify) are for interactive use; the worker uses the openspec CLI
+        'Skill'
     )
     # frozen acceptance tests; the runner's git diff check after every run is the real guard
     if ($Cfg.acceptanceMode -ne 'off') { $deny += @("Edit(./$($Cfg.acceptanceDir)/**)", "Write(./$($Cfg.acceptanceDir)/**)") }
@@ -415,15 +457,20 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
 
     $started = Get-Date
     $proc = [System.Diagnostics.Process]::Start($psi)
+    Add-ToJob $proc
+    Set-RunChild $proc
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
     if ($StdIn) { $proc.StandardInput.Write($StdIn) }
     $proc.StandardInput.Close()
 
     $timedOut = $false
+    $availAtTimeout = $null
     try {
         if (-not $proc.WaitForExit([int]($TimeoutMinutes * 60 * 1000))) {
             $timedOut = $true
+            # measured before the kill: afterwards the killed processes have freed their memory
+            $availAtTimeout = Get-AvailableMB
             if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
             $proc.WaitForExit(15000) | Out-Null
         }
@@ -431,6 +478,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
         if (-not $proc.HasExited) {
             if ($IsWin) { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } else { $proc.Kill() }
         }
+        Set-RunChild $null
     }
     $null = $outTask.Wait(15000); $null = $errTask.Wait(15000)
     $stdout = ''; $stderr = ''
@@ -440,6 +488,7 @@ function Invoke-Process([string]$CommandLine, [double]$TimeoutMinutes, [string]$
     if ($proc.HasExited) { $exitCode = $proc.ExitCode }
     [pscustomobject]@{
         ExitCode = $exitCode; TimedOut = $timedOut; Stdout = $stdout; Stderr = $stderr
+        AvailableMBAtTimeout = $availAtTimeout
         Minutes = [math]::Round(((Get-Date) - $started).TotalMinutes, 1)
     }
 }
@@ -452,7 +501,9 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
     foreach ($c in @($AcceptFor | Where-Object { $_ })) {
         $cmds += [pscustomobject]@{ Name = "acceptance $c "; Line = (Get-AcceptanceCommand $c) }
     }
-    $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0
+    $log = ''; $passed = $true; $label = 'green'; $tail = ''; $exitCode = 0; $timedOut = $false; $minutes = 0.0; $memory = $null
+    $mem = Test-MemoryState
+    if ($mem.Problems.Count) { Write-Host ''; Write-Warn "low memory before the tests: $($mem.Problems -join ', ') ($($mem.Text))" }
     foreach ($c in $cmds) {
         $p = Invoke-Process $c.Line ([double]$Cfg.testTimeoutMinutes) ''
         $minutes += $p.Minutes
@@ -470,11 +521,19 @@ function Invoke-Tests($Cfg, [string]$LogPath, [string[]]$AcceptFor) {
                 if ($_.Length -gt 300) { $_.Substring(0, 300) } else { $_ }
             }) -join "`n")
             if ($c.Name) { $tail = "[$($c.Line)]`n$tail" }
+            # out of memory (docs/memory-pressure-plan.md 6): a memory error line, or a timeout
+            # while available memory was below minFreeMemoryGB
+            $memLine = Find-MemoryLine $text
+            $minMB = [double]$Cfg.minFreeMemoryGB * 1024
+            if ($memLine) { $memory = $memLine }
+            elseif ($p.TimedOut -and $minMB -gt 0 -and $null -ne $p.AvailableMBAtTimeout -and $p.AvailableMBAtTimeout -lt $minMB) {
+                $memory = "timeout with $(Format-GB $p.AvailableMBAtTimeout) available"
+            }
         }
     }
     Write-TextFile $LogPath $log
     [pscustomobject]@{
-        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label
+        Passed = $passed; ExitCode = $exitCode; TimedOut = $timedOut; Label = $label; Memory = $memory
         Tail = $tail; Dirty = (Get-DirtyStatus); Log = $LogPath; Minutes = [math]::Round($minutes, 1)
     }
 }
@@ -564,13 +623,18 @@ Acceptance test command: $(Get-AcceptanceCommand $target)
 
 "@
     }
+    $memText = ''
+    if (@($Cfg.memoryErrorPatterns).Count) {
+        $quoted = @(@($Cfg.memoryErrorPatterns) | ForEach-Object { '`' + $_ + '`' }) -join ', '
+        $memText = "Memory error patterns (see your rule on running out of memory): $quoted`n"
+    }
     $prompt = @"
 Change: $($Item.Name)
 Kind: $kind
 Run: $Run of max $($Item.MaxRuns) for this change
 Task budget for this run: $($Cfg.tasksPerRun)
 Test command: $($Cfg.testCommand)
-$acceptText$UnitText$evidence
+$memText$acceptText$UnitText$evidence
 Allowed shell commands (one per Bash call, from the project root; any arguments):
 $shell
 
@@ -611,8 +675,367 @@ Process this change according to your OpenSpec auto-mode instructions.
             $info.Turns = $j.num_turns; $info.Cost = $j.total_cost_usd; $info.Result = [string]$j.result
         }
     } catch { $info.Result = $stdout }
-    if ($info.Result -match 'AUTO-MODE-RESULT:\s*([A-Z]+)') { $info.Claimed = $Matches[1] }
+    if ($info.Result -match 'AUTO-MODE-RESULT:\s*([A-Z]+(-[A-Z]+)*)') { $info.Claimed = $Matches[1] }
     $info
+}
+
+# ---------------------------------------------------------------- run state (docs/memory-pressure-plan.md 4.2, 4.3, 5)
+
+# Job object with KILL_ON_JOB_CLOSE: every child (worker, tests, notify) and its own children end
+# when the runner process ends in any way, so no worker keeps editing after a killed runner.
+$script:JobHandle = [IntPtr]::Zero
+$script:JobWarned = $false
+function Initialize-Job {
+    if (-not $IsWin) { return }
+    try {
+        if (-not ('OsaJob' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class OsaJob {
+    [StructLayout(LayoutKind.Sequential)] struct Basic {
+        public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Io { public ulong R, W, O, RB, WB, OB; }
+    [StructLayout(LayoutKind.Sequential)] struct Extended {
+        public Basic BasicLimits; public Io IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref Extended info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    public static IntPtr Create() {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception();
+        Extended info = new Extended();
+        info.BasicLimits.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if (!SetInformationJobObject(job, 9, ref info, (uint)Marshal.SizeOf(typeof(Extended)))) throw new Win32Exception();
+        return job;
+    }
+    public static void Assign(IntPtr job, IntPtr process) {
+        if (!AssignProcessToJobObject(job, process)) throw new Win32Exception();
+    }
+
+    [StructLayout(LayoutKind.Sequential)] class MemStatus {
+        public uint Length = (uint)Marshal.SizeOf(typeof(MemStatus)); public uint MemoryLoad;
+        public ulong TotalPhys; public ulong AvailPhys; public ulong TotalPageFile; public ulong AvailPageFile;
+        public ulong TotalVirtual; public ulong AvailVirtual; public ulong AvailExtendedVirtual;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GlobalMemoryStatusEx([In, Out] MemStatus status);
+    // available physical memory incl. the standby cache Windows can free at once; -1 on error
+    public static double AvailableMB() {
+        MemStatus m = new MemStatus();
+        if (!GlobalMemoryStatusEx(m)) return -1;
+        return m.AvailPhys / 1048576.0;
+    }
+    // commit charge and commit limit in MB (TotalPageFile = limit, AvailPageFile = what is left);
+    // Windows refuses allocations when the limit is reached; null on error
+    public static double[] Commit() {
+        MemStatus m = new MemStatus();
+        if (!GlobalMemoryStatusEx(m)) return null;
+        return new double[] { (m.TotalPageFile - m.AvailPageFile) / 1048576.0, m.TotalPageFile / 1048576.0 };
+    }
+
+    [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint flags);
+    // ES_CONTINUOUS | ES_SYSTEM_REQUIRED while on; ES_CONTINUOUS alone clears it. 0 = failed.
+    public static uint KeepAwake(bool on) { return SetThreadExecutionState(on ? 0x80000001u : 0x80000000u); }
+
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out Extended info, uint length, IntPtr returned);
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    // job object the runner itself runs in (not the one it creates for its children):
+    // -1 = none, -2 / -3 = could not be read, otherwise its limit flags
+    public static long OwnJobFlags() {
+        bool inJob;
+        if (!IsProcessInJob(GetCurrentProcess(), IntPtr.Zero, out inJob)) return -2;
+        if (!inJob) return -1;
+        Extended info;
+        if (!QueryInformationJobObject(IntPtr.Zero, 9, out info, (uint)Marshal.SizeOf(typeof(Extended)), IntPtr.Zero)) return -3;
+        return info.BasicLimits.LimitFlags;
+    }
+}
+'@
+        }
+    } catch {
+        $w = "native helpers not available ($($_.Exception.Message)); no job object, memory checks or sleep prevention"
+        $script:warnings += $w
+        Write-Warn $w
+        return
+    }
+    try {
+        $script:JobHandle = [OsaJob]::Create()
+    } catch {
+        $w = "child processes are not bound to the runner (job object: $($_.Exception.Message)); after a killed runner check that no claude process is left"
+        $script:warnings += $w
+        Write-Warn $w
+    }
+}
+
+function Add-ToJob([System.Diagnostics.Process]$Proc) {
+    if ($script:JobHandle -eq [IntPtr]::Zero) { return }
+    try { [OsaJob]::Assign($script:JobHandle, $Proc.Handle) }
+    catch {
+        if ($Proc.HasExited -or $script:JobWarned) { return }
+        $script:JobWarned = $true
+        $w = "a child process could not be bound to the runner (job object: $($_.Exception.Message))"
+        $script:warnings += $w
+        Write-Warn $w
+    }
+}
+
+# Available physical memory in MB, or $null when unknown (docs/memory-pressure-plan.md 9).
+# Test hooks: OSA_TEST_FREE_MB_FILE holds "<pid> <mb>", valid only while that process lives;
+# otherwise OSA_TEST_FREE_MB.
+function Get-AvailableMB {
+    $f = $env:OSA_TEST_FREE_MB_FILE
+    if ($f -and (Test-Path -LiteralPath $f)) {
+        $parts = @(([System.IO.File]::ReadAllText($f).Trim()) -split '\s+')
+        if ($parts.Count -eq 2 -and (Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue)) { return [double]$parts[1] }
+    }
+    if ($env:OSA_TEST_FREE_MB) { return [double]$env:OSA_TEST_FREE_MB }
+    if (-not ('OsaJob' -as [type])) { return $null }
+    $mb = [OsaJob]::AvailableMB()
+    if ($mb -lt 0) { return $null }
+    $mb
+}
+
+function Format-GB($MB) {
+    if ($null -eq $MB) { return '? GB' }
+    ([double]$MB / 1024).ToString('0.0', [System.Globalization.CultureInfo]::InvariantCulture) + ' GB'
+}
+
+# Commit charge (docs/memory-recovery-plan.md 2.1): used and limit in MB, percent; $null when unknown.
+# Test hook: OSA_TEST_COMMIT = "<used MB>/<limit MB>".
+function Get-CommitInfo {
+    if ($env:OSA_TEST_COMMIT -match '^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)$') {
+        $used = [double]$Matches[1]; $limit = [double]$Matches[2]
+    } else {
+        if (-not ('OsaJob' -as [type])) { return $null }
+        $c = [OsaJob]::Commit()
+        if (-not $c) { return $null }
+        $used = $c[0]; $limit = $c[1]
+    }
+    if ($limit -le 0) { return $null }
+    [pscustomobject]@{ UsedMB = $used; LimitMB = $limit; Percent = [int][math]::Round(100 * $used / $limit) }
+}
+
+function Format-Commit($Commit) {
+    if (-not $Commit) { return 'commit ?' }
+    "commit $((Format-GB $Commit.UsedMB) -replace ' GB$', '') of $(Format-GB $Commit.LimitMB) ($($Commit.Percent) %)"
+}
+
+# Memory check before a run or a test command (docs/memory-recovery-plan.md 2.1): measures, keeps
+# the statistics for the report and names what is below minFreeMemoryGB / above maxCommitPercent.
+# Step 2 only warns; nothing is stopped here.
+$script:MemStats = [ordered]@{ Checks = 0; Low = 0; MinAvailMB = $null; MaxCommitPct = $null }
+function Test-MemoryState {
+    $avail = Get-AvailableMB
+    $commit = Get-CommitInfo
+    $s = $script:MemStats
+    $s.Checks++
+    if ($null -ne $avail -and ($null -eq $s.MinAvailMB -or $avail -lt $s.MinAvailMB)) { $s.MinAvailMB = $avail }
+    if ($commit -and ($null -eq $s.MaxCommitPct -or $commit.Percent -gt $s.MaxCommitPct)) { $s.MaxCommitPct = $commit.Percent }
+    $problems = @()
+    $minMB = [double]$script:cfg.minFreeMemoryGB * 1024
+    if ($minMB -gt 0 -and $null -ne $avail -and $avail -lt $minMB) { $problems += "only $(Format-GB $avail) available" }
+    $maxPct = [double]$script:cfg.maxCommitPercent
+    if ($maxPct -gt 0 -and $commit -and $commit.Percent -gt $maxPct) { $problems += "commit at $($commit.Percent) % of the limit" }
+    if ($problems.Count) { $s.Low++ }
+    $text = "memory available: $(Format-GB $avail)"
+    if ($commit) { $text += ", $(Format-Commit $commit)" }
+    [pscustomobject]@{ AvailMB = $avail; Commit = $commit; Problems = $problems; Text = $text }
+}
+
+# Memory log (docs/memory-recovery-plan.md 2.6): memory-log.ps1 next to the runner writes one line
+# per minute to <runDir>/memory.csv. It is in the runner's job and also ends by itself when the
+# runner is gone. Test hook: OSA_TEST_MEMLOG_SECONDS.
+$script:MemLogProc = $null
+function Start-MemoryLog([string]$CsvPath) {
+    if (-not $IsWin) { return }
+    $tool = Join-Path $PSScriptRoot 'memory-log.ps1'
+    if (-not (Test-Path -LiteralPath $tool)) { Write-Warn "memory log not written ($tool missing)"; return }
+    $seconds = 60
+    if ($env:OSA_TEST_MEMLOG_SECONDS -match '^\d+$') { $seconds = [int]$env:OSA_TEST_MEMLOG_SECONDS }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = (Get-Process -Id $PID).Path
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$tool`" -Csv `"$CsvPath`" -Seconds $seconds -ParentPid $PID"
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        Add-ToJob $proc
+        $script:MemLogProc = $proc
+        Write-Ok "memory log: $(Get-RelPath $CsvPath) (PID $($proc.Id), every $seconds s)"
+    } catch {
+        $w = "memory log not started ($($_.Exception.Message))"
+        $script:warnings += $w; Write-Warn $w
+    }
+}
+
+function Stop-MemoryLog {
+    $p = $script:MemLogProc
+    if ($p -and -not $p.HasExited) { try { $p.Kill(); $p.WaitForExit(5000) | Out-Null } catch { } }
+}
+
+# Biggest processes by working set, grouped by name: "java 3.4 GB (2), browser 2.7 GB, ...".
+# Only for the console and the local report, never for notifications.
+# Test hook: OSA_TEST_PROCESSES = "name=MB;name=MB".
+function Get-BigProcesses([int]$Top = 5) {
+    if ($env:OSA_TEST_PROCESSES) {
+        $list = @(($env:OSA_TEST_PROCESSES -split ';') | Where-Object { $_ -match '^(.+)=(\d+)$' } |
+            ForEach-Object { [pscustomobject]@{ Name = $Matches[1]; MB = [double]$Matches[2] } })
+    } else {
+        $list = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ Name = $_.ProcessName; MB = $_.WorkingSet64 / 1MB } })
+    }
+    $groups = @($list | Group-Object Name | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; MB = ($_.Group | Measure-Object MB -Sum).Sum; Count = $_.Count }
+    } | Sort-Object MB -Descending | Select-Object -First $Top)
+    @($groups | ForEach-Object { "$($_.Name) $(Format-GB $_.MB)$(if ($_.Count -gt 1) { " ($($_.Count))" })" }) -join ', '
+}
+
+# First output line containing one of memoryErrorPatterns, or $null.
+function Find-MemoryLine([string]$Text) {
+    $patterns = @($script:cfg.memoryErrorPatterns)
+    if (-not $patterns.Count -or -not $Text) { return $null }
+    foreach ($line in (($Text -replace "`r", '') -split "`n")) {
+        foreach ($p in $patterns) {
+            if ($line.IndexOf([string]$p, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $l = $line.Trim()
+                if ($l.Length -gt 200) { $l = $l.Substring(0, 200) }
+                return $l
+            }
+        }
+    }
+    $null
+}
+
+function Get-ProcessStart($Proc) {
+    try { return $Proc.StartTime.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
+
+# A process counts as alive only when the PID exists and its start time matches (PIDs are reused).
+function Test-ProcessAlive($Id, $Start) {
+    if (-not $Id) { return $false }
+    $p = Get-Process -Id ([int]$Id) -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    if (-not $Start) { return $true }
+    try { $actual = $p.StartTime.ToUniversalTime() } catch { return $false }
+    if ($Start -is [datetime]) { $expected = $Start.ToUniversalTime() }
+    else {
+        $expected = [datetime]::Parse([string]$Start, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    }
+    [math]::Abs(($actual - $expected).TotalSeconds) -lt 2
+}
+
+# running.json: exists while a run is going; holds what was running when a run died.
+$script:RunStatePath = $null      # set once this runner owns running.json
+$script:RunState = $null
+$script:RunGuard = $null          # open handle without delete sharing: nobody can rename the file away
+function Write-RunState {
+    if (-not $script:RunStatePath) { return }
+    try { Write-TextFile $script:RunStatePath ($script:RunState | ConvertTo-Json) } catch { }
+}
+function Set-RunState([hashtable]$Values) {
+    if (-not $script:RunStatePath) { return }
+    foreach ($k in $Values.Keys) { $script:RunState[$k] = $Values[$k] }
+    Write-RunState
+}
+function Set-RunChild($Proc) {
+    if (-not $script:RunStatePath) { return }
+    if ($Proc) { Set-RunState @{ childPid = $Proc.Id; childStart = (Get-ProcessStart $Proc) } }
+    else { Set-RunState @{ childPid = $null; childStart = $null } }
+}
+
+function Read-RunRecord([string]$Path) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $text = [System.IO.File]::ReadAllText($Path)
+            if ($text.Trim()) { return ($text | ConvertFrom-Json) }
+        } catch { }
+        Start-Sleep -Milliseconds 300
+    }
+    [pscustomobject]@{ pid = $null; processStart = $null; childPid = $null; childStart = $null; runDir = $null; change = $null; run = $null; startedAt = $null }
+}
+
+# Claims running.json for this runner. Returns $null or the reason why another start holds it.
+function Enter-RunState([string]$Path, [hashtable]$State, $Stale) {
+    if ($Stale -and (Test-Path -LiteralPath $Path)) {
+        # move the record of the interrupted run into its own log folder
+        $now = Read-RunRecord $Path
+        if ([string]$now.pid -eq [string]$Stale.pid -and [string]$now.processStart -eq [string]$Stale.processStart) {
+            $dest = Join-Path (Split-Path -Parent $Path) 'running.stale.json'
+            if ($Stale.runDir) {
+                $d = Join-Path $Project ([string]$Stale.runDir)
+                if (Test-Path -LiteralPath $d) { $dest = Join-Path $d 'running.interrupted.json' }
+            }
+            try { Move-Item -LiteralPath $Path -Destination $dest -Force } catch { }
+        }
+    }
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        $fs.Close()
+    } catch {
+        $other = Read-RunRecord $Path
+        $since = ''
+        if ($other.startedAt) { try { $since = ', since ' + ([datetime]$other.startedAt).ToString('HH:mm') } catch { } }
+        return "auto-mode is already running in this project (PID $($other.pid)$since)"
+    }
+    $script:RunGuard = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $script:RunStatePath = $Path
+    $script:RunState = [ordered]@{}
+    foreach ($k in @('pid', 'processStart', 'phase', 'childPid', 'childStart', 'runDir', 'startedAt', 'change', 'run', 'consoleLog')) { $script:RunState[$k] = $State[$k] }
+    Write-RunState
+    return $null
+}
+
+function Exit-RunState {
+    if (-not $script:RunStatePath) { return }
+    try { $script:RunGuard.Dispose() } catch { }
+    Remove-Item -LiteralPath $script:RunStatePath -Force -ErrorAction SilentlyContinue
+    $script:RunStatePath = $null
+}
+
+# Leftovers of a run that ended without committing go into a stash, never reset or cleaned.
+function Save-Leftovers([string]$Message) {
+    $files = @(((Get-DirtyStatus -AllFiles) -split "`n") | Where-Object { $_.Trim() })
+    $branchName = Get-CurrentBranch
+    Write-Warn "uncommitted files ($($files.Count)) on branch ${branchName}:"
+    foreach ($f in $files) { Write-Host "      $f" }
+    # No pathspec: an exclude pathspec naming the ignored state folder makes git stash fail halfway
+    # (stash saved, files left staged). --include-untracked never takes ignored files, so the state
+    # folder stays out as long as it is ignored; otherwise refuse instead of stashing it.
+    if ((Invoke-Git @('check-ignore', '-q', "$StateDirName/running.json")).Code -ne 0) {
+        throw "$StateDirName/ is not ignored by git (a .gitignore re-includes it?); leftovers not stashed. Remove that rule and run again."
+    }
+    $before = (Invoke-Git @('rev-parse', '-q', '--verify', 'refs/stash')).Out
+    $r = Invoke-Git @('stash', 'push', '--include-untracked', '-m', $Message)
+    $after = (Invoke-Git @('rev-parse', '-q', '--verify', 'refs/stash')).Out
+    if (-not $after -or $after -eq $before) { throw "git stash failed:`n$($r.Out)" }
+    $left = Get-DirtyStatus
+    if ($left) { throw "git stash left files in the working tree:`n$left`n$($r.Out)" }
+    [pscustomobject]@{ Ref = 'stash@{0}'; Count = $files.Count; Files = $files; Branch = $branchName }
+}
+
+function Get-LeftoverStashes {
+    $r = Invoke-Git @('stash', 'list', '--format=%gd %s')
+    if ($r.Code -ne 0 -or -not $r.Out) { return @() }
+    @(($r.Out -split "`n") | Where-Object { $_ -match 'openspec-auto: leftovers' })
+}
+
+$script:LastRunPath = $null       # set when this start should leave last-run.json
+$script:EndCode = $null
+$script:EndReason = $null
+$script:Crashed = $false
+$script:MemoryStop = $null
+$script:KeptAwake = $false
+function Exit-Runner([int]$Code, [string]$Reason) {
+    $script:EndCode = $Code
+    $script:EndReason = $Reason
+    exit $Code
 }
 
 # ---------------------------------------------------------------- start
@@ -627,6 +1050,51 @@ if ((Invoke-Git @('rev-parse', '--is-inside-work-tree')).Out -ne 'true') {
 }
 $top = [System.IO.Path]::GetFullPath((Invoke-Git @('rev-parse', '--show-toplevel')).Out)
 if ($top.TrimEnd('\', '/') -ne $Project.TrimEnd('\', '/')) { throw "Run from the repository root ($top)." }
+
+if ($Background) {
+    # launcher (4.1): a copy in its own minimized window; this process ends at once, so the copy
+    # has no living parent and is not part of the calling shell's process tree
+    if ($Init -or $SetupAcceptanceSchema -or $DryRun -or $Detached) { throw '-Background cannot be combined with -Init, -SetupAcceptanceSchema, -DryRun or -Detached' }
+    $statePath = Join-Path $Project "$StateDirName/running.json"
+    $lastPath = Join-Path $Project "$StateDirName/last-run.json"
+    if (Test-Path -LiteralPath $statePath) {
+        $prev = Read-RunRecord $statePath
+        if (Test-ProcessAlive $prev.pid $prev.processStart) { Write-Bad "auto-mode is already running in this project (PID $($prev.pid))"; exit 2 }
+    }
+    $lastBefore = $null
+    if (Test-Path -LiteralPath $lastPath) { $lastBefore = (Get-Item -LiteralPath $lastPath).LastWriteTimeUtc }
+    $exe = (Get-Process -Id $PID).Path
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Project', "`"$Project`"", '-ClaudeCommand', "`"$ClaudeCommand`"", '-Detached')
+    $copy = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $Project -WindowStyle Minimized -PassThru
+    $null = $copy.Handle   # keeps the exit code readable
+    Write-Step "auto-mode started in its own minimized window (PID $($copy.Id))"
+    # wait until the start checks (incl. baseline tests) passed, the copy ended, or 20 s are over
+    $state = $null
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline -and -not $copy.HasExited) {
+        if (Test-Path -LiteralPath $statePath) {
+            $s = Read-RunRecord $statePath
+            if ([string]$s.pid -eq [string]$copy.Id) { $state = $s; if ($s.phase -eq 'running') { break } }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($copy.HasExited) {
+        if ((Test-Path -LiteralPath $lastPath) -and (Get-Item -LiteralPath $lastPath).LastWriteTimeUtc -ne $lastBefore) {
+            $l = Read-RunRecord $lastPath
+            Write-Bad "the run ended at once ($($l.state)): $($l.reason)"
+            Write-Host "    console: $($l.runDir)/console.txt"
+        } else {
+            Write-Bad "the run ended at once (exit code $($copy.ExitCode)); see the newest $StateDirName/runs/*/console.txt"
+        }
+        exit 2
+    }
+    if ($state -and $state.phase -eq 'running') { Write-Ok 'start checks passed, the run is going' }
+    else { Write-Warn 'still starting (start checks, baseline tests); look at running.json and last-run.json in a moment' }
+    Write-Host "    status:  $StateDirName/running.json (deleted at the end)"
+    if ($state) { Write-Host "    console: $($state.consoleLog)" }
+    Write-Host "    result:  $StateDirName/last-run.json and $StateDirName/auto-mode-report.md"
+    exit 0
+}
 
 if ($Init) {
     Write-Step 'Init'
@@ -694,7 +1162,31 @@ if ($SetupAcceptanceSchema) {
 
 # ---------------------------------------------------------------- start checks (kap. 5.2)
 
+$warnings = @()
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+for ($n = 2; Test-Path (Join-Path $Project "$StateDirName/runs/$stamp"); $n++) { $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss') + "-$n" }
+$runDir = Join-Path $Project "$StateDirName/runs/$stamp"
+$consoleLog = Join-Path $runDir 'console.txt'
+$runningPath = Join-Path $Project "$StateDirName/running.json"
+$script:Transcript = $false
+if (-not $DryRun) {
+    New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+    try { Start-Transcript -LiteralPath $consoleLog | Out-Null; $script:Transcript = $true } catch { }
+}
+Initialize-Job
+
 Write-Step "OpenSpec auto-mode in $Project"
+if ($Detached) { try { $Host.UI.RawUI.WindowTitle = "openspec-auto: $(Split-Path -Leaf $Project)" } catch { } }
+# the job object the runner itself is in (4.1): one that kills on close would end the run with it
+if ('OsaJob' -as [type]) {
+    $jf = [OsaJob]::OwnJobFlags()
+    if ($jf -eq -1) { Write-Ok 'runner is not in a job object' }
+    elseif ($jf -lt 0) { Write-Ok "job object of the runner could not be read ($jf)" }
+    elseif ($jf -band 0x2000) {
+        $w = "the runner is in a job object that kills its processes when it closes (flags 0x$('{0:X}' -f $jf)); the run ends when the program that started it ends"
+        $warnings += $w; Write-Warn $w
+    } else { Write-Ok "runner is in a job object without kill-on-close (flags 0x$('{0:X}' -f $jf))" }
+}
 $errors = @()
 if (-not (Get-Command $OpenSpecExe -ErrorAction SilentlyContinue)) { $errors += 'openspec CLI not found' }
 $cfg = Read-Config
@@ -703,6 +1195,10 @@ elseif (-not $cfg.testCommand) { $errors += "testCommand is not set in $ConfigRe
 elseif ($cfg.fixMode -notin @('immediate', 'stop')) { $errors += "fixMode in $ConfigRel must be 'immediate' or 'stop' (is '$($cfg.fixMode)')" }
 elseif ($cfg.acceptanceMode -notin @('off', 'reviewed')) { $errors += "acceptanceMode in $ConfigRel must be 'off' or 'reviewed' (is '$($cfg.acceptanceMode)')" }
 elseif ($cfg.scenarioCoverage -isnot [bool]) { $errors += "scenarioCoverage in $ConfigRel must be true or false (is '$($cfg.scenarioCoverage)')" }
+elseif ($cfg.preventSleep -isnot [bool]) { $errors += "preventSleep in $ConfigRel must be true or false (is '$($cfg.preventSleep)')" }
+elseif ("$($cfg.minFreeMemoryGB)" -notmatch '^\d+(\.\d+)?$') { $errors += "minFreeMemoryGB in $ConfigRel must be a number >= 0 (is '$($cfg.minFreeMemoryGB)')" }
+elseif ("$($cfg.maxCommitPercent)" -notmatch '^\d+(\.\d+)?$' -or [double]$cfg.maxCommitPercent -gt 100) { $errors += "maxCommitPercent in $ConfigRel must be a number from 0 to 100 (is '$($cfg.maxCommitPercent)')" }
+elseif (@($cfg.memoryErrorPatterns | Where-Object { $_ -isnot [string] }).Count) { $errors += "memoryErrorPatterns in $ConfigRel must be a list of strings" }
 elseif ($cfg.acceptanceMode -ne 'off') {
     if (-not ([string]$cfg.acceptanceCommand).Contains('{change}')) { $errors += "acceptanceCommand in $ConfigRel must contain {change} (e.g. node --test `"$($cfg.acceptanceDir)/{change}/*.accept.js`")" }
     if (-not $cfg.acceptanceDir -or [System.IO.Path]::IsPathRooted($cfg.acceptanceDir) -or $cfg.acceptanceDir -match '(^|/)\.\.?(/|$)' -or $cfg.acceptanceDir -match '[*?]') {
@@ -722,8 +1218,57 @@ $baseBranch = Get-CurrentBranch
 if (-not $baseBranch) { $errors += 'HEAD is detached; check out a branch first' }
 if ((Invoke-Git @('config', 'user.email')).Out -eq '') { $errors += 'git user.email is not set' }
 Add-GitExclude
+
+# running.json of an earlier start (5.1, 5.3): still running, or interrupted
+$interrupted = $null
+$runActive = $false
+if (Test-Path -LiteralPath $runningPath) {
+    $prev = Read-RunRecord $runningPath
+    $busy = $null
+    if (Test-ProcessAlive $prev.pid $prev.processStart) {
+        $since = ''
+        if ($prev.startedAt) { try { $since = ', since ' + ([datetime]$prev.startedAt).ToString('HH:mm') } catch { } }
+        $busy = "auto-mode is already running in this project (PID $($prev.pid)$since)"
+    } elseif (Test-ProcessAlive $prev.childPid $prev.childStart) {
+        $busy = "a worker of the previous run is still running (PID $($prev.childPid)); end it first"
+    }
+    if ($busy -and $DryRun) { $runActive = $true; $warnings += $busy; Write-Warn $busy }
+    elseif ($busy) { Write-Bad $busy; Exit-Runner 2 $busy }
+    else {
+        $interrupted = $prev
+        $prevStamp = '?'
+        if ($prev.runDir) { $prevStamp = Split-Path -Leaf ([string]$prev.runDir) }
+        $where = 'before the first change'
+        if ($prev.change) { $where = "during $($prev.change) run $($prev.run)" }
+        $interrupted | Add-Member -NotePropertyName Label -NotePropertyValue "$prevStamp ($(if ($prev.change) { "$($prev.change) run $($prev.run)" } else { 'start' }))" -Force
+        $w = "previous run $prevStamp was interrupted $where"
+        $warnings += $w; Write-Warn $w
+    }
+}
+if (-not $DryRun) {
+    $claim = Enter-RunState $runningPath @{
+        pid = $PID; processStart = (Get-ProcessStart (Get-Process -Id $PID)); phase = 'starting'; runDir = (Get-RelPath $runDir)
+        startedAt = (Get-Date).ToString('o'); consoleLog = (Get-RelPath $consoleLog)
+    } $interrupted
+    if ($claim) { Write-Bad $claim; Exit-Runner 2 $claim }
+    # only the start that owns running.json leaves last-run.json
+    $script:LastRunPath = Join-Path $Project "$StateDirName/last-run.json"
+}
+
+$stashInfo = $null
 $dirty = Get-DirtyStatus
-if ($dirty) { $errors += "working tree is not clean:`n$dirty" }
+if ($dirty) {
+    if ($runActive) { Write-Warn 'working tree is not clean (the running run is working in it)' }
+    elseif ($interrupted -and $DryRun) {
+        $w = "leftovers of the interrupted run are stashed at the start (git stash):`n$dirty"
+        $warnings += $w; Write-Warn $w
+    } elseif ($interrupted) {
+        try { $stashInfo = Save-Leftovers "openspec-auto: leftovers of interrupted run $($interrupted.Label)" }
+        catch { Write-Bad $_.Exception.Message; Exit-Runner 2 $_.Exception.Message }
+        $w = "leftovers of the interrupted run stashed on branch $($stashInfo.Branch) ($($stashInfo.Ref), $($stashInfo.Count) files: $($stashInfo.Files -join ', ')); see them with git stash show -p $($stashInfo.Ref)"
+        $warnings += $w; Write-Warn $w
+    } else { $errors += "working tree is not clean:`n$dirty" }
+}
 
 $numbered = @()
 $fixCandidate = $null
@@ -765,17 +1310,24 @@ if ($errors.Count -eq 0) {
 }
 if ($errors.Count -gt 0) {
     foreach ($e in $errors) { Write-Bad $e }
-    exit 2
+    Exit-Runner 2 ($errors -join '; ')
 }
 
 $resumed = ($baseBranch -like 'auto/*') -or ((Invoke-Git @('branch', '--list', 'auto/*')).Out -ne '')
 Write-Ok "base branch: $baseBranch$(if ($resumed) { ' (resuming)' })"
 
+if (-not $DryRun) { Start-MemoryLog (Join-Path $runDir 'memory.csv') }
+
 # Baseline: a failure must not be blamed on the first change, so the start has to be green.
 Write-Host '    baseline tests ...' -NoNewline
 $baselineLog = Join-Path $Project "$StateDirName/baseline-tests.txt"
 $baselineAccept = @(Get-DoneAcceptance)
-$baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
+if ($runActive) {
+    # dry run while a run is going: do not run the tests in the tree the worker is using
+    $baseline = [pscustomobject]@{ Passed = $true; Label = 'skipped (a run is in progress)'; Minutes = 0; Dirty = ''; Tail = ''; Log = $baselineLog }
+} else {
+    $baseline = Invoke-Tests $cfg $baselineLog $baselineAccept
+}
 Write-Host (" {0}, {1} min" -f $baseline.Label, $baseline.Minutes)
 if ($baselineAccept.Count) { Write-Ok "acceptance tests of archived changes included: $($baselineAccept -join ', ')" }
 $resumeFix = $null
@@ -784,7 +1336,12 @@ if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
 }
 if ($baseline.Dirty) {
     Write-Bad "testCommand leaves the working tree dirty:`n$($baseline.Dirty)`n    add these files to .gitignore (or clean them up) and run again"
-    exit 2
+    Exit-Runner 2 'testCommand leaves the working tree dirty'
+}
+if (-not $baseline.Passed -and $baseline.Memory) {
+    $why = "baseline tests ran out of memory ($($baseline.Memory)); close other programs and run again"
+    Write-Bad "$why. Output: $StateDirName/baseline-tests.txt"
+    Exit-Runner 2 $why
 }
 if (-not $baseline.Passed) {
     if ($fixCandidate -and $cfg.fixMode -eq 'immediate') {
@@ -792,28 +1349,44 @@ if (-not $baseline.Passed) {
         Write-Warn "baseline tests fail; resuming $resumeFix first"
     } else {
         Write-Bad "baseline tests fail: $($baseline.Label); auto-mode needs a green start. Output: $StateDirName/baseline-tests.txt"
-        exit 2
+        Exit-Runner 2 "baseline tests fail: $($baseline.Label)"
     }
 } else {
     Write-Ok 'baseline tests green'
 }
-if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered changes (NN-name) to process'; exit 2 }
+if ($numbered.Count -eq 0 -and -not $resumeFix) { Write-Bad 'no active numbered changes (NN-name) to process'; Exit-Runner 2 'no active numbered changes (NN-name) to process' }
 
 $planNames = @(@($resumeFix) + @($numbered | ForEach-Object { $_.name }) | Where-Object { $_ })
 Write-Ok ("plan: " + ($planNames -join ' -> '))
 if ($NotifyCandidate) { Write-Ok "notifications: $NotifyCandidate (project name '$($cfg.notifyProjectName)')" }
-if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$runDir = Join-Path $Project "$StateDirName/runs/$stamp"
-New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+# memory warning (docs/memory-pressure-plan.md 9): a hint only, the tests decide
+$memoryWarning = $null
+$memStart = Test-MemoryState
+$memShort = @(); $memLong = @()   # numbers only (notification) / with the settings (console, report)
+if ([double]$cfg.minFreeMemoryGB -gt 0 -and $null -ne $memStart.AvailMB -and $memStart.AvailMB -lt [double]$cfg.minFreeMemoryGB * 1024) {
+    $t = "only $(Format-GB $memStart.AvailMB) memory available"
+    $memShort += $t; $memLong += "$t (minFreeMemoryGB $($cfg.minFreeMemoryGB))"
+}
+$cs = $memStart.Commit
+if ([double]$cfg.maxCommitPercent -gt 0 -and $cs -and $cs.Percent -gt [double]$cfg.maxCommitPercent) {
+    $memShort += "commit at $($cs.Percent) % of the limit"
+    $memLong += "commit at $($cs.Percent) % of the limit, $((Format-GB $cs.UsedMB) -replace ' GB$', '') of $(Format-GB $cs.LimitMB) (maxCommitPercent $($cfg.maxCommitPercent))"
+}
+if ($memShort.Count) {
+    $memoryWarning = $memShort -join ', '
+    $w = "$($memLong -join '; '); biggest processes: $(Get-BigProcesses)"
+    $warnings += $w; Write-Warn $w
+} elseif ($null -ne $memStart.AvailMB) { Write-Ok $memStart.Text }
+if ($DryRun) { Write-Step 'Dry run, no agent started.'; exit 0 }
+Set-RunState @{ phase = 'running' }
+
 $settingsPath = Join-Path $runDir 'worker-settings.json'
 $agentsPath = Join-Path $runDir 'worker-agents.json'
 $acceptChanges = @(@($baselineAccept) + @($numbered | ForEach-Object { $_.name } | Where-Object { Test-HasAcceptance $_ }))
 New-WorkerSettings $cfg $settingsPath $acceptChanges
 New-WorkerAgents $agentsPath
 
-$warnings = @()
 $hookWarning = Install-PrePushHook
 if ($hookWarning) { $warnings += $hookWarning; Write-Warn $hookWarning } else { Write-Ok 'pre-push guard installed' }
 $env:OPENSPEC_AUTO_MODE = '1'
@@ -827,7 +1400,15 @@ $stopReason = $null
 
 $script:NotifyPath = $NotifyCandidate
 $planCount = @($numbered).Count
-Send-Notify ("{0} auto-mode started: {1} change{2}, first {3}" -f (Get-Emoji 0x25B6), $planNames.Count, $(if ($planNames.Count -ne 1) { 's' }), $planNames[0]) 0
+if ($cfg.preventSleep -and ('OsaJob' -as [type])) {
+    # held by this (main) thread for the whole loop; Windows drops it when the thread ends
+    if ([OsaJob]::KeepAwake($true) -ne 0) { $script:KeptAwake = $true; Write-Ok 'Windows is kept awake during the run (preventSleep)' }
+    else { $w = 'could not keep Windows awake (SetThreadExecutionState failed)'; $warnings += $w; Write-Warn $w }
+}
+$startExtra = ''
+if ($memoryWarning) { $startExtra += " $([char]0x00B7) $([char]0x26A0) $memoryWarning" }
+if ($stashInfo) { $startExtra += " $([char]0x00B7) leftovers of the interrupted run stashed ($($stashInfo.Ref), $($stashInfo.Count) file$(if ($stashInfo.Count -ne 1) { 's' }))" }
+Send-Notify (("{0} auto-mode started: {1} change{2}, first {3}" -f (Get-Emoji 0x25B6), $planNames.Count, $(if ($planNames.Count -ne 1) { 's' }), $planNames[0]) + $startExtra) 0
 
 function New-QueueItem([string]$Name, [bool]$IsFix, [string]$Parent, [string]$Branch, [int]$MaxRuns, [string]$Evidence, [string]$EvidenceLabel) {
     [pscustomobject]@{
@@ -851,6 +1432,8 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
     $change = $item.Name
     $branch = $item.Branch
     $changeStart = Get-Date
+    if ($env:OSA_TEST_THROW -eq 'loop') { throw 'test crash (OSA_TEST_THROW)' }
+    Set-RunState @{ change = $change; run = 0 }
     Write-Step "$(if ($item.IsFix) { 'Fix' } else { 'Change' }) $change"
 
     # 1. branch (kap. 5 bod 1, kap. 5.2); a fix runs on the branch of the change it fixes
@@ -892,6 +1475,7 @@ for ($qi = 0; $qi -lt $queue.Count; $qi++) {
 
     while (-not $outcome) {
         $run++
+        Set-RunState @{ run = $run }
         if ($run -gt $item.MaxRuns) {
             $outcome = 'STOPPED'
             if ($item.IsFix) { $notes += "tests still fail after $($item.MaxRuns) runs (maxRunsPerFix); the fix plan is probably wrong" }
@@ -941,11 +1525,50 @@ Do the completion check and archive (SUCCESS).
         # 2. new process = empty context (kap. 5.1)
         $unitLabel = ''
         if ($mode -eq 'group') { $unitLabel = ", group $unitGroup" } elseif ($mode -eq 'repair') { $unitLabel = ", repair of group $unitGroup" } elseif ($mode -eq 'final') { $unitLabel = ', final' }
+        $mem = Test-MemoryState
+        Write-Host "    $($mem.Text)"
+        if ($mem.Problems.Count) { Write-Warn "low memory before run ${run}: $($mem.Problems -join ', ')" }
         Write-Host "    run $run ($($before.Done)/$($before.Total) tasks done$unitLabel) ..." -NoNewline
         $logBase = Join-Path $runDir ("{0}.run{1:D2}" -f $change, $run)
         $w = Invoke-Worker $cfg $item $run $logBase $settingsPath $agentsPath $unitText
         if ($w.Cost) { $cost += [double]$w.Cost }
+        if ($env:OSA_TEST_THROW -eq 'after-worker') { throw 'test crash after the worker (OSA_TEST_THROW)' }
         Write-Host (" exit {0}, {1} min, claims {2}" -f $w.ExitCode, $w.Minutes, $(if ($w.Claimed) { $w.Claimed } else { '-' }))
+
+        # 2b. the worker ran out of memory (docs/memory-pressure-plan.md 7): no commit expected,
+        # leftovers go into a stash, the change stops (not BLOCKED, so the next start continues)
+        if ($w.Claimed -eq 'LOW-MEMORY' -and -not $w.TimedOut -and $w.ExitCode -eq 0) {
+            $lmProblems = @()
+            $cur = Get-CurrentBranch
+            if ($cur -ne $branch) { $lmProblems += "agent left branch $branch (now on $cur)" }
+            if ((Get-RemoteRefs) -ne $refsBefore) { $lmProblems += 'remote-tracking refs changed during the run (possible push)' }
+            if (-not $lmProblems.Count) {
+                $memLine = Find-MemoryLine $w.Result
+                if (-not $memLine) {
+                    $memLine = (($w.Result -replace "`r", '') -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch 'AUTO-MODE-RESULT' } | Select-Object -First 1)
+                    if (-not $memLine) { $memLine = '(no line given)' }
+                    $memLine = ([string]$memLine).Trim()
+                    if ($memLine.Length -gt 200) { $memLine = $memLine.Substring(0, 200) }
+                }
+                $avail = Format-GB (Get-AvailableMB)
+                $memNote = "worker ran out of memory: $memLine; available now $avail"
+                if (Get-DirtyStatus) {
+                    try {
+                        $s = Save-Leftovers "openspec-auto: leftovers of LOW-MEMORY in $change run $run"
+                        $memNote += "; leftovers stashed on branch $($s.Branch) ($($s.Ref), $($s.Count) files)"
+                    } catch { $memNote += "; stashing the leftovers failed: $($_.Exception.Message -replace '\s+', ' ')" }
+                }
+                Write-Bad $memNote
+                $outcome = 'STOPPED'; $notes += $memNote
+                $stopReason = "change ${change}: $memNote; close other programs and run again"
+                $script:MemoryStop = "low memory ($avail available)"
+                break
+            }
+            foreach ($p in $lmProblems) { Write-Bad $p }
+            $outcome = 'FAILED-CHECK'; $notes += $lmProblems
+            $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+            break
+        }
 
         # 3. write-check by the runner (kap. 6.1 C) - must pass before the next process starts
         $problems = @()
@@ -1010,6 +1633,7 @@ Do the completion check and archive (SUCCESS).
 
         # 5. test gate: once the change is archived, the runner runs testCommand itself
         $tests = $null
+        $memStop = $null
         if ($problems.Count -eq 0 -and $kind -in @('SUCCESS', 'NONCRITICAL')) {
             Write-Host '    tests ...' -NoNewline
             # the change is archived now, so its acceptance tests are part of the regression set
@@ -1019,6 +1643,9 @@ Do the completion check and archive (SUCCESS).
             $claimText = '-'
             if ($w.Claimed) { $claimText = $w.Claimed }
             if ($tests.Dirty) { $problems += "testCommand left the working tree dirty:`n$($tests.Dirty)" }
+            elseif (-not $tests.Passed -and $tests.Memory) {
+                $memStop = "tests ran out of memory ($($tests.Memory)); close other programs and run again; output: $(Get-RelPath $tests.Log)"
+            }
             elseif ($kind -eq 'SUCCESS' -and -not $tests.Passed) {
                 $problems += "tests fail after $change was archived ($($tests.Label), agent claimed $claimText); output: $(Get-RelPath $tests.Log)"
             }
@@ -1057,6 +1684,10 @@ Do the completion check and archive (SUCCESS).
                             $groupHistory[$gid] += 'green'
                             $repairGroup = $null; $repairCount = 0; $groupStartHead = Get-Head
                             Write-Ok "group $gid green"
+                        } elseif ($gt.Memory) {
+                            # no repair run: the tests could not run, the code is not to blame
+                            $groupHistory[$gid] += 'out of memory'
+                            $memStop = "tests after group $gid ran out of memory ($($gt.Memory)); close other programs and run again; output: $(Get-RelPath $gt.Log)"
                         } else {
                             $groupHistory[$gid] += 'red'
                             if ($mode -eq 'repair') { $repairCount++ }
@@ -1080,6 +1711,11 @@ Do the completion check and archive (SUCCESS).
             foreach ($p in $problems) { Write-Bad $p }
             $outcome = 'FAILED-CHECK'; $notes += $problems
             $stopReason = "write-check failed after run $run of $change (see notes); log: $logBase.out.json"
+        } elseif ($memStop) {
+            Write-Bad $memStop
+            $outcome = 'STOPPED'; $notes += $memStop
+            $stopReason = "change ${change}: $memStop"
+            $script:MemoryStop = "low memory ($(Format-GB (Get-AvailableMB)) available)"
         } elseif ($groupStop) {
             Write-Bad $groupStop
             $outcome = 'STOPPED'; $notes += $groupStop
@@ -1156,11 +1792,25 @@ $runFacts = "{0} $([char]0x00B7) {1}" -f (Format-Usd $totalCost), (Format-Minute
 $reportHint = "report: $StateDirName/auto-mode-report.md"
 if ($stopReason) {
     $why = ($stopReason -replace '\s+', ' ').Trim()
+    if ($script:MemoryStop) { $why = $script:MemoryStop }
     if ($why.Length -gt 200) { $why = $why.Substring(0, 197) + '...' }
     Send-Notify ("{0} auto-mode stopped at {1}: {2} $([char]0x00B7) {3}; {4}" -f (Get-Emoji 0x1F6D1), $change, $why, $runFacts, $reportHint) ([int]$cfg.notifyStopPriority)
 } else {
     $doneCount = @($results | Where-Object { $_.Outcome -in @('SUCCESS', 'NONCRITICAL') -and $_.Change -notlike 'fix-*' }).Count
     Send-Notify ("{0} auto-mode finished: {1}/{2} done $([char]0x00B7) {3}; {4}" -f (Get-Emoji 0x1F3C1), $doneCount, $planCount, $runFacts, $reportHint) 1
+}
+
+# memory summary (docs/memory-recovery-plan.md 2.1): one line, and a warning when it was low
+$ms = $script:MemStats
+$memLine = "lowest $(Format-GB $ms.MinAvailMB) available"
+if ($null -ne $ms.MaxCommitPct) { $memLine += ", highest commit $($ms.MaxCommitPct) %" }
+$memLine += " ($($ms.Checks) checks)"
+$memLog = $null
+if ($script:MemLogProc) { $memLog = "$StateDirName/runs/$stamp/memory.csv" }
+if ($ms.Low -gt 0) {
+    $w = "memory was low before $($ms.Low) of $($ms.Checks) checks ($memLine)"
+    if ($memLog) { $w += "; memory log: $memLog" }
+    $warnings += $w
 }
 
 $sb = New-Object System.Text.StringBuilder
@@ -1175,6 +1825,9 @@ $baselineText = $baseline.Label
 if ($resumeFix) { $baselineText += " (resuming $resumeFix)" }
 if ($baselineAccept.Count) { $baselineText += " (incl. acceptance tests of $($baselineAccept -join ', '))" }
 [void]$sb.AppendLine("- Baseline tests: $baselineText")
+$memReport = "- Memory: $memLine"
+if ($memLog) { $memReport += '; log `' + $memLog + '`' }
+[void]$sb.AppendLine($memReport)
 if ($cfg.acceptanceMode -ne 'off') {
     [void]$sb.AppendLine("- Acceptance tests: $($cfg.acceptanceMode), frozen under ``$($cfg.acceptanceDir)/``")
     if ($cfg.acceptanceMode -eq 'reviewed' -and $NoAcceptArtifact.Count) {
@@ -1211,7 +1864,16 @@ if ($warnings.Count) {
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('## Warnings')
     [void]$sb.AppendLine()
-    foreach ($w in $warnings) { [void]$sb.AppendLine("- $w") }
+    foreach ($w in $warnings) { [void]$sb.AppendLine("- $($w -replace "`r?`n", ' ')") }
+}
+$leftoverStashes = @(Get-LeftoverStashes)
+if ($leftoverStashes.Count) {
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('## Stashed leftovers')
+    [void]$sb.AppendLine()
+    foreach ($s in $leftoverStashes) { [void]$sb.AppendLine("- ``$s``") }
+    [void]$sb.AppendLine()
+    [void]$sb.AppendLine('Look at one with `git stash show -p stash@{n}`, drop it with `git stash drop stash@{n}`. Auto-mode never drops a stash.')
 }
 [void]$sb.AppendLine()
 [void]$sb.AppendLine("Logs: ``$StateDirName/runs/$stamp/``")
@@ -1221,10 +1883,12 @@ Write-TextFile (Join-Path $Project "$StateDirName/auto-mode-report.md") $report
 Write-TextFile (Join-Path $runDir 'auto-mode-report.md') $report
 Write-Host ''
 Write-Host $report
-if ($stopReason) { exit 1 }
-exit 0
+if ($stopReason) { Exit-Runner 1 $stopReason }
+Exit-Runner 0 $null
 
 } catch {
+    $script:Crashed = $true
+    $script:EndReason = $_.Exception.Message
     # an unexpected error after the start message: tell the user it is not running any more
     if ($script:NotifyPath) {
         $why = ($_.Exception.Message -replace '\s+', ' ').Trim()
@@ -1234,5 +1898,34 @@ exit 0
     throw
 } finally {
     Remove-Item Env:OPENSPEC_AUTO_MODE -ErrorAction SilentlyContinue
+    # Ctrl+C (no end code, no crash) keeps running.json, so the next start sees the interruption
+    if ($script:LastRunPath -and ($script:Crashed -or $null -ne $script:EndCode)) {
+        $state = 'crashed'; $code = 1
+        if (-not $script:Crashed) {
+            $code = $script:EndCode
+            $state = @{ 0 = 'finished'; 1 = 'stopped'; 2 = 'failed-start' }[[int]$code]
+        }
+        # E8: a start that fails in the detached copy is seen by nobody (4.1)
+        if ($Detached -and -not $script:NotifyPath -and $NotifyCandidate -and $state -in @('failed-start', 'crashed')) {
+            $why = ([string]$script:EndReason -replace '\s+', ' ').Trim()
+            if ($why.Length -gt 200) { $why = $why.Substring(0, 197) + '...' }
+            $script:NotifyPath = $NotifyCandidate
+            try { Send-Notify ("{0} auto-mode could not start: {1}" -f (Get-Emoji 0x1F6D1), $why) ([int]$cfg.notifyStopPriority) } catch { }
+        }
+        $last = [ordered]@{
+            exitCode = $code; state = $state; endedAt = (Get-Date).ToString('o')
+            runDir = (Get-RelPath $runDir); reason = $script:EndReason
+        }
+        try { Write-TextFile $script:LastRunPath ($last | ConvertTo-Json) } catch { }
+        # a crash with uncommitted files keeps running.json: the next start sees an interrupted
+        # run and stashes the leftovers instead of refusing a dirty tree
+        $keep = $false
+        if ($script:Crashed) { try { $keep = [bool](Get-DirtyStatus) } catch { } }
+        if ($keep) { try { $script:RunGuard.Dispose() } catch { } }
+        else { Exit-RunState }
+    }
+    Stop-MemoryLog
+    if ($script:KeptAwake) { try { [void][OsaJob]::KeepAwake($false) } catch { } }
+    if ($script:Transcript) { try { Stop-Transcript | Out-Null } catch { } }
     Pop-Location
 }

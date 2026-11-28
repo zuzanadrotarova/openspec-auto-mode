@@ -9,6 +9,10 @@ $Fake = Join-Path $PSScriptRoot 'fake-claude.cmd'
 $os = 'openspec'
 if (Get-Command 'openspec.cmd' -ErrorAction SilentlyContinue) { $os = 'openspec.cmd' }
 $script:Failed = 0
+# fixed available memory and commit charge, so the memory warnings do not depend on this PC
+# (T39 and T43 change them)
+$env:OSA_TEST_FREE_MB = '16000'
+$env:OSA_TEST_COMMIT = '20000/40000'
 
 function Check([bool]$Cond, [string]$Msg) {
     if ($Cond) { Write-Host "    ok   $Msg" -ForegroundColor Green }
@@ -52,16 +56,21 @@ function New-Project([string]$Name, [string[]]$Changes, [string]$Config = $Defau
         New-Change $parts[0] ([int]$parts[1]) $groups
     }
     Set-Content 'openspec/auto-mode.json' $Config
-    Set-Content 'run-tests.cmd' '@if exist broken.txt (echo FAIL broken.txt & exit /b 1) else (echo ok)'
+    Set-Content 'run-tests.cmd' @(
+        '@if exist oom.txt (echo Exception in thread main java.lang.OutOfMemoryError: Java heap space & exit /b 1)'
+        '@if exist oom-green.txt (echo test of java.lang.OutOfMemoryError handling: ok & exit /b 0)'
+        '@if exist slow.txt (powershell -NoProfile -Command "if ($env:OSA_TEST_FREE_MB_FILE) { Set-Content -LiteralPath $env:OSA_TEST_FREE_MB_FILE ([string]$PID + '' 3000'') }; Start-Sleep 120" & exit /b 1)'
+        '@if exist broken.txt (echo FAIL broken.txt & exit /b 1) else (echo ok)'
+    )
     git add -A 2>&1 | Out-Null; git commit -q -m init 2>&1 | Out-Null
     git remote add origin $remote; git push -q origin main 2>&1 | Out-Null
     Pop-Location
     $p
 }
 
-function Invoke-Runner([string]$P, [string]$Plan) {
+function Invoke-Runner([string]$P, [string]$Plan, [string[]]$More = @()) {
     $env:FAKE_PLAN = $Plan
-    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner -Project $P -ClaudeCommand $Fake 2>&1 | ForEach-Object { "$_" }
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner -Project $P -ClaudeCommand $Fake @More 2>&1 | ForEach-Object { "$_" }
     $code = $LASTEXITCODE
     Set-Content (Join-Path $WorkDir ((Split-Path -Leaf $P) + '.log')) $out
     [pscustomobject]@{ Code = $code; Out = ($out -join "`n") }
@@ -151,7 +160,7 @@ Check ($r.Out -match '02-b is not ready.*missing artifacts: design') 'missing de
 Check ($r.Out -match '03-c is not ready.*validate failed') 'invalid spec delta reported'
 Check ($r.Out -match '04-d is not ready.*no tasks') 'empty tasks.md reported'
 Check ($r.Out -notmatch '01-a is not ready') 'complete change not reported'
-Check (-not (Test-Path "$p/.openspec-auto/runs")) 'no agent run started'
+Check (-not (Test-Path "$p/.openspec-auto/runs/*/*.prompt.txt")) 'no agent run started'
 
 function Read-RunPrompt([string]$P, [string]$File) {
     $f = Get-ChildItem "$P/.openspec-auto/runs/*/$File" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -173,7 +182,7 @@ $p = New-Project 't9' @('01-a:1')
 Push-Location $p; Set-Content broken.txt 'x'; git add -A 2>&1 | Out-Null; git commit -q -m red 2>&1 | Out-Null; Pop-Location
 $r = Invoke-Runner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'baseline tests fail') 'red baseline refused (exit 2)'
-Check (-not (Test-Path "$p/.openspec-auto/runs")) 'no agent run started'
+Check (-not (Test-Path "$p/.openspec-auto/runs/*/*.prompt.txt")) 'no agent run started'
 Check (Test-Path "$p/.openspec-auto/baseline-tests.txt") 'baseline output saved'
 $p = New-Project 't9b' @('01-a:1') '{ "testCommand": "echo x> junk.out", "timeoutMinutes": 2 }'
 $r = Invoke-Runner $p '01-a=success'
@@ -513,6 +522,286 @@ $r = Invoke-NotifyRunner $p '01-a=success'
 Check ($r.Code -eq 2 -and $r.Out -match 'notifyScript .* not found' -and $r.Lines.Count -eq 0) 'missing notifyScript refused at the start'
 Remove-Item Env:FAKE_NOTIFY_LOG -ErrorAction SilentlyContinue
 
+# ---------------------------------------------------------------- memory pressure, step 1
+function Read-State([string]$P, [string]$Name) {
+    $f = "$P/.openspec-auto/$Name"
+    if (-not (Test-Path $f)) { return $null }
+    [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+}
+function Write-State([string]$P, [hashtable]$Values) {
+    New-Item -ItemType Directory -Force "$P/.openspec-auto" | Out-Null
+    [System.IO.File]::WriteAllText("$P/.openspec-auto/running.json", ([pscustomobject]$Values | ConvertTo-Json))
+}
+function Get-Start($Proc) { $Proc.StartTime.ToUniversalTime().ToString('o') }
+# PIDs on Windows are multiples of 4, so this one never exists
+$DeadPid = 999999
+
+Write-Host "T30 killed runner: its children end (job object), the next start stashes the leftovers"
+$p = New-Project 't30' @('01-a:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$pidFile = Join-Path $WorkDir 't30.pids'
+Remove-Item $pidFile -ErrorAction SilentlyContinue
+$env:FAKE_PID_FILE = $pidFile; $env:FAKE_PLAN = '01-a=hang'
+$runnerProc = Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Runner`"", '-Project', "`"$p`"", '-ClaudeCommand', "`"$Fake`"") -WindowStyle Hidden -PassThru
+for ($i = 0; $i -lt 120 -and -not (Test-Path $pidFile); $i++) { Start-Sleep -Milliseconds 500 }
+Remove-Item Env:FAKE_PID_FILE
+$st = Read-State $p 'running.json'
+Check ($st -and $st.pid -eq $runnerProc.Id -and $st.change -eq '01-a' -and $st.run -eq 1) 'running.json names the runner, the change and the run'
+Check ($st -and $st.childPid -and (Get-Process -Id $st.childPid -ErrorAction SilentlyContinue)) 'running.json names the living child process'
+Check ($st -and $st.consoleLog -and (Test-Path (Join-Path $p $st.consoleLog))) 'console.txt is written'
+$ids = @(); if (Test-Path $pidFile) { $ids = @((Get-Content $pidFile) -split ' ' | Where-Object { $_ }) }
+Check ($ids.Count -eq 2) 'fake worker started a grandchild'
+Stop-Process -Id $runnerProc.Id -Force
+Start-Sleep 3
+Check ($ids.Count -eq 2 -and -not (Get-Process -Id $ids[0] -ErrorAction SilentlyContinue)) 'worker ended with the killed runner'
+Check ($ids.Count -eq 2 -and -not (Get-Process -Id $ids[1] -ErrorAction SilentlyContinue)) 'grandchild ended with the killed runner'
+foreach ($id in $ids) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+Check ((Test-Path "$p/.openspec-auto/running.json") -and -not (Clean $p)) 'running.json and the leftovers stay after the kill'
+$r = Invoke-NotifyRunner $p '01-a=success'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'next start finishes the change'
+Check ($r.Out -match 'previous run \S+ was interrupted during 01-a run 1') 'interruption reported'
+Check ($r.Out -match 'leftover\.txt') 'leftover files listed'
+Check ((GitIn $p stash list --format=%s) -match 'openspec-auto: leftovers of interrupted run \S+ \(01-a run 1\)') 'stash with the message'
+$names = GitIn $p stash show --include-untracked --name-only 'stash@{0}'
+Check ($names -match 'leftover\.txt' -and $names -match 'tasks\.md') 'stash holds the leftover files'
+Check ($names -notmatch '\.openspec-auto') 'stash holds nothing of .openspec-auto/'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($rep -match 'was interrupted during 01-a' -and $rep -match '## Stashed leftovers') 'report: warning and stash list'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'started: 1 change, first 01-a .* leftovers of the interrupted run stashed \(stash@\{0\}, \d+ files\)$') 'E1 mentions the stash'
+$last = Read-State $p 'last-run.json'
+Check (-not (Test-Path "$p/.openspec-auto/running.json") -and $last.state -eq 'finished' -and $last.exitCode -eq 0) 'normal end: running.json removed, last-run.json finished'
+
+Write-Host "T31 interrupted run with a clean tree: warning only"
+$p = New-Project 't31' @('01-a:1')
+Write-State $p @{ pid = $DeadPid; processStart = '2026-01-01T00:00:00.0000000Z'; runDir = '.openspec-auto/runs/20260101-000000'; change = '01-a'; run = 2 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -match 'previous run 20260101-000000 was interrupted during 01-a run 2') 'interruption reported, run continues'
+Check ((GitIn $p stash list) -eq '') 'no stash'
+Check ((Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md") -match 'was interrupted') 'warning in the report'
+
+Write-Host "T32 dirty tree without an interrupted run: refused as before"
+$p = New-Project 't32' @('01-a:1')
+Set-Content "$p/mine.txt" 'my own work'
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'working tree is not clean') 'start refused'
+Check ((GitIn $p stash list) -eq '' -and (Test-Path "$p/mine.txt")) 'no stash, file untouched'
+Check ((Read-State $p 'last-run.json').state -eq 'failed-start' -and -not (Test-Path "$p/.openspec-auto/running.json")) 'last-run.json failed-start, no running.json'
+
+Write-Host "T33 a living runner or worker refuses the start"
+$p = New-Project 't33' @('01-a:1')
+$me = Get-Process -Id $PID
+Write-State $p @{ pid = $PID; processStart = (Get-Start $me); startedAt = (Get-Date).ToString('o'); change = '01-a'; run = 1 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match "already running in this project \(PID $PID, since") 'living runner: exit 2'
+Check ((Read-State $p 'running.json').pid -eq $PID -and -not (Test-Path "$p/.openspec-auto/last-run.json")) 'running.json of the living run untouched, no last-run.json'
+$r = Invoke-Runner $p '01-a=success' @('-DryRun')
+Check ($r.Code -eq 0 -and $r.Out -match 'already running' -and $r.Out -match 'skipped \(a run is in progress\)') 'dry run: warning only, no baseline tests'
+$sleeper = Start-Process powershell -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 120') -WindowStyle Hidden -PassThru
+Write-State $p @{ pid = $DeadPid; processStart = '2026-01-01T00:00:00.0000000Z'; childPid = $sleeper.Id; childStart = (Get-Start $sleeper); change = '01-a'; run = 1 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match "a worker of the previous run is still running \(PID $($sleeper.Id)\)") 'living worker: exit 2'
+Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
+Write-State $p @{ pid = $PID; processStart = '2020-01-01T00:00:00.0000000Z'; change = '01-a'; run = 1 }
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -match 'was interrupted') 'reused PID (other start time) counts as interrupted'
+
+Write-Host "T34 two starts at the same moment: one runs, the other exits 2"
+$p = New-Project 't34' @('01-a:1')
+$env:FAKE_PLAN = '01-a=slow'
+$procs = foreach ($n in 1, 2) {
+    $log = Join-Path $WorkDir "t34.$n.log"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', "/d /c powershell -NoProfile -ExecutionPolicy Bypass -File `"$Runner`" -Project `"$p`" -ClaudeCommand `"$Fake`" > `"$log`" 2>&1"
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    [pscustomobject]@{ Proc = [System.Diagnostics.Process]::Start($psi); Log = $log }
+}
+foreach ($x in $procs) { [void]$x.Proc.WaitForExit(240000) }
+$codes = @($procs | ForEach-Object { $_.Proc.ExitCode } | Sort-Object)
+$loser = $procs | Where-Object { $_.Proc.ExitCode -eq 2 } | Select-Object -First 1
+Check (($codes -join ',') -eq '0,2') "exit codes 0 and 2 (got $($codes -join ','))"
+Check ($loser -and (Get-Content -Raw $loser.Log) -match 'already running') 'the second start says auto-mode is already running'
+Check ((Archived $p '01-a') -and (Count-Prompts $p '01-a') -eq 1) 'the change ran once'
+
+Write-Host "T35 last-run.json after stop and crash"
+$p = New-Project 't35' @('01-a:1', '02-b:1')
+$r = Invoke-Runner $p '01-a=blocked;02-b=success'
+$last = Read-State $p 'last-run.json'
+Check ($r.Code -eq 1 -and $last.state -eq 'stopped' -and $last.exitCode -eq 1 -and $last.reason -match 'blocked') 'stop: last-run.json stopped with the reason'
+Check (-not (Test-Path "$p/.openspec-auto/running.json")) 'stop: running.json removed'
+$p = New-Project 't35b' @('01-a:1')
+$env:OSA_TEST_THROW = 'loop'
+$r = Invoke-Runner $p '01-a=success'
+Remove-Item Env:OSA_TEST_THROW
+$last = Read-State $p 'last-run.json'
+Check ($r.Code -ne 0 -and $last.state -eq 'crashed' -and $last.reason -match 'test crash') 'crash: last-run.json crashed with the message'
+Check (-not (Test-Path "$p/.openspec-auto/running.json")) 'crash: running.json removed'
+$console = Get-ChildItem "$p/.openspec-auto/runs/*/console.txt" | Select-Object -First 1
+Check ($console -and (Get-Content -Raw $console.FullName) -match 'OpenSpec auto-mode in') 'console.txt holds the runner output'
+$p = New-Project 't35c' @('01-a:1')
+$env:OSA_TEST_THROW = 'after-worker'
+$r = Invoke-Runner $p '01-a=dirty'
+Remove-Item Env:OSA_TEST_THROW
+Check ($r.Code -ne 0 -and (Read-State $p 'last-run.json').state -eq 'crashed' -and (Test-Path "$p/.openspec-auto/running.json")) 'crash with uncommitted files: running.json kept'
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -match 'was interrupted' -and (GitIn $p stash list --format=%s) -match 'leftovers of interrupted run') 'next start stashes the leftovers of the crash and finishes'
+
+# ---------------------------------------------------------------- memory pressure, step 2
+function Set-Break([string]$File) { if ($File) { $env:FAKE_BREAK_FILE = $File } else { Remove-Item Env:FAKE_BREAK_FILE -ErrorAction SilentlyContinue } }
+
+Write-Host "T36 out-of-memory in the runner's tests: no repair, STOPPED; baseline with it refuses the start"
+$p = New-Project 't36' @('01-a:4:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+Set-Break 'oom.txt'
+$r = Invoke-NotifyRunner $p '01-a=group-red'
+Check ($r.Code -eq 1 -and $r.Out -match '\| 01-a \| STOPPED' -and $r.Out -match 'group 1 ran out of memory \(Exception in thread main java\.lang\.OutOfMemoryError') 'red group with OutOfMemoryError: STOPPED with the line'
+Check ((Count-Prompts $p '01-a') -eq 1) 'no repair run'
+Check ($r.Lines.Count -ge 2 -and $r.Lines[-1] -match 'stopped at 01-a: low memory \(15\.6 GB available\)') 'E6 says low memory'
+Check ((Read-RunPrompt $p '01-a.run01.prompt.txt') -match 'Memory error patterns .*java\.lang\.OutOfMemoryError') 'worker prompt carries the pattern list'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 2 -and $r.Out -match 'baseline tests ran out of memory \(Exception in thread main java\.lang\.OutOfMemoryError') 'baseline with a memory error: exit 2 with the memory message'
+$p = New-Project 't36b' @('01-a:4:2')
+Set-Break 'oom-green.txt'
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'green tests with a memory line count as green'
+$p = New-Project 't36c' @('01-a:4:2') ($DefaultConfig -replace ' }$', ', "memoryErrorPatterns": [] }')
+Set-Break 'oom.txt'
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Count-Prompts $p '01-a') -eq 4) 'memoryErrorPatterns [] : normal repair'
+Set-Break $null
+
+Write-Host "T37 test timeout: out of memory only with low memory at the moment of the timeout"
+$TimeoutConfig = $DefaultConfig -replace ' }$', ', "testTimeoutMinutes": 0.1 }'
+$p = New-Project 't37' @('01-a:4:2') $TimeoutConfig
+Set-Break 'slow.txt'
+$memFile = Join-Path $WorkDir 't37.mem'
+Remove-Item $memFile -ErrorAction SilentlyContinue
+$env:OSA_TEST_FREE_MB_FILE = $memFile
+$r = Invoke-Runner $p '01-a=group-red'
+Remove-Item Env:OSA_TEST_FREE_MB_FILE
+Check ($r.Code -eq 1 -and $r.Out -match 'ran out of memory \(timeout with 2\.9 GB available\)') 'timeout with low memory (measured before the kill): STOPPED'
+Check ((Count-Prompts $p '01-a') -eq 1) 'no repair run'
+$p = New-Project 't37b' @('01-a:4:2') $TimeoutConfig
+$r = Invoke-Runner $p '01-a=group-red'
+Check ($r.Code -eq 0 -and (Archived $p '01-a') -and (Count-Prompts $p '01-a') -eq 4) 'timeout with enough memory: normal red timeout, repaired'
+Check ($r.Out -match 'timeout after 0\.1 min' -and $r.Out -notmatch 'ran out of memory') 'reported as a normal timeout'
+Set-Break $null
+
+Write-Host "T38 worker reports LOW-MEMORY: STOPPED, leftovers stashed, next start continues"
+$p = New-Project 't38' @('01-a:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$r = Invoke-NotifyRunner $p '01-a=lowmem'
+Check ($r.Code -eq 1 -and $r.Out -match '\| 01-a \| STOPPED' -and $r.Out -match 'worker ran out of memory: Exception in thread main java\.lang\.OutOfMemoryError') 'STOPPED with the worker''s line'
+Check (-not (Test-Path "$p/openspec/changes/01-a/BLOCKED.md") -and -not (Active $p 'fix-01-a')) 'no BLOCKED.md, no fix change'
+Check ((Clean $p) -and (GitIn $p stash list --format=%s) -match 'openspec-auto: leftovers of LOW-MEMORY in 01-a run 1') 'leftovers in a stash, tree clean'
+Check ($r.Lines.Count -ge 2 -and $r.Lines[-1] -match 'stopped at 01-a: low memory \(15\.6 GB available\)') 'E6 says low memory'
+$r = Invoke-Runner $p '01-a=group'
+Check ($r.Code -eq 0 -and $r.Out -match 'baseline tests green' -and (Archived $p '01-a')) 'next start: green baseline, change finished'
+
+Write-Host "T39 memory warning at the start"
+$p = New-Project 't39' @('01-a:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$env:OSA_TEST_FREE_MB = '3000'; $env:OSA_TEST_PROCESSES = 'java=3400;java=200;qemu-system=2100;browser=2700;code=100'
+$r = Invoke-Runner $p '' @('-DryRun')
+Check ($r.Code -eq 0 -and $r.Out -match 'only 2\.9 GB memory available') 'dry run warns too'
+$r = Invoke-NotifyRunner $p '01-a=success'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and $rep -match 'only 2\.9 GB memory available \(minFreeMemoryGB 8\); biggest processes: java 3\.5 GB \(2\), browser 2\.6 GB, qemu-system 2\.1 GB, code 0\.1 GB') 'report: warning with the process list'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'only 2\.9 GB memory available$' -and $r.Lines[0] -notmatch 'java|browser|qemu') 'E1: the number, no process names'
+$p = New-Project 't39b' @('01-a:1') ($DefaultConfig -replace ' }$', ', "minFreeMemoryGB": 0 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -notmatch 'memory available \(minFreeMemoryGB') 'minFreeMemoryGB 0: no warning'
+$p = New-Project 't39c' @('01-a:1') ($DefaultConfig -replace ' }$', ', "minFreeMemoryGB": "lots", "preventSleep": "yes" }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'preventSleep .* must be true or false') 'invalid memory settings refused'
+$env:OSA_TEST_FREE_MB = '16000'; Remove-Item Env:OSA_TEST_PROCESSES
+
+# ---------------------------------------------------------------- memory pressure, step 3
+function Get-LaunchedPid([string]$Out) { if ($Out -match 'own minimized window \(PID (\d+)\)') { return [int]$Matches[1] }; $null }
+
+Write-Host "T40 -Background: own window outside the caller's process tree, same environment"
+$p = New-Project 't40' @('01-a:1')
+$envOut = Join-Path $WorkDir 't40.env.txt'
+Remove-Item $envOut -ErrorAction SilentlyContinue
+$env:OSA_TEST_ENV_MARK = 'only-in-the-launching-shell'; $env:FAKE_ENV_OUT = $envOut
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-Runner $p '01-a=envcheck' @('-Background')
+$sw.Stop()
+Remove-Item Env:OSA_TEST_ENV_MARK
+$cpid = Get-LaunchedPid $r.Out
+Check ($r.Code -eq 0 -and $cpid -and $sw.Elapsed.TotalSeconds -lt 40) "launcher returns with the PID ($([int]$sw.Elapsed.TotalSeconds) s)"
+Check ($r.Out -match 'start checks passed' -and $r.Out -match 'console: \.openspec-auto/runs/\S+/console\.txt') 'launcher waits for the start checks and names the console log'
+$alive = $cpid -and (Get-Process -Id $cpid -ErrorAction SilentlyContinue)
+$parentId = $null
+if ($alive) { $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$cpid").ParentProcessId }
+$parentAlive = $parentId -and (Get-Process -Id $parentId -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -lt (Get-Process -Id $cpid).StartTime })
+Check ($alive -and -not $parentAlive) 'the run lives on without a living parent'
+if ($cpid) { Wait-Process -Id $cpid -Timeout 180 -ErrorAction SilentlyContinue }
+Remove-Item Env:FAKE_ENV_OUT
+$last = Read-State $p 'last-run.json'
+Check ($last.state -eq 'finished' -and (Archived $p '01-a')) 'the run finished, last-run.json finished'
+Check ((Test-Path $envOut) -and (Get-Content $envOut) -eq 'mark=only-in-the-launching-shell') 'the run saw the launching shell''s environment'
+$console = Get-ChildItem "$p/.openspec-auto/runs/*/console.txt" | Select-Object -First 1
+Check ($console -and (Get-Content -Raw $console.FullName) -match 'job object') 'console.txt has the job object line'
+
+Write-Host "T41 -Background with a failing start: exit 2 with the reason, E8"
+$p = New-Project 't41' @('fix-x:1') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$nlog = Join-Path $WorkDir 't41.notify.txt'
+Remove-Item $nlog -ErrorAction SilentlyContinue
+$env:FAKE_NOTIFY_LOG = $nlog; $env:FAKE_NOTIFY_MODE = 'ok'
+$r = Invoke-Runner $p '' @('-Background')
+for ($i = 0; $i -lt 40 -and -not (Test-Path $nlog); $i++) { Start-Sleep -Milliseconds 500 }
+Remove-Item Env:FAKE_NOTIFY_LOG, Env:FAKE_NOTIFY_MODE -ErrorAction SilentlyContinue
+Check ($r.Code -eq 2 -and $r.Out -match 'ended at once \(failed-start\): no active numbered changes') 'launcher exit 2 with the reason'
+Check ((Read-State $p 'last-run.json').state -eq 'failed-start') 'last-run.json failed-start'
+$nl = @(); if (Test-Path $nlog) { $nl = @([System.IO.File]::ReadAllLines($nlog, [System.Text.Encoding]::UTF8) | Where-Object { $_ }) }
+Check ($nl.Count -eq 1 -and $nl[0] -match '^t41\|1\|.* could not start: no active numbered changes') 'E8 notification'
+
+Write-Host "T42 -Background while a run is living: exit 2, nothing started"
+$p = New-Project 't42' @('01-a:1')
+Write-State $p @{ pid = $PID; processStart = (Get-Start (Get-Process -Id $PID)); startedAt = (Get-Date).ToString('o') }
+$r = Invoke-Runner $p '01-a=success' @('-Background')
+Check ($r.Code -eq 2 -and $r.Out -match 'already running' -and -not (Test-Path "$p/.openspec-auto/runs")) 'refused before launching'
+
+# ---------------------------------------------------------------- memory recovery, step 2
+Write-Host "T43 memory check before every run and test command, commit charge, report line"
+$p = New-Project 't43' @('01-a:4:2')
+$r = Invoke-Runner $p '01-a=group'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and $r.Out -match 'memory available: 15\.6 GB, commit 19\.5 of 39\.1 GB \(50 %\)') 'start and runs print available memory and commit'
+Check (([regex]::Matches($r.Out, '    memory available: 15\.6 GB, commit')).Count -eq 3) 'measured before each of the 3 runs'
+# checks: start + baseline + 3 runs + 2 group tests + final tests = 8
+Check ($rep -match '- Memory: lowest 15\.6 GB available, highest commit 50 % \(8 checks\); log `\.openspec-auto/runs/[^/]+/memory\.csv`') 'report: memory line with the number of checks and the log'
+Check ($rep -notmatch 'memory was low') 'no low-memory warning'
+$p = New-Project 't43b' @('01-a:4:2') (Notify-Config "`"notifyScript`": `"$NotifyFake`"")
+$env:OSA_TEST_COMMIT = '38000/40000'; $env:OSA_TEST_PROCESSES = 'java=3400;qemu-system=2100'
+$r = Invoke-NotifyRunner $p '01-a=group'
+$rep = Get-Content -Raw "$p/.openspec-auto/auto-mode-report.md"
+Check ($r.Code -eq 0 -and (Archived $p '01-a')) 'high commit only warns, the run goes on'
+Check ($rep -match 'commit at 95 % of the limit, 37\.1 of 39\.1 GB \(maxCommitPercent 85\); biggest processes: java 3\.3 GB, qemu-system 2\.1 GB') 'start warning with commit, limit and processes'
+Check ($r.Out -match 'low memory before run 1: commit at 95 % of the limit' -and $r.Out -match 'low memory before the tests: commit at 95 %') 'console warns before runs and tests'
+Check ($rep -match 'memory was low before 8 of 8 checks \(lowest 15\.6 GB available, highest commit 95 %') 'report warning counts the low checks'
+Check ($r.Lines.Count -gt 0 -and $r.Lines[0] -match 'commit at 95 % of the limit$' -and $r.Lines[0] -notmatch 'java|qemu') 'E1: commit number, no process names'
+$p = New-Project 't43c' @('01-a:1') ($DefaultConfig -replace ' }$', ', "maxCommitPercent": 0 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 0 -and $r.Out -notmatch 'commit at \d+ %') 'maxCommitPercent 0: no commit warning'
+$p = New-Project 't43d' @('01-a:1') ($DefaultConfig -replace ' }$', ', "maxCommitPercent": 120 }')
+$r = Invoke-Runner $p '01-a=success'
+Check ($r.Code -eq 2 -and $r.Out -match 'maxCommitPercent .* must be a number from 0 to 100') 'invalid maxCommitPercent refused'
+$env:OSA_TEST_COMMIT = '20000/40000'; Remove-Item Env:OSA_TEST_PROCESSES
+
+Write-Host "T44 memory log: memory.csv per start, the logger ends with the runner"
+$p = New-Project 't44' @('01-a:4:2')
+$env:OSA_TEST_MEMLOG_SECONDS = '1'
+$r = Invoke-Runner $p '01-a=group'
+Remove-Item Env:OSA_TEST_MEMLOG_SECONDS
+$logPid = $null; if ($r.Out -match 'memory log: \S+memory\.csv \(PID (\d+), every 1 s\)') { $logPid = [int]$Matches[1] }
+Check ($r.Code -eq 0 -and $logPid) 'runner names the memory log and its PID'
+$csv = Get-ChildItem "$p/.openspec-auto/runs/*/memory.csv" | Select-Object -First 1
+$rows = @(); if ($csv) { $rows = @(Get-Content $csv.FullName) }
+Check ($rows.Count -ge 2 -and $rows[0] -eq 'time,availableMB,commitMB,commitLimitMB,commitPercent,top') 'memory.csv has the header and at least one line'
+Check ($rows.Count -ge 2 -and $rows[1] -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+,\d+,\d+,\d+,"[^"]+"$') 'a line has time, numbers and the top processes'
+$gone = $false
+for ($i = 0; $i -lt 20 -and -not $gone; $i++) { $gone = -not ($logPid -and (Get-Process -Id $logPid -ErrorAction SilentlyContinue)); if (-not $gone) { Start-Sleep -Milliseconds 250 } }
+Check ($logPid -and $gone) 'the logger is gone after the runner ended'
+$r = Invoke-Runner $p '' @('-DryRun')
+Check ($r.Code -eq 2 -or $r.Out -notmatch 'memory log:') 'dry run starts no memory log'
+
 Write-Host ''
 if ($script:Failed) { Write-Host "$script:Failed check(s) FAILED" -ForegroundColor Red; exit 1 }
 Write-Host 'All checks passed' -ForegroundColor Green
+exit 0
